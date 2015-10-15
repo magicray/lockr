@@ -1,0 +1,179 @@
+#!/usr/bin/env python
+import os
+import sys
+import time
+import socket
+import struct
+import select
+import optparse
+
+
+def log(msg):
+    timestamp = time.time()
+    os.write(2, '{0}.{1} : {2}\n'.format(
+        time.strftime('%y%m%d.%H%M%S', time.gmtime(timestamp)),
+        '%06d' % ((timestamp - int(timestamp)) * 10**6),
+        msg))
+
+
+class Handler():
+    def __init__(self, peers):
+        self.peers = peers
+        log('init')
+
+    def before_loop(self):
+        #log('before loop')
+        pass
+
+    def after_loop(self):
+        #for peer, handler in self.peers.iteritems():
+        #    if handler is None:
+        #        ip, port = peer.split(':')
+        #        peers[peer] = epoll_loop.connect(ip, int(port), 97)
+        pass
+
+    def on_receive(self, fileno, proto):
+        log('on_receive {0} {1}'.format(fileno, proto))
+        epoll_loop.send(fileno, 'Hello')
+        return 8
+
+    def on_write(self, fileno):
+        epoll_loop.send(fileno, 'Hello')
+        log('on_write')
+
+    def on_read(self, fileno, buf):
+        log('on_read {0}'.format(buf))
+        return 8
+        
+
+class EPollLoop():
+    def __init__(self, port, handler):
+        self.handler = handler
+        self.port = port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(('0.0.0.0', port))
+        self.sock.listen(10000)
+        self.sock.setblocking(0)
+
+        self.epoll = select.epoll()
+        self.epoll.register(self.sock.fileno(), select.EPOLLIN)
+
+        self.connections = dict()
+        self.handlers = dict()
+
+    def register_handler(self, identifier, class_name):
+        self.handlers[identifier] = class_name
+        return self
+
+    def connect(self, ip, port, proto):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(0)
+        self.epoll.register(sock.fileno(), select.EPOLLIN | select.EPOLLOUT)
+        self.connections[sock.fileno()] = dict(
+            sock=sock,
+            addr=(ip, port),
+            is_server=False)
+        sock.connect((ip, port))
+        sock.send(struct.pack('!B', proto))
+
+    def send(self, fileno, buf):
+        conn = self.connections[fileno]
+        if 'out_pkt' in conn:
+            raise Exception('message is already being sent to {0}'.format(addr))
+
+        conn['out_pkt'] = buf
+        self.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
+
+    def run(self):
+        def recv(fileno, size):
+            buf = self.connections[fileno]['sock'].recv(size)
+            if 0 == len(buf):
+                raise Exception('receive failed')
+
+            return buf
+
+        while True:
+            self.handler.before_loop()
+            for fileno, event in self.epoll.poll(1):
+                try:
+                    if self.sock.fileno() == fileno:
+                        sock, addr = self.sock.accept()
+                        log('addr{0} connected'.format(addr))
+                        sock.setblocking(0)
+                        self.epoll.register(sock.fileno(), select.EPOLLIN)
+                        self.connections[sock.fileno()] = dict(
+                            sock=sock,
+                            addr=addr,
+                            is_server=True)
+                    elif event & select.EPOLLIN:
+                        conn = self.connections[fileno]
+                        handler = self.handler
+
+                        if 'in_size' not in conn:
+                            proto = struct.unpack('!B', recv(fileno, 1))[0]
+                            conn['in_size'] = handler.on_receive(fileno, proto)
+                            conn['in_pkts'] = list()
+                        elif conn['in_size'] > 0:
+                            pkt = recv(fileno, conn['in_size'])
+                            conn['in_pkts'].append(pkt)
+                            conn['in_size'] -= len(pkt)
+                        elif conn['in_size'] == 0:
+                            buf = ''.join(conn['in_pkts'])
+                            conn['in_pkts'] = list()
+                            conn['in_size'] = handler.on_read(fileno, buf)
+
+                    elif event & select.EPOLLOUT:
+                        conn = self.connections[fileno]
+                        pkt = conn['out_pkt']
+                        sock = conn['sock']
+
+                        if 'out_sent' not in conn:
+                            conn['out_sent'] = 0
+                        else:
+                            sent = sock.send(pkt[conn['out_sent']:])
+                            if 0 == sent:
+                                raise Exception('could not send')
+                            conn['out_sent'] += sent
+                            if len(pkt) == conn['out_sent']:
+                                del(conn['out_sent'])
+                                del(conn['out_pkt'])
+                                self.epoll.modify(fileno, select.EPOLLIN)
+                                self.handler.on_write(fileno)
+
+                    else:
+                        raise Exception('unhandled event({0})'.format(event))
+                except Exception as e:
+                    self.epoll.unregister(fileno)
+                    self.connections[fileno]['sock'].close()
+                    log('disconnected addr{0} reason({1})'.format(
+                        self.connections[fileno]['addr'],
+                        str(e)))
+                    del(self.connections[fileno])
+                    exit(0)
+
+            self.handler.after_loop()
+             
+ 
+def test(ip, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((ip, port))
+    sock.send(struct.pack('!B', 97))
+
+    while True:
+        sock.send('ABCDEFGH')
+        print(sock.recv(1000))
+
+if '__main__' == __name__:
+    parser = optparse.OptionParser()
+    parser.add_option('--peers', dest='peers', type='string')
+    parser.add_option('--port', dest='port', type='int')
+    opt, args = parser.parse_args()
+
+    if 'server' == args[0]:
+        peers = dict((x, None) for x in opt.peers.split(','))
+        epoll_loop = EPollLoop(opt.port, Handler(peers))
+        #epoll_loop.register_handler(97, StatsServer)
+        epoll_loop.run()
+    else:
+        test('localhost', opt.port)
