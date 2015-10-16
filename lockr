@@ -71,14 +71,13 @@ class EPollLoop(object):
                         sock, addr = self.sock.accept()
                         log('addr{0} connected'.format(addr))
                         sock.setblocking(0)
-                        self.connections[sock.fileno()] = dict(
-                            sock=sock,
-                            peer=addr)
+                        self.connections[sock.fileno()] = dict(sock=sock)
                         self.epoll.register(sock.fileno(), select.EPOLLIN)
-                        self.on_contacted(sock.fileno(), addr)
+                        self.on_contacted(sock.fileno(), sock.getpeername())
                     else:
                         if event & select.EPOLLIN:
                             conn = self.connections[fileno]
+                            peer = conn['sock'].getpeername()
 
                             if 'in_size' in conn:
                                 if conn['in_size'] > 0:
@@ -90,13 +89,14 @@ class EPollLoop(object):
                                     del(conn['in_pkts'])
                                     del(conn['in_size'])
 
-                                    self.on_read(fileno, buf)
+                                    self.on_read(fileno, peer, buf)
 
                         if event & select.EPOLLOUT:
                             conn = self.connections[fileno]
+                            peer = conn['sock'].getpeername()
 
                             if 'out_pkt' not in conn:
-                                self.on_connect(fileno, conn['peer'])
+                                self.on_connect(fileno, peer)
                             else:
                                 pkt = conn['out_pkt']
                                 sock = conn['sock']
@@ -128,14 +128,14 @@ class EPollLoop(object):
 
 
 class StatsServer():
-    def __init__(self):
-        pass
+    def __init__(self, peer):
+        self.peer = peer
 
-    def on_init(self):
+    def on_accept(self):
         return ('recv', 4)
 
     def on_recv(self, buf):
-        log(buf)
+        log('stats_server{0} {1}'.format(self.peer, buf))
         return ('send', buf)
 
     def on_send(self):
@@ -143,14 +143,14 @@ class StatsServer():
 
 
 class StatsClient():
-    def __init__(self):
-        pass
+    def __init__(self, peer):
+        self.peer = peer
 
-    def on_init(self):
+    def on_connect(self):
         return ('send', 'SABCD')
 
     def on_recv(self, buf):
-        log(buf)
+        log('stats_client{0} {1}'.format(self.peer, buf))
         return ('send', 'ABCD')
 
     def on_send(self):
@@ -179,24 +179,24 @@ class Application(EPollLoop):
 
     def on_connect(self, fileno, peer):
         self.conns[fileno] = dict(peer=peer, state='client')
-        self.conns[fileno]['handler'] = StatsClient()
+        self.conns[fileno]['handler'] = StatsClient(peer)
         self.peers[peer] = fileno
 
-        next, value = self.conns[fileno]['handler'].on_init()
+        next, value = self.conns[fileno]['handler'].on_connect()
         log(str((next, value)))
         if 'recv' == next:
             self.recv(fileno, value)
         elif 'send' == next:
             self.send(fileno, value)
 
-    def on_read(self, fileno, buf):
+    def on_read(self, fileno, peer, buf):
         conn = self.conns[fileno]
         if 'contacted' == conn['state']:
             if 'S' == buf:
-                conn['handler'] = StatsServer()
+                conn['handler'] = StatsServer(peer)
 
             conn['state'] = 'server'
-            next, value = conn['handler'].on_init()
+            next, value = conn['handler'].on_accept()
         else:
             next, value = conn['handler'].on_recv(buf)
 
@@ -217,7 +217,7 @@ class Application(EPollLoop):
         for peer, handler in self.peers.iteritems():
             if handler is None:
                 ip, port = peer
-                log(str((ip, port)))
+                log('connecting to {0}'.format(str((ip, port))))
                 self.connect(ip, port)
 
 
