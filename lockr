@@ -26,34 +26,24 @@ class EPollLoop(object):
         self.epoll = select.epoll()
         self.epoll.register(self.sock.fileno(), select.EPOLLIN)
 
+        self.servers = dict()
         self.connections = dict()
 
-    def connect(self, ip, port):
+    def register_server(self, proto, class_name):
+        self.servers[proto] = class_name
+
+    def connect(self, handler, ip, port, proto):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setblocking(0)
             self.connections[sock.fileno()] = dict(
                 sock=sock,
-                peer=(ip, port))
+                proto=struct.pack('!B', proto),
+                handler=handler)
             self.epoll.register(sock.fileno(), select.EPOLLOUT)
             sock.connect((ip, port))
         except:
             pass
-
-    def send(self, fileno, buf):
-        conn = self.connections[fileno]
-
-        if 'out_pkt' in conn:
-            raise Exception('msg is already being sent to {0}'.format(fileno))
-
-        conn['out_pkt'] = buf
-        conn['out_sent'] = 0
-        self.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
-
-    def recv(self, fileno, recv_size):
-        conn = self.connections[fileno]
-        conn['in_size'] = recv_size
-        conn['in_pkts'] = list()
 
     def run(self):
         def recv(fileno, size):
@@ -71,90 +61,138 @@ class EPollLoop(object):
                         sock, addr = self.sock.accept()
                         log('addr{0} connected'.format(addr))
                         sock.setblocking(0)
-                        self.connections[sock.fileno()] = dict(sock=sock)
+                        self.connections[sock.fileno()] = dict(
+                            sock=sock,
+                            peer=sock.getpeername())
                         self.epoll.register(sock.fileno(), select.EPOLLIN)
-                        self.on_contacted(sock.fileno(), sock.getpeername())
                     else:
+                        conn = self.connections[fileno]
+                        result = None
+                        flags = select.EPOLLIN
+
                         if event & select.EPOLLIN:
-                            conn = self.connections[fileno]
-                            peer = conn['sock'].getpeername()
-
-                            if 'in_size' in conn:
-                                if conn['in_size'] > 0:
-                                    pkt = recv(fileno, conn['in_size'])
-                                    conn['in_pkts'].append(pkt)
-                                    conn['in_size'] -= len(pkt)
-                                if conn['in_size'] == 0:
+                            if 'handler' not in conn:
+                                proto = struct.unpack('!B', recv(fileno, 1))[0]
+                                conn['handler'] = self.servers[proto]()
+                                conn['in_hdr_size'] = 4
+                                conn['in_hdr_pkts'] = list()
+                                result = conn['handler'].on_accept(conn['peer'])
+                            elif 'in_size' not in conn:
+                                pkt = recv(fileno, conn['in_hdr_size'])
+                                conn['in_hdr_pkts'].append(pkt)
+                                conn['in_hdr_size'] -= len(pkt)
+                                if 0 == conn['in_hdr_size']:
+                                    size = struct.unpack(
+                                        '!I',
+                                        ''.join(conn['in_hdr_pkts']))[0]
+                                    if 0 == size:
+                                        result = conn['handler'].on_recv('')
+                                    else:
+                                        conn['in_size'] = size
+                                        conn['in_pkts'] = list()
+                                    conn['in_hdr_size'] = 4
+                                    conn['in_hdr_pkts'] = list()
+                            else:
+                                pkt = recv(fileno, conn['in_size'])
+                                conn['in_pkts'].append(pkt)
+                                conn['in_size'] -= len(pkt)
+                                if 0 == conn['in_size']:
                                     buf = ''.join(conn['in_pkts'])
-                                    del(conn['in_pkts'])
                                     del(conn['in_size'])
-
-                                    self.on_read(fileno, peer, buf)
+                                    del(conn['in_pkts'])
+                                    result = conn['handler'].on_recv(buf)
 
                         if event & select.EPOLLOUT:
-                            conn = self.connections[fileno]
-                            peer = conn['sock'].getpeername()
-
                             if 'out_pkt' not in conn:
-                                self.on_connect(fileno, peer)
+                                if 'peer' not in conn:
+                                    conn['sock'].send(conn['proto'])
+                                    conn['peer'] = conn['sock'].getpeername()
+                                    conn['in_hdr_size'] = 4
+                                    conn['in_hdr_pkts'] = list()
+                                    conn['handler'].on_connect(conn['peer'])
+                                    flags |= select.EPOLLOUT
+                                else:
+                                    result = conn['handler'].on_send()
                             else:
-                                pkt = conn['out_pkt']
                                 sock = conn['sock']
 
-                                sent = sock.send(pkt[conn['out_sent']:])
-                                if 0 == sent:
-                                    raise Exception('could not send')
-                                conn['out_sent'] += sent
+                                if 4 != conn['out_hdr_sent']:
+                                    pkt = conn['out_hdr']
+                                    sent = sock.send(pkt[conn['out_hdr_sent']:])
+                                    conn['out_hdr_sent'] += sent
+                                else:
+                                    pkt = conn['out_pkt']
+                                    if len(pkt) > conn['out_sent']:
+                                        sent = sock.send(pkt[conn['out_sent']:])
+                                        conn['out_sent'] += sent
+                                    else:
+                                        del(conn['out_sent'])
+                                        del(conn['out_hdr_sent'])
+                                        del(conn['out_hdr'])
+                                        del(conn['out_pkt'])
+                                        result = conn['handler'].on_send()
 
-                                if len(pkt) == conn['out_sent']:
-                                    del(conn['out_sent'])
-                                    del(conn['out_pkt'])
-                                    self.on_write(fileno)
-                                self.epoll.modify(fileno, select.EPOLLIN)
+                        if result is not None:
+                            key, value = result
+                            if 'send' == key:
+                                conn['out_pkt'] = value
+                                conn['out_hdr'] = struct.pack('!I', len(value))
+                                conn['out_sent'] = 0
+                                conn['out_hdr_sent'] = 0
+
+                        if 'out_pkt' in conn:
+                            flags |= select.EPOLLOUT
+
+                        self.epoll.modify(fileno, flags)
 
                     if event & ~(select.EPOLLIN | select.EPOLLOUT):
                         raise Exception('unhandled event({0})'.format(event))
 
                 except Exception as e:
-                    self.on_close(fileno)
+                    if 'handler' in self.connections[fileno]:
+                        self.connections[fileno]['handler'].on_close()
+
                     self.epoll.unregister(fileno)
                     log('disconnected addr{0} {1}'.format(
-                        self.connections[fileno]['peer'],
+                        self.connections[fileno].get('peer'),
                         str(e)))
                     self.connections[fileno]['sock'].close()
                     del(self.connections[fileno])
 
-            self.timer()
+            #self.timer()
 
 
 class StatsServer():
-    def __init__(self, peer):
+    def on_accept(self, peer):
         self.peer = peer
 
-    def on_accept(self):
-        return ('recv', 4)
-
     def on_recv(self, buf):
-        log('stats_server{0} {1}'.format(self.peer, buf))
+        log('on_recv stats_server{0} {1}'.format(self.peer, buf))
         return ('send', buf)
 
     def on_send(self):
-        return ('recv', 4)
+        pass
+
+    def on_close(self):
+        log('on_close stats_server{0}'.format(self.peer))
 
 
 class StatsClient():
-    def __init__(self, peer):
-        self.peer = peer
+    def __init__(self):
+        self.peer = None
 
-    def on_connect(self):
-        return ('send', 'SABCD')
+    def on_connect(self, peer):
+        self.peer = peer
+        log('on_connect {0}'.format(self.peer))
+
+    def on_close(self):
+        log('on_close stats_server{0}'.format(self.peer))
 
     def on_recv(self, buf):
         log('stats_client{0} {1}'.format(self.peer, buf))
-        return ('send', 'ABCD')
 
     def on_send(self):
-        return ('recv', 4)
+        return ('send', 'ABCD')
 
 
 class Application(EPollLoop):
@@ -166,16 +204,6 @@ class Application(EPollLoop):
         for x in peers.split(','):
             ip, addr = x.split(':')
             self.peers[(ip, int(addr))] = None
-
-    def on_close(self, fileno):
-        log('on_close {0}'.format(fileno))
-        if fileno in self.conns:
-            self.conns[fileno]
-
-    def on_contacted(self, fileno, peer):
-        log('on_contacted {0}'.format(fileno))
-        self.conns[fileno] = dict(peer=peer, state='contacted')
-        self.recv(fileno, 1)
 
     def on_connect(self, fileno, peer):
         self.conns[fileno] = dict(peer=peer, state='client')
@@ -189,31 +217,8 @@ class Application(EPollLoop):
         elif 'send' == next:
             self.send(fileno, value)
 
-    def on_read(self, fileno, peer, buf):
-        conn = self.conns[fileno]
-        if 'contacted' == conn['state']:
-            if 'S' == buf:
-                conn['handler'] = StatsServer(peer)
-
-            conn['state'] = 'server'
-            next, value = conn['handler'].on_accept()
-        else:
-            next, value = conn['handler'].on_recv(buf)
-
-        if 'recv' == next:
-            self.recv(fileno, value)
-        elif 'send' == next:
-            self.send(fileno, value)
-
-    def on_write(self, fileno):
-        conn = self.conns[fileno]
-
-        next, value = conn['handler'].on_send()
-
-        if 'recv' == next:
-            self.recv(fileno, value)
-
     def timer(self):
+        return
         for peer, handler in self.peers.iteritems():
             if handler is None:
                 ip, port = peer
@@ -227,8 +232,12 @@ def test(ip, port):
     sock.send(struct.pack('!B', 83))
 
     while True:
-        sock.send('ABCDEFGH')
-        print(sock.recv(1000))
+        for i in range(10):
+            sock.send(struct.pack('!I', i))
+            sock.send(str(i) * i)
+            length = struct.unpack('!I', sock.recv(4))[0]
+            if length > 0:
+                print(sock.recv(length))
 
 if '__main__' == __name__:
     parser = optparse.OptionParser()
@@ -237,7 +246,11 @@ if '__main__' == __name__:
     opt, args = parser.parse_args()
 
     if 'server' == args[0]:
-        app = Application(opt.port, opt.peers)
+        app = EPollLoop(opt.port)
+        app.register_server(83, StatsServer)
+        for peer in opt.peers.split(','):
+            ip, port = peer.split(':')
+            app.connect(StatsClient(), ip, port, 83)
         app.run()
     else:
         test('localhost', opt.port)
