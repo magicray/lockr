@@ -29,21 +29,14 @@ class EPollLoop(object):
         self.servers = dict()
         self.connections = dict()
 
+        self.clients = list()
+        self.last_timestamp = time.time()
+
     def register_server(self, proto, class_name):
         self.servers[proto] = class_name
 
     def connect(self, handler, ip, port, proto):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setblocking(0)
-            self.connections[sock.fileno()] = dict(
-                sock=sock,
-                proto=struct.pack('!B', proto),
-                handler=handler)
-            self.epoll.register(sock.fileno(), select.EPOLLOUT)
-            sock.connect((ip, int(port)))
-        except:
-            pass
+        self.clients.append((handler, ip, port, proto))
 
     def run(self):
         def recv(fileno, size):
@@ -107,7 +100,8 @@ class EPollLoop(object):
                         if event & select.EPOLLOUT:
                             if 'out_pkt' not in conn:
                                 if 'peer' not in conn:
-                                    conn['sock'].send(conn['proto'])
+                                    proto = struct.pack('!B', conn['proto'])
+                                    conn['sock'].send(proto)
                                     conn['peer'] = conn['sock'].getpeername()
                                     conn['in_hdr_size'] = 4
                                     conn['in_hdr_pkts'] = list()
@@ -149,15 +143,41 @@ class EPollLoop(object):
                         raise Exception('unhandled event({0})'.format(event))
 
                 except Exception as e:
-                    if 'handler' in self.connections[fileno]:
-                        self.connections[fileno]['handler'].on_close()
+                    conn = self.connections[fileno]
+                    if 'handler' in conn:
+                        if 'peer' in conn:
+                            self.connections[fileno]['handler'].on_close()
+
+                        if 'proto' in conn:
+                            self.connect(conn['handler'],
+                                         conn['ip'],
+                                         conn['port'],
+                                         conn['proto'])
 
                     self.epoll.unregister(fileno)
                     log('disconnected addr{0} {1}'.format(
-                        self.connections[fileno].get('peer'),
+                        conn.get('peer'),
                         str(e)))
-                    self.connections[fileno]['sock'].close()
+                    conn['sock'].close()
                     del(self.connections[fileno])
+
+            if time.time() > (self.last_timestamp + 0.1):
+                self.last_timestamp = time.time()
+                while self.clients:
+                    handler, ip, port, proto = self.clients.pop()
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        s.setblocking(0)
+                        self.connections[s.fileno()] = dict(
+                            sock=s,
+                            ip=ip,
+                            port=port,
+                            proto=proto,
+                            handler=handler)
+                        self.epoll.register(s.fileno(), select.EPOLLOUT)
+                        s.connect((ip, int(port)))
+                    except:
+                        pass
 
 
 class StatsServer():
@@ -176,12 +196,8 @@ class StatsServer():
 
 
 class StatsClient():
-    def __init__(self):
-        self.peer = None
-
     def on_connect(self, peer):
         self.peer = peer
-        log('on_connect {0}'.format(self.peer))
 
     def on_close(self):
         log('on_close stats_server{0}'.format(self.peer))
