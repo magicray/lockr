@@ -41,7 +41,7 @@ class EPollLoop(object):
                 proto=struct.pack('!B', proto),
                 handler=handler)
             self.epoll.register(sock.fileno(), select.EPOLLOUT)
-            sock.connect((ip, port))
+            sock.connect((ip, int(port)))
         except:
             pass
 
@@ -67,6 +67,8 @@ class EPollLoop(object):
                         self.epoll.register(sock.fileno(), select.EPOLLIN)
                     else:
                         conn = self.connections[fileno]
+                        peer = conn.get('peer')
+                        sock = conn.get('sock')
                         result = None
                         flags = select.EPOLLIN
 
@@ -76,7 +78,7 @@ class EPollLoop(object):
                                 conn['handler'] = self.servers[proto]()
                                 conn['in_hdr_size'] = 4
                                 conn['in_hdr_pkts'] = list()
-                                result = conn['handler'].on_accept(conn['peer'])
+                                result = conn['handler'].on_accept(peer)
                             elif 'in_size' not in conn:
                                 pkt = recv(fileno, conn['in_hdr_size'])
                                 conn['in_hdr_pkts'].append(pkt)
@@ -114,17 +116,15 @@ class EPollLoop(object):
                                 else:
                                     result = conn['handler'].on_send()
                             else:
-                                sock = conn['sock']
-
                                 if 4 != conn['out_hdr_sent']:
                                     pkt = conn['out_hdr']
-                                    sent = sock.send(pkt[conn['out_hdr_sent']:])
-                                    conn['out_hdr_sent'] += sent
+                                    n = sock.send(pkt[conn['out_hdr_sent']:])
+                                    conn['out_hdr_sent'] += n
                                 else:
                                     pkt = conn['out_pkt']
                                     if len(pkt) > conn['out_sent']:
-                                        sent = sock.send(pkt[conn['out_sent']:])
-                                        conn['out_sent'] += sent
+                                        n = sock.send(pkt[conn['out_sent']:])
+                                        conn['out_sent'] += n
                                     else:
                                         del(conn['out_sent'])
                                         del(conn['out_hdr_sent'])
@@ -159,8 +159,6 @@ class EPollLoop(object):
                     self.connections[fileno]['sock'].close()
                     del(self.connections[fileno])
 
-            #self.timer()
-
 
 class StatsServer():
     def on_accept(self, peer):
@@ -189,41 +187,10 @@ class StatsClient():
         log('on_close stats_server{0}'.format(self.peer))
 
     def on_recv(self, buf):
-        log('stats_client{0} {1}'.format(self.peer, buf))
+        log('on_recv stats_client{0} {1}'.format(self.peer, buf))
 
     def on_send(self):
         return ('send', 'ABCD')
-
-
-class Application(EPollLoop):
-    def __init__(self, port, peers):
-        super(self.__class__, self).__init__(port)
-        self.conns = dict()
-
-        self.peers = dict()
-        for x in peers.split(','):
-            ip, addr = x.split(':')
-            self.peers[(ip, int(addr))] = None
-
-    def on_connect(self, fileno, peer):
-        self.conns[fileno] = dict(peer=peer, state='client')
-        self.conns[fileno]['handler'] = StatsClient(peer)
-        self.peers[peer] = fileno
-
-        next, value = self.conns[fileno]['handler'].on_connect()
-        log(str((next, value)))
-        if 'recv' == next:
-            self.recv(fileno, value)
-        elif 'send' == next:
-            self.send(fileno, value)
-
-    def timer(self):
-        return
-        for peer, handler in self.peers.iteritems():
-            if handler is None:
-                ip, port = peer
-                log('connecting to {0}'.format(str((ip, port))))
-                self.connect(ip, port)
 
 
 def test(ip, port):
