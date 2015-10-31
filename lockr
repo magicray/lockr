@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os
+import ssl
 import time
 import socket
 import struct
@@ -49,21 +50,50 @@ class EPollLoop(object):
 
         while True:
             for fileno, event in self.epoll.poll(0.1):
+                log('event {0} {1}'.format(fileno, event))
                 try:
                     if self.sock.fileno() == fileno:
                         sock, addr = self.sock.accept()
                         log('addr{0} connected'.format(addr))
                         sock.setblocking(0)
+                        sock=ssl.wrap_socket(sock,
+                                             keyfile='key',
+                                             certfile='cert',
+                                             do_handshake_on_connect=False,
+                                             server_side=True)
                         self.connections[sock.fileno()] = dict(
                             sock=sock,
+                            handshake_done=False,
                             peer=sock.getpeername())
-                        self.epoll.register(sock.fileno(), select.EPOLLIN)
+                        try:
+                            sock.do_handshake()
+                            conn['handshake_done'] = True
+                        except ssl.SSLError as e:
+                            if ssl.SSL_ERROR_WANT_READ == e.errno:
+                                self.epoll.register(sock.fileno(), select.EPOLLIN)
+                            elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                                self.epoll.register(sock.fileno(), select.EPOLLOUT)
+                            else:
+                               raise
                     else:
                         conn = self.connections[fileno]
                         peer = conn.get('peer')
                         sock = conn.get('sock')
                         result = None
                         flags = select.EPOLLIN
+
+                        if False == conn['handshake_done']:
+                            try:
+                                sock.do_handshake()
+                                conn['handshake_done'] = True
+                            except ssl.SSLError as e:
+                              if ssl.SSL_ERROR_WANT_READ == e.errno:
+                                self.epoll.register(sock.fileno(), select.EPOLLIN)
+                              elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                                self.epoll.register(sock.fileno(), select.EPOLLOUT)
+                              else:
+                                raise
+                            break
 
                         if event & select.EPOLLIN:
                             if 'handler' not in conn:
@@ -161,20 +191,22 @@ class EPollLoop(object):
                     conn['sock'].close()
                     del(self.connections[fileno])
 
-            if time.time() > (self.last_timestamp + 0.1):
+            if time.time() > (self.last_timestamp + 5.1):
                 self.last_timestamp = time.time()
                 while self.clients:
                     handler, ip, port, proto = self.clients.pop()
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         s.setblocking(0)
+                        s = ssl.wrap_socket(s, do_handshake_on_connect=False, server_side=False)
                         self.connections[s.fileno()] = dict(
                             sock=s,
                             ip=ip,
                             port=port,
                             proto=proto,
+                            handshake_done=False,
                             handler=handler)
-                        self.epoll.register(s.fileno(), select.EPOLLOUT)
+                        self.epoll.register(s.fileno(), select.EPOLLIN|select.EPOLLOUT)
                         s.connect((ip, int(port)))
                     except:
                         pass
@@ -210,14 +242,15 @@ class StatsClient():
 
 
 def test(ip, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock = ssl.wrap_socket(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
     sock.connect((ip, port))
     sock.send(struct.pack('!B', 83))
 
     while True:
         for i in range(10):
             sock.send(struct.pack('!I', i))
-            sock.send(str(i) * i)
+            if i > 0:
+                sock.send(str(i) * i)
             length = struct.unpack('!I', sock.recv(4))[0]
             if length > 0:
                 print(sock.recv(length))
@@ -236,4 +269,4 @@ if '__main__' == __name__:
             app.connect(StatsClient(), ip, port, 83)
         app.run()
     else:
-        test('localhost', opt.port)
+        test('127.0.0.1', opt.port)
