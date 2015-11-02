@@ -50,7 +50,6 @@ class EPollLoop(object):
 
         while True:
             for fileno, event in self.epoll.poll(0.1):
-                log('event {0} {1}'.format(fileno, event))
                 try:
                     if self.sock.fileno() == fileno:
                         sock, addr = self.sock.accept()
@@ -65,16 +64,7 @@ class EPollLoop(object):
                             sock=sock,
                             handshake_done=False,
                             peer=sock.getpeername())
-                        try:
-                            sock.do_handshake()
-                            conn['handshake_done'] = True
-                        except ssl.SSLError as e:
-                            if ssl.SSL_ERROR_WANT_READ == e.errno:
-                                self.epoll.register(sock.fileno(), select.EPOLLIN)
-                            elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
-                                self.epoll.register(sock.fileno(), select.EPOLLOUT)
-                            else:
-                               raise
+                        self.epoll.register(sock.fileno(), select.EPOLLIN)
                     else:
                         conn = self.connections[fileno]
                         peer = conn.get('peer')
@@ -83,17 +73,28 @@ class EPollLoop(object):
                         flags = select.EPOLLIN
 
                         if False == conn['handshake_done']:
+                            if None == getattr(sock, 'do_handshake', None):
+                                sock = ssl.wrap_socket(
+                                    sock,
+                                    do_handshake_on_connect=False,
+                                    server_side=False)
+                                conn['sock'] = sock
+
                             try:
                                 sock.do_handshake()
                                 conn['handshake_done'] = True
+                                if 'proto' in conn:
+                                    self.epoll.modify(fileno, select.EPOLLOUT)
+                                else:
+                                    self.epoll.modify(fileno, select.EPOLLIN)
                             except ssl.SSLError as e:
-                              if ssl.SSL_ERROR_WANT_READ == e.errno:
-                                self.epoll.register(sock.fileno(), select.EPOLLIN)
-                              elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
-                                self.epoll.register(sock.fileno(), select.EPOLLOUT)
-                              else:
-                                raise
-                            break
+                                if ssl.SSL_ERROR_WANT_READ == e.errno:
+                                    self.epoll.modify(fileno, select.EPOLLIN)
+                                elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                                    self.epoll.modify(fileno, select.EPOLLOUT)
+                                else:
+                                    raise
+                            continue
 
                         if event & select.EPOLLIN:
                             if 'handler' not in conn:
@@ -191,14 +192,13 @@ class EPollLoop(object):
                     conn['sock'].close()
                     del(self.connections[fileno])
 
-            if time.time() > (self.last_timestamp + 5.1):
+            if time.time() > (self.last_timestamp + 0.05):
                 self.last_timestamp = time.time()
                 while self.clients:
                     handler, ip, port, proto = self.clients.pop()
                     try:
                         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         s.setblocking(0)
-                        s = ssl.wrap_socket(s, do_handshake_on_connect=False, server_side=False)
                         self.connections[s.fileno()] = dict(
                             sock=s,
                             ip=ip,
@@ -206,10 +206,11 @@ class EPollLoop(object):
                             proto=proto,
                             handshake_done=False,
                             handler=handler)
-                        self.epoll.register(s.fileno(), select.EPOLLIN|select.EPOLLOUT)
+                        self.epoll.register(s.fileno(), select.EPOLLOUT)
                         s.connect((ip, int(port)))
-                    except:
-                        pass
+                    except Exception as e:
+                        if 115 != e.errno:
+                            raise
 
 
 class StatsServer():
@@ -217,7 +218,7 @@ class StatsServer():
         self.peer = peer
 
     def on_recv(self, buf):
-        log('on_recv stats_server{0} {1}'.format(self.peer, buf))
+        log('on_recv stats_server{0} {1}'.format(self.peer, len(buf)))
         return ('send', buf)
 
     def on_send(self):
@@ -235,10 +236,10 @@ class StatsClient():
         log('on_close stats_server{0}'.format(self.peer))
 
     def on_recv(self, buf):
-        log('on_recv stats_client{0} {1}'.format(self.peer, buf))
+        log('on_recv stats_client{0} {1}'.format(self.peer, len(buf)))
 
     def on_send(self):
-        return ('send', 'ABCD')
+        return ('send', 'ABCD' * 100000)
 
 
 def test(ip, port):
