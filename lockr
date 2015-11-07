@@ -97,7 +97,7 @@ class EPollLoop(object):
                                     continue
 
                                 if 0 == len(buf):
-                                    raise('nothing to read')
+                                    raise Exception('nothing to read')
 
                                 proto = struct.unpack('!B', buf)[0]
                                 conn['handler'] = self.servers[proto]()
@@ -112,9 +112,8 @@ class EPollLoop(object):
                                     continue
 
                                 if 0 == len(pkt):
-                                    raise('nothing to read')
+                                    raise Exception('nothing to read')
 
-                                #pkt = recv(fileno, conn['in_hdr_size'])
                                 conn['in_hdr_pkts'].append(pkt)
                                 conn['in_hdr_size'] -= len(pkt)
                                 if 0 == conn['in_hdr_size']:
@@ -136,9 +135,8 @@ class EPollLoop(object):
                                     continue
 
                                 if 0 == len(pkt):
-                                    raise('nothing to read')
+                                    raise Exception('nothing to read')
 
-                                #pkt = recv(fileno, conn['in_size'])
                                 conn['in_pkts'].append(pkt)
                                 conn['in_size'] -= len(pkt)
                                 if 0 == conn['in_size']:
