@@ -2,6 +2,7 @@
 import os
 import ssl
 import time
+import json
 import socket
 import struct
 import select
@@ -9,14 +10,21 @@ import optparse
 from OpenSSL import crypto
 
 
+######## Logger ################################################################
+logfd = os.open(
+    'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
+    os.O_CREAT | os.O_WRONLY | os.O_APPEND)  
+
+
 def log(msg):
     timestamp = time.time()
-    os.write(2, '{0}.{1} : {2}\n'.format(
+    os.write(logfd, '{0}.{1} : {2}\n'.format(
         time.strftime('%y%m%d.%H%M%S', time.gmtime(timestamp)),
         '%06d' % ((timestamp - int(timestamp)) * 10**6),
         msg))
 
 
+######## SSL/EPoll Loop ########################################################
 class EPollLoop(object):
     def __init__(self, port):
         key = crypto.PKey()
@@ -54,7 +62,7 @@ class EPollLoop(object):
         epoll.register(self.sock.fileno(), select.EPOLLIN)
 
         while True:
-            for fileno, event in epoll.poll(0.05):
+            for fileno, event in epoll.poll(0.01):
                 if self.sock.fileno() == fileno:
                     sock, addr = self.sock.accept()
                     log('connected {0}'.format(addr))
@@ -223,7 +231,7 @@ class EPollLoop(object):
                     conn['sock'].close()
                     del(self.connections[fileno])
 
-            if time.time() > (self.last_timestamp + 0.05):
+            if time.time() > (self.last_timestamp + 0.01):
                 self.last_timestamp = time.time()
 
                 while self.clients:
@@ -246,16 +254,30 @@ class EPollLoop(object):
                             raise
 
 
+######## Lockr #################################################################
+state = dict(
+    file_a=0,
+    file_y=0,
+    size_y=0,
+    file_z=0,
+    size_z=0,
+    committed=0,
+    peer_count=0)
+
+peer_state = dict()
+
+
 class StatsServer():
     def on_accept(self, peer):
         self.peer = peer
+        return ('send', json.dumps(state))
 
     def on_recv(self, buf):
         log('on_recv stats_server{0} {1}'.format(self.peer, len(buf)))
-        return ('send', buf)
+        return ('send', json.dumps(state))
 
     def on_send(self):
-        log('server on_send')
+        pass
 
     def on_close(self):
         log('on_close stats_server{0}'.format(self.peer))
@@ -264,17 +286,17 @@ class StatsServer():
 class StatsClient():
     def on_connect(self, peer):
         self.peer = peer
-        return ('send', 'ABCD' * 1000000)
-
-    def on_close(self):
-        log('on_close stats_server{0}'.format(self.peer))
+        return ('send', 'ok')
 
     def on_recv(self, buf):
         log('on_recv stats_client{0} {1}'.format(self.peer, len(buf)))
-        return ('send', 'ABCD' * 1000000)
+        return ('send', 'ok')
 
     def on_send(self):
-        log('client on_send')
+        pass
+
+    def on_close(self):
+        log('on_close stats_server{0}'.format(self.peer))
 
 
 if '__main__' == __name__:
@@ -288,4 +310,5 @@ if '__main__' == __name__:
     for peer in opt.peers.split(','):
         ip, port = peer.split(':')
         app.connect(StatsClient(), ip, port, 83)
+        state['peer_count'] += 1
     app.run()
