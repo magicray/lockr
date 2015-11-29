@@ -276,6 +276,7 @@ class StatsClient():
         pass
 
     def on_close(self):
+        peer_state[(self.conn['ip'], self.conn['port'])] = None
         return ('connect', self)
 
 
@@ -307,9 +308,7 @@ class LockrServer():
 
 class Lockr(object):
     def __init__(self, servers):
-        self.servers = set([(s[0], int(s[1])) for s in 
-            [srv.split(':') for srv in servers.split(',')]])
-
+        self.servers = servers
         self.sock = self.connect()
 
     def connect(self):
@@ -344,39 +343,32 @@ class Lockr(object):
         return json.loads(self.request(struct.pack('!B', 0)))
 
 
-def lockr_server():
-    os.dup2(os.open(
-        'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
-        os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
-
-
-    loop = EPollLoop(opt.port, {100:StatsServer, 200:LockrServer})
-
-    peer_state.update(dict([((p[0], int(p[1])), None) for p in 
-        [peer.split(':') for peer in opt.peers.split(',')]]))
-
-    for peer in peer_state:
-        loop.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
-
-    loop.run()
-
-
-def lockr_client():
-    cli = Lockr(opt.servers)  
-
-    if 'state' == opt.cmd:
-        print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
-
-
 if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('--port', dest='port', type='int')
-    parser.add_option('--peers', dest='peers', type='string')
     parser.add_option('--cmd', dest='cmd', type='string')
     parser.add_option('--servers', dest='servers', type='string')
     opt, args = parser.parse_args()
 
-    if opt.servers:
-        lockr_client()
+    server_list = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
+                          map(lambda x: x.split(':'),
+                              opt.servers.split(','))))
+
+    if opt.port:
+        os.dup2(os.open(
+            'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
+            os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
+
+        loop = EPollLoop(opt.port, {100:StatsServer, 200:LockrServer})
+
+        peer_state.update(dict((ip_port, None) for ip_port in server_list))
+
+        for peer in peer_state:
+            loop.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
+
+        loop.run()
     else:
-        lockr_server()
+        cli = Lockr(server_list)
+
+        if 'state' == opt.cmd:
+            print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
