@@ -10,16 +10,6 @@ import optparse
 from OpenSSL import crypto
 
 
-######## Logger ################################################################
-def log(msg):
-    timestamp = time.time()
-    os.write(2, '{0}.{1} : {2}\n'.format(
-        time.strftime('%y%m%d.%H%M%S', time.gmtime(timestamp)),
-        '%06d' % ((timestamp - int(timestamp)) * 10**6),
-        msg))
-
-
-######## SSL/EPoll Loop ########################################################
 class EPollLoop(object):
     def __init__(self, port, servers):
         key = crypto.PKey()
@@ -67,11 +57,11 @@ class EPollLoop(object):
                 if self.sock.fileno() == fileno:
                     sock, addr = self.sock.accept()
                     sock.setblocking(0)
-                    sock=ssl.wrap_socket(sock,
-                                         keyfile='key',
-                                         certfile='cert',
-                                         do_handshake_on_connect=False,
-                                         server_side=True)
+                    sock = ssl.wrap_socket(sock,
+                                           keyfile='key',
+                                           certfile='cert',
+                                           do_handshake_on_connect=False,
+                                           server_side=True)
                     self.connections[sock.fileno()] = dict(
                         sock=sock,
                         handshake_done=False,
@@ -231,17 +221,13 @@ class EPollLoop(object):
                             self.connect(result[1])
 
 
-######## Lockr #################################################################
-my_state = dict(
-    file_a=0,
-    file_y=0,
-    size_y=0,
-    file_z=0,
-    size_z=0,
-    committed=0,
-    peer_count=0)
+def log(msg):
+    timestamp = time.time()
+    os.write(2, '{0}.{1} : {2}\n'.format(
+        time.strftime('%y%m%d.%H%M%S', time.gmtime(timestamp)),
+        '%06d' % ((timestamp - int(timestamp)) * 10**6),
+        msg))
 
-peer_state = dict()
 
 class StatsServer():
     def __init__(self):
@@ -314,7 +300,6 @@ class Lockr(object):
     def connect(self):
         for ip, port in self.servers:
             try:
-                print((ip, port))
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock = ssl.wrap_socket(sock)
                 sock.connect((ip, port))
@@ -359,14 +344,23 @@ if '__main__' == __name__:
             'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
-        loop = EPollLoop(opt.port, {100:StatsServer, 200:LockrServer})
+        my_state = dict(
+            file_a=0,
+            file_y=0,
+            size_y=0,
+            file_z=0,
+            size_z=0,
+            committed=0,
+            peer_count=0)
 
-        peer_state.update(dict((ip_port, None) for ip_port in server_list))
+        peer_state = dict((ip_port, None) for ip_port in server_list)
+
+        app = EPollLoop(opt.port, {100: StatsServer, 200: LockrServer})
 
         for peer in peer_state:
-            loop.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
+            app.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
 
-        loop.run()
+        app.run()
     else:
         cli = Lockr(server_list)
 
