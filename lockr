@@ -45,6 +45,7 @@ class EPollLoop(object):
             for fileno, event in self.epoll.poll():
                 if self.sock.fileno() == fileno:
                     sock, addr = self.sock.accept()
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                     self.stats['srv_accept'] += 1
                     sock.setblocking(0)
                     sock = ssl.wrap_socket(sock,
@@ -195,10 +196,9 @@ class EPollLoop(object):
                                     flags = select.EPOLLIN
 
                     if result is not None:
-                        key, value = result
-                        if 'send' == key:
-                            conn['out_pkt'] = value
-                            conn['out_hdr'] = struct.pack('!I', len(value))
+                        if 'send' == result[0]:
+                            conn['out_pkt'] = result[1]
+                            conn['out_hdr'] = struct.pack('!I', len(result[1]))
                             conn['out_sent'] = 0
                             conn['out_hdr_sent'] = 0
                             flags = select.EPOLLOUT
@@ -227,6 +227,7 @@ class EPollLoop(object):
 
     def connect(self, handler):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.setblocking(0)
         self.connections[s.fileno()] = dict(
             sock=s,
@@ -251,48 +252,38 @@ def log(msg):
 
 
 class StatsServer():
-    def __init__(self):
-        self.conn = dict()
-
-    def on_accept(self, peer):
-        self.peer = peer
-        return ('send', json.dumps(my_state))
+    def on_accept(self, peer): pass
+    def on_send(self): pass
+    def on_close(self): pass
 
     def on_recv(self, buf):
         return ('send', json.dumps(my_state))
-
-    def on_send(self):
-        pass
-
-    def on_close(self):
-        pass
 
 
 class StatsClient():
     def __init__(self, conn):
         self.conn = conn
-
-    def on_connect(self):
-        return ('send', 'ok')
-
-    def on_recv(self, buf):
-        peer_state[(self.conn['ip'], self.conn['port'])] = json.loads(buf)
-        return ('send', 'ok')
+        self.key = (conn['ip'], conn['port'])
 
     def on_send(self):
         pass
 
+    def on_connect(self):
+        return ('send', '')
+
+    def on_recv(self, buf):
+        peer_state[self.key] = json.loads(buf)
+        return ('send', '')
+
     def on_close(self):
-        peer_state[(self.conn['ip'], self.conn['port'])] = None
+        peer_state[self.key] = None
         return ('connect', self)
 
 
 class LockrServer():
-    def __init__(self):
-        self.conn = dict()
-
-    def on_accept(self, peer):
-        self.peer = peer
+    def on_accept(self, peer): pass
+    def on_send(self): pass
+    def on_close(self): pass
 
     def on_recv(self, buf):
         cmd = struct.unpack('!B', buf[0])[0]
@@ -309,12 +300,6 @@ class LockrServer():
 
         return ('send', res)
 
-    def on_send(self):
-        pass
-
-    def on_close(self):
-        pass
-
 
 class Lockr(object):
     def __init__(self, servers):
@@ -325,6 +310,7 @@ class Lockr(object):
         for ip, port in self.servers:
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock = ssl.wrap_socket(sock)
                 sock.connect((ip, port))
                 sock.send(struct.pack('!B', 200))
