@@ -241,10 +241,6 @@ class EPollLoop(object):
             if 115 != e.errno:
                 raise
 
-    def get_stats(self):
-        self.stats['timestamp'] = time.strftime('%y%m%d.%H%M%S', time.gmtime())
-        return self.stats
-
 
 def log(msg):
     timestamp = time.time()
@@ -260,11 +256,9 @@ class StatsServer():
 
     def on_accept(self, peer):
         self.peer = peer
-        my_state['stats'] = app.get_stats()
         return ('send', json.dumps(my_state))
 
     def on_recv(self, buf):
-        my_state['stats'] = app.get_stats()
         return ('send', json.dumps(my_state))
 
     def on_send(self):
@@ -308,7 +302,10 @@ class LockrServer():
             state = dict()
             for ip, port in peer_state:
                 state['{0}:{1}'.format(ip, port)] = peer_state[(ip, port)]
-            res = json.dumps(dict(my_state=my_state, peer_state=state))
+            res = json.dumps(dict(
+                my_state=my_state,
+                peer_state=state,
+                timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
 
         return ('send', res)
 
@@ -371,6 +368,13 @@ if '__main__' == __name__:
             'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
+        peer_state = dict((ip_port, None) for ip_port in server_list)
+
+        app = EPollLoop(opt.port, {100: StatsServer, 200: LockrServer})
+
+        for peer in peer_state:
+            app.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
+
         my_state = dict(
             file_a=0,
             file_y=0,
@@ -378,14 +382,8 @@ if '__main__' == __name__:
             file_z=0,
             size_z=0,
             committed=0,
-            peer_count=0)
-
-        peer_state = dict((ip_port, None) for ip_port in server_list)
-
-        app = EPollLoop(opt.port, {100: StatsServer, 200: LockrServer})
-
-        for peer in peer_state:
-            app.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
+            peer_count=0,
+            stats=app.stats)
 
         app.run()
     else:
