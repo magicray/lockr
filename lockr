@@ -36,26 +36,16 @@ class EPollLoop(object):
 
         self.servers = servers
         self.connections = dict()
-
-    def connect(self, handler):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setblocking(0)
-        self.connections[s.fileno()] = dict(
-            sock=s,
-            handshake_done=False,
-            handler=handler)
-        self.epoll.register(s.fileno(), select.EPOLLOUT)
-        try:
-            s.connect((handler.conn['ip'], handler.conn['port']))
-        except Exception as e:
-            if 115 != e.errno:
-                raise
+        self.stats = dict(in_pkt=0, in_bytes=0, out_pkt=0, out_bytes=0,
+                          srv_accept=0, srv_established=0, srv_disconnect=0,
+                          cli_connect=0, cli_established=0, cli_disconnect=0)
 
     def run(self):
         while True:
             for fileno, event in self.epoll.poll():
                 if self.sock.fileno() == fileno:
                     sock, addr = self.sock.accept()
+                    self.stats['srv_accept'] += 1
                     sock.setblocking(0)
                     sock = ssl.wrap_socket(sock,
                                            keyfile='key',
@@ -64,6 +54,7 @@ class EPollLoop(object):
                                            server_side=True)
                     self.connections[sock.fileno()] = dict(
                         sock=sock,
+                        is_server=True,
                         handshake_done=False,
                         peer=sock.getpeername())
                     self.epoll.register(sock.fileno(), select.EPOLLIN)
@@ -108,6 +99,7 @@ class EPollLoop(object):
 
                         try:
                             buf = conn['sock'].recv(read_bytes)
+                            self.stats['in_bytes'] += len(buf)
                         except Exception as e:
                             self.epoll.modify(fileno, select.EPOLLIN)
                             continue
@@ -121,6 +113,7 @@ class EPollLoop(object):
                             conn['in_hdr_size'] = 4
                             conn['in_hdr_pkts'] = list()
                             log('accepted {0}'.format(conn['peer']))
+                            self.stats['srv_established'] += 1
                             result = conn['handler'].on_accept(conn['peer'])
                         elif 'in_size' not in conn:
                             conn['in_hdr_pkts'].append(buf)
@@ -130,6 +123,7 @@ class EPollLoop(object):
                                     '!I',
                                     ''.join(conn['in_hdr_pkts']))[0]
                                 if 0 == size:
+                                    self.stats['in_pkt'] += 1
                                     result = conn['handler'].on_recv('')
                                 else:
                                     conn['in_size'] = size
@@ -143,6 +137,7 @@ class EPollLoop(object):
                                 pkt = ''.join(conn['in_pkts'])
                                 del(conn['in_size'])
                                 del(conn['in_pkts'])
+                                self.stats['in_pkt'] += 1
                                 result = conn['handler'].on_recv(pkt)
 
                     if event & select.EPOLLOUT:
@@ -157,11 +152,14 @@ class EPollLoop(object):
                                     conn['in_hdr_size'] = 4
                                     conn['in_hdr_pkts'] = list()
                                     log('connected {0}'.format(conn['peer']))
+                                    self.stats['cli_established'] += 1
+                                    self.stats['out_bytes'] += 1
                                     result = conn['handler'].on_connect()
                                 else:
                                     log('unexpected code path')
                                     exit(0)
                             else:
+                                self.stats['out_pkt'] += 1
                                 result = conn['handler'].on_send()
                         else:
                             if 4 != conn['out_hdr_sent']:
@@ -174,6 +172,7 @@ class EPollLoop(object):
                                 if n > 0:
                                     del(conn['snd_hdr'])
                                     conn['out_hdr_sent'] += n
+                                    self.stats['out_bytes'] += n
                             else:
                                 pkt = conn['out_pkt']
                                 if len(pkt) > conn['out_sent']:
@@ -185,11 +184,13 @@ class EPollLoop(object):
                                     if n > 0:
                                         del(conn['snd_pkt'])
                                         conn['out_sent'] += n
+                                        self.stats['out_bytes'] += n
                                 else:
                                     del(conn['out_sent'])
                                     del(conn['out_hdr_sent'])
                                     del(conn['out_hdr'])
                                     del(conn['out_pkt'])
+                                    self.stats['out_pkt'] += 1
                                     result = conn['handler'].on_send()
                                     flags = select.EPOLLIN
 
@@ -212,6 +213,10 @@ class EPollLoop(object):
                     del(self.connections[fileno])
                     self.epoll.unregister(fileno)
                     conn['sock'].close()
+                    if conn['is_server']:
+                        self.stats['srv_disconnect'] += 1
+                    else:
+                        self.stats['cli_disconnect'] += 1
                     if 'peer' in conn:
                         log('disconnected peer{0} reason({1})'.format(
                             conn['peer'], str(e)))
@@ -219,6 +224,26 @@ class EPollLoop(object):
                         result = conn['handler'].on_close()
                         if result and ('connect' == result[0]):
                             self.connect(result[1])
+
+    def connect(self, handler):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setblocking(0)
+        self.connections[s.fileno()] = dict(
+            sock=s,
+            handshake_done=False,
+            is_server=False,
+            handler=handler)
+        self.epoll.register(s.fileno(), select.EPOLLOUT)
+        try:
+            self.stats['cli_connect'] += 1
+            s.connect((handler.conn['ip'], handler.conn['port']))
+        except Exception as e:
+            if 115 != e.errno:
+                raise
+
+    def get_stats(self):
+        self.stats['timestamp'] = time.strftime('%y%m%d.%H%M%S', time.gmtime())
+        return self.stats
 
 
 def log(msg):
@@ -235,9 +260,11 @@ class StatsServer():
 
     def on_accept(self, peer):
         self.peer = peer
+        my_state['stats'] = app.get_stats()
         return ('send', json.dumps(my_state))
 
     def on_recv(self, buf):
+        my_state['stats'] = app.get_stats()
         return ('send', json.dumps(my_state))
 
     def on_send(self):
