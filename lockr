@@ -87,10 +87,8 @@ class EPollLoop(object):
                                 raise
                         continue
 
-                    result = None
-
                     if event & select.EPOLLIN:
-                        flags = select.EPOLLIN
+                        result = select.EPOLLIN
                         if 'handler' not in conn:
                             read_bytes = 1
                         elif 'in_size' not in conn:
@@ -141,8 +139,8 @@ class EPollLoop(object):
                                 self.stats['in_pkt'] += 1
                                 result = conn['handler'].on_recv(pkt)
 
-                    if event & select.EPOLLOUT:
-                        flags = select.EPOLLOUT
+                    elif event & select.EPOLLOUT:
+                        result = select.EPOLLOUT
                         if 'out_pkt' not in conn:
                             if 'peer' not in conn:
                                 proto = struct.pack(
@@ -193,20 +191,20 @@ class EPollLoop(object):
                                     del(conn['out_pkt'])
                                     self.stats['out_pkt'] += 1
                                     result = conn['handler'].on_send()
-                                    flags = select.EPOLLIN
+                    else:
+                        raise Exception('unhandled event({0})'.format(event))
 
-                    if result is not None:
-                        if 'send' == result[0]:
-                            conn['out_pkt'] = result[1]
-                            conn['out_hdr'] = struct.pack('!I', len(result[1]))
+                    if result in (select.EPOLLIN, select.EPOLLOUT):
+                            self.epoll.modify(fileno, result)
+                    elif result is not False:
+                        if result is True:
+                            self.epoll.modify(fileno, select.EPOLLIN)
+                        else:
+                            conn['out_pkt'] = result
+                            conn['out_hdr'] = struct.pack('!I', len(result))
                             conn['out_sent'] = 0
                             conn['out_hdr_sent'] = 0
-                            flags = select.EPOLLOUT
-
-                    self.epoll.modify(fileno, flags)
-
-                    if event & ~(select.EPOLLIN | select.EPOLLOUT):
-                        raise Exception('unhandled event({0})'.format(event))
+                            self.epoll.modify(fileno, select.EPOLLOUT)
 
                 except Exception as e:
                     conn = self.connections[fileno]
@@ -221,9 +219,8 @@ class EPollLoop(object):
                         log('disconnected peer{0} reason({1})'.format(
                             conn['peer'], str(e)))
                     if 'handler' in conn:
-                        result = conn['handler'].on_close()
-                        if result and ('connect' == result[0]):
-                            self.connect(result[1])
+                        if conn['handler'].on_close() is True:
+                            self.connect(conn['handler'])
 
     def connect(self, handler):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -252,12 +249,17 @@ def log(msg):
 
 
 class StatsServer():
-    def on_accept(self, peer): pass
-    def on_send(self): pass
-    def on_close(self): pass
+    def on_accept(self, peer):
+        return True
 
     def on_recv(self, buf):
-        return ('send', json.dumps(my_state))
+        return json.dumps(my_state)
+
+    def on_send(self):
+        return True
+
+    def on_close(self):
+        pass
 
 
 class StatsClient():
@@ -265,25 +267,24 @@ class StatsClient():
         self.conn = conn
         self.key = (conn['ip'], conn['port'])
 
-    def on_send(self):
-        pass
-
     def on_connect(self):
-        return ('send', '')
+        return ''
 
     def on_recv(self, buf):
         peer_state[self.key] = json.loads(buf)
-        return ('send', '')
+        return ''
+
+    def on_send(self):
+        return True
 
     def on_close(self):
         peer_state[self.key] = None
-        return ('connect', self)
+        return True
 
 
 class LockrServer():
-    def on_accept(self, peer): pass
-    def on_send(self): pass
-    def on_close(self): pass
+    def on_accept(self, peer):
+        return True
 
     def on_recv(self, buf):
         cmd = struct.unpack('!B', buf[0])[0]
@@ -298,7 +299,13 @@ class LockrServer():
                 peer_state=state,
                 timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
 
-        return ('send', res)
+        return res
+
+    def on_send(self):
+        return True
+
+    def on_close(self):
+        pass
 
 
 class Lockr(object):
