@@ -352,7 +352,9 @@ if '__main__' == __name__:
     parser.add_option('--servers', dest='servers', type='string')
     opt, args = parser.parse_args()
 
-    server_list = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
+    servers = set()
+    if opt.servers:
+        servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
                           map(lambda x: x.split(':'),
                               opt.servers.split(','))))
 
@@ -361,7 +363,7 @@ if '__main__' == __name__:
             'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
-        peer_state = dict((ip_port, None) for ip_port in server_list)
+        peer_state = dict((ip_port, None) for ip_port in servers)
 
         app = EPollLoop(opt.port, {100: StatsServer, 200: LockrServer})
 
@@ -380,7 +382,7 @@ if '__main__' == __name__:
 
         app.run()
     else:
-        cli = Lockr(server_list)
+        cli = Lockr(servers)
 
         if 'state' == opt.cmd:
             print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
