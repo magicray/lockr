@@ -6,6 +6,7 @@ import json
 import socket
 import struct
 import select
+import hashlib
 import optparse
 from OpenSSL import crypto
 
@@ -294,10 +295,26 @@ class LockrServer():
             state = dict()
             for ip, port in peer_state:
                 state['{0}:{1}'.format(ip, port)] = peer_state[(ip, port)]
+
             res = json.dumps(dict(
                 my_state=my_state,
                 peer_state=state,
                 timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
+        elif 1 == cmd:
+            docs = dict()
+            i = 1
+            while i < len(buf):
+                key = buf[i:i+32]
+                file = struct.unpack('!I', buf[i+32:i+36])[0]
+                offset = struct.unpack('!I', buf[i+36:i+40])[0]
+                length = struct.unpack('!I', buf[i+40:i+44])[0]
+                i += 44 + length
+
+                if key in docs:
+                    raise Exception('duplicate record')
+
+                docs[key] = (file, offset, length)
+            return json.dumps('ok')
 
         return res
 
@@ -344,6 +361,16 @@ class Lockr(object):
     def get_state(self):
         return json.loads(self.request(struct.pack('!B', 0)))
 
+    def put(self, docs):
+        items = [struct.pack('!B', 1)]
+        for k, v in docs.iteritems():
+            items.append(hashlib.sha256(k).digest())
+            items.append(struct.pack('!II', v[0]/(2**32), v[0]%(2**32)))
+            items.append(struct.pack('!I', len(v[1])))
+            items.append(v[1])
+
+        return self.request(''.join(items))
+
 
 if '__main__' == __name__:
     parser = optparse.OptionParser()
@@ -386,3 +413,6 @@ if '__main__' == __name__:
 
         if 'state' == opt.cmd:
             print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
+        elif 'put' == opt.cmd:
+            docs = dict(abcd=(10000000001000000000, 'Bhupendra'))
+            print(json.dumps(cli.put(docs), indent=4, sort_keys=True))
