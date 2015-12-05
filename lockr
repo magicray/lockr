@@ -5,13 +5,14 @@ import time
 import json
 import socket
 import struct
-import select
 import hashlib
 import optparse
-from OpenSSL import crypto
 
 
 def epoll_loop(port, servers, clients, stats):
+    import select
+    from OpenSSL import crypto
+
     key = crypto.PKey()
     key.generate_key(crypto.TYPE_RSA, 1024)
     cert = crypto.X509()
@@ -76,7 +77,6 @@ def epoll_loop(port, servers, clients, stats):
                     peer=s.getpeername())
                 epoll.register(s.fileno(), select.EPOLLIN)
                 continue
-
             try:
                 conn = connections[fileno]
 
@@ -86,7 +86,6 @@ def epoll_loop(port, servers, clients, stats):
                             conn['sock'],
                             do_handshake_on_connect=False,
                             server_side=False)
-
                     try:
                         conn['sock'].do_handshake()
                         conn['handshake_done'] = True
@@ -252,7 +251,7 @@ class StatsServer():
         return True
 
     def on_recv(self, buf):
-        return json.dumps(my_state)
+        return json.dumps(local)
 
     def on_send(self):
         return True
@@ -270,14 +269,14 @@ class StatsClient():
         return ''
 
     def on_recv(self, buf):
-        peer_state[self.key] = json.loads(buf)
+        peers[self.key] = json.loads(buf)
         return ''
 
     def on_send(self):
         return True
 
     def on_close(self):
-        peer_state[self.key] = None
+        peers[self.key] = None
         return True
 
 
@@ -291,12 +290,12 @@ class LockrServer():
 
         if 0 == cmd:
             state = dict()
-            for ip, port in peer_state:
-                state['{0}:{1}'.format(ip, port)] = peer_state[(ip, port)]
+            for ip, port in peers:
+                state['{0}:{1}'.format(ip, port)] = peers[(ip, port)]
 
             res = json.dumps(dict(
-                my_state=my_state,
-                peer_state=state,
+                local=local,
+                peers=state,
                 timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
         elif 1 == cmd:
             docs = dict()
@@ -395,7 +394,6 @@ if '__main__' == __name__:
     parser.add_option('--servers', dest='servers', type='string')
     opt, args = parser.parse_args()
 
-    servers = set()
     if opt.servers:
         servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
                           map(lambda x: x.split(':'),
@@ -408,9 +406,8 @@ if '__main__' == __name__:
 
         lockrdata = LockrData()
 
-        peer_state = dict((ip_port, None) for ip_port in servers)
-
-        my_state = dict(
+        peers = dict((ip_port, None) for ip_port in servers)
+        local = dict(
             file_a=0,
             file_y=0,
             size_y=0,
@@ -423,9 +420,8 @@ if '__main__' == __name__:
         epoll_loop(
             opt.port,
             {100: StatsServer, 200: LockrServer},
-            map(lambda p: StatsClient(dict(ip=p[0], port=p[1], proto=100)),
-                peer_state),
-            my_state['stats'])
+            [StatsClient(dict(ip=p[0], port=p[1], proto=100)) for p in peers],
+            local['stats'])
     else:
         cli = Lockr(servers)
 
