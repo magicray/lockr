@@ -11,234 +11,232 @@ import optparse
 from OpenSSL import crypto
 
 
-class EPollLoop(object):
-    def __init__(self, port, servers):
-        key = crypto.PKey()
-        key.generate_key(crypto.TYPE_RSA, 1024)
-        cert = crypto.X509()
-        cert.gmtime_adj_notBefore(0)
-        cert.gmtime_adj_notAfter(30*24*60*60)
-        cert.set_pubkey(key)
-        cert.sign(key, 'sha1')
+def epoll_loop(port, servers, clients, stats):
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, 1024)
+    cert = crypto.X509()
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(30*24*60*60)
+    cert.set_pubkey(key)
+    cert.sign(key, 'sha1')
 
-        with open('cert', 'w') as fd:
-            fd.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
-        with open('key', 'w') as fd:
-            fd.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
+    with open('cert', 'w') as fd:
+        fd.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+    with open('key', 'w') as fd:
+        fd.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
 
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(('0.0.0.0', port))
-        self.sock.listen(5)
-        self.sock.setblocking(0)
+    listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener_sock.bind(('0.0.0.0', port))
+    listener_sock.listen(5)
+    listener_sock.setblocking(0)
 
-        self.epoll = select.epoll()
-        self.epoll.register(self.sock.fileno(), select.EPOLLIN)
+    epoll = select.epoll()
+    epoll.register(listener_sock.fileno(), select.EPOLLIN)
 
-        self.servers = servers
-        self.connections = dict()
-        self.stats = dict(in_pkt=0, in_bytes=0, out_pkt=0, out_bytes=0,
-                          srv_accept=0, srv_established=0, srv_disconnect=0,
-                          cli_connect=0, cli_established=0, cli_disconnect=0)
+    stats.update(dict(in_pkt=0, in_bytes=0, out_pkt=0, out_bytes=0,
+                      srv_accept=0, srv_established=0, srv_disconnect=0,
+                      cli_connect=0, cli_established=0, cli_disconnect=0))
+    connections = dict()
 
-    def run(self):
-        while True:
-            for fileno, event in self.epoll.poll():
-                if self.sock.fileno() == fileno:
-                    sock, addr = self.sock.accept()
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    self.stats['srv_accept'] += 1
-                    sock.setblocking(0)
-                    sock = ssl.wrap_socket(sock,
-                                           keyfile='key',
-                                           certfile='cert',
-                                           do_handshake_on_connect=False,
-                                           server_side=True)
-                    self.connections[sock.fileno()] = dict(
-                        sock=sock,
-                        is_server=True,
-                        handshake_done=False,
-                        peer=sock.getpeername())
-                    self.epoll.register(sock.fileno(), select.EPOLLIN)
+    while True:
+        while clients:
+            handler = clients.pop()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.setblocking(0)
+            connections[s.fileno()] = dict(
+                sock=s,
+                handshake_done=False,
+                is_server=False,
+                handler=handler)
+            epoll.register(s.fileno(), select.EPOLLOUT)
+            try:
+                stats['cli_connect'] += 1
+                s.connect((handler.conn['ip'], handler.conn['port']))
+            except Exception as e:
+                if 115 != e.errno:
+                    raise
+
+        for fileno, event in epoll.poll():
+            if listener_sock.fileno() == fileno:
+                s, addr = listener_sock.accept()
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                stats['srv_accept'] += 1
+                s.setblocking(0)
+                s = ssl.wrap_socket(s,
+                                    keyfile='key',
+                                    certfile='cert',
+                                    do_handshake_on_connect=False,
+                                    server_side=True)
+                connections[s.fileno()] = dict(
+                    sock=s,
+                    is_server=True,
+                    handshake_done=False,
+                    peer=s.getpeername())
+                epoll.register(s.fileno(), select.EPOLLIN)
+                continue
+
+            try:
+                conn = connections[fileno]
+
+                if False == conn['handshake_done']:
+                    if getattr(conn['sock'], 'do_handshake', None) is None:
+                        conn['sock'] = ssl.wrap_socket(
+                            conn['sock'],
+                            do_handshake_on_connect=False,
+                            server_side=False)
+
+                    try:
+                        conn['sock'].do_handshake()
+                        conn['handshake_done'] = True
+                        if 'handler' in conn:
+                            epoll.modify(fileno, select.EPOLLOUT)
+                        else:
+                            epoll.modify(fileno, select.EPOLLIN)
+                    except ssl.SSLError as e:
+                        if ssl.SSL_ERROR_WANT_READ == e.errno:
+                            epoll.modify(fileno, select.EPOLLIN)
+                        elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                            epoll.modify(fileno, select.EPOLLOUT)
+                        else:
+                            raise
                     continue
 
-                try:
-                    conn = self.connections[fileno]
+                if event & select.EPOLLIN:
+                    result = select.EPOLLIN
+                    if 'handler' not in conn:
+                        read_bytes = 1
+                    elif 'in_size' not in conn:
+                        read_bytes = conn['in_hdr_size']
+                    else:
+                        read_bytes = conn['in_size']
 
-                    if False == conn['handshake_done']:
-                        if getattr(conn['sock'], 'do_handshake', None) is None:
-                            conn['sock'] = ssl.wrap_socket(
-                                conn['sock'],
-                                do_handshake_on_connect=False,
-                                server_side=False)
-
-                        try:
-                            conn['sock'].do_handshake()
-                            conn['handshake_done'] = True
-                            if 'handler' in conn:
-                                self.epoll.modify(fileno, select.EPOLLOUT)
-                            else:
-                                self.epoll.modify(fileno, select.EPOLLIN)
-                        except ssl.SSLError as e:
-                            if ssl.SSL_ERROR_WANT_READ == e.errno:
-                                self.epoll.modify(fileno, select.EPOLLIN)
-                            elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
-                                self.epoll.modify(fileno, select.EPOLLOUT)
-                            else:
-                                raise
+                    try:
+                        buf = conn['sock'].recv(read_bytes)
+                        stats['in_bytes'] += len(buf)
+                    except Exception as e:
+                        epoll.modify(fileno, select.EPOLLIN)
                         continue
 
-                    if event & select.EPOLLIN:
-                        result = select.EPOLLIN
-                        if 'handler' not in conn:
-                            read_bytes = 1
-                        elif 'in_size' not in conn:
-                            read_bytes = conn['in_hdr_size']
-                        else:
-                            read_bytes = conn['in_size']
+                    if 0 == len(buf):
+                        raise Exception('recv returned zero bytes')
 
-                        try:
-                            buf = conn['sock'].recv(read_bytes)
-                            self.stats['in_bytes'] += len(buf)
-                        except Exception as e:
-                            self.epoll.modify(fileno, select.EPOLLIN)
-                            continue
-
-                        if 0 == len(buf):
-                            raise Exception('recv returned zero bytes')
-
-                        if 'handler' not in conn:
-                            proto = struct.unpack('!B', buf)[0]
-                            conn['handler'] = self.servers[proto]()
+                    if 'handler' not in conn:
+                        proto = struct.unpack('!B', buf)[0]
+                        conn['handler'] = servers[proto]()
+                        conn['in_hdr_size'] = 4
+                        conn['in_hdr_pkts'] = list()
+                        log('accepted {0}'.format(conn['peer']))
+                        stats['srv_established'] += 1
+                        result = conn['handler'].on_accept(conn['peer'])
+                    elif 'in_size' not in conn:
+                        conn['in_hdr_pkts'].append(buf)
+                        conn['in_hdr_size'] -= len(buf)
+                        if 0 == conn['in_hdr_size']:
+                            size = struct.unpack(
+                                '!I',
+                                ''.join(conn['in_hdr_pkts']))[0]
+                            if 0 == size:
+                                stats['in_pkt'] += 1
+                                result = conn['handler'].on_recv('')
+                            else:
+                                conn['in_size'] = size
+                                conn['in_pkts'] = list()
                             conn['in_hdr_size'] = 4
                             conn['in_hdr_pkts'] = list()
-                            log('accepted {0}'.format(conn['peer']))
-                            self.stats['srv_established'] += 1
-                            result = conn['handler'].on_accept(conn['peer'])
-                        elif 'in_size' not in conn:
-                            conn['in_hdr_pkts'].append(buf)
-                            conn['in_hdr_size'] -= len(buf)
-                            if 0 == conn['in_hdr_size']:
-                                size = struct.unpack(
-                                    '!I',
-                                    ''.join(conn['in_hdr_pkts']))[0]
-                                if 0 == size:
-                                    self.stats['in_pkt'] += 1
-                                    result = conn['handler'].on_recv('')
-                                else:
-                                    conn['in_size'] = size
-                                    conn['in_pkts'] = list()
+                    else:
+                        conn['in_pkts'].append(buf)
+                        conn['in_size'] -= len(buf)
+                        if 0 == conn['in_size']:
+                            pkt = ''.join(conn['in_pkts'])
+                            del(conn['in_size'])
+                            del(conn['in_pkts'])
+                            stats['in_pkt'] += 1
+                            result = conn['handler'].on_recv(pkt)
+
+                elif event & select.EPOLLOUT:
+                    result = select.EPOLLOUT
+                    if 'out_pkt' not in conn:
+                        if 'peer' not in conn:
+                            proto = struct.pack(
+                                '!B',
+                                conn['handler'].conn['proto'])
+                            if 1 == conn['sock'].send(proto):
+                                conn['peer'] = conn['sock'].getpeername()
                                 conn['in_hdr_size'] = 4
                                 conn['in_hdr_pkts'] = list()
-                        else:
-                            conn['in_pkts'].append(buf)
-                            conn['in_size'] -= len(buf)
-                            if 0 == conn['in_size']:
-                                pkt = ''.join(conn['in_pkts'])
-                                del(conn['in_size'])
-                                del(conn['in_pkts'])
-                                self.stats['in_pkt'] += 1
-                                result = conn['handler'].on_recv(pkt)
-
-                    elif event & select.EPOLLOUT:
-                        result = select.EPOLLOUT
-                        if 'out_pkt' not in conn:
-                            if 'peer' not in conn:
-                                proto = struct.pack(
-                                    '!B',
-                                    conn['handler'].conn['proto'])
-                                if 1 == conn['sock'].send(proto):
-                                    conn['peer'] = conn['sock'].getpeername()
-                                    conn['in_hdr_size'] = 4
-                                    conn['in_hdr_pkts'] = list()
-                                    log('connected {0}'.format(conn['peer']))
-                                    self.stats['cli_established'] += 1
-                                    self.stats['out_bytes'] += 1
-                                    result = conn['handler'].on_connect()
-                                else:
-                                    log('unexpected code path')
-                                    exit(0)
+                                log('connected {0}'.format(conn['peer']))
+                                stats['cli_established'] += 1
+                                stats['out_bytes'] += 1
+                                result = conn['handler'].on_connect()
                             else:
-                                self.stats['out_pkt'] += 1
-                                result = conn['handler'].on_send()
+                                log('unexpected code path')
+                                exit(0)
                         else:
-                            if 4 != conn['out_hdr_sent']:
-                                if 'snd_hdr' not in conn:
-                                    pkt = conn['out_hdr']
-                                    offset = conn['out_hdr_sent']
-                                    conn['snd_hdr'] = pkt[offset:]
+                            stats['out_pkt'] += 1
+                            result = conn['handler'].on_send()
+                    else:
+                        if 4 != conn['out_hdr_sent']:
+                            if 'snd_hdr' not in conn:
+                                pkt = conn['out_hdr']
+                                offset = conn['out_hdr_sent']
+                                conn['snd_hdr'] = pkt[offset:]
 
-                                n = conn['sock'].send(conn['snd_hdr'])
+                            n = conn['sock'].send(conn['snd_hdr'])
+                            if n > 0:
+                                del(conn['snd_hdr'])
+                                conn['out_hdr_sent'] += n
+                                stats['out_bytes'] += n
+                        else:
+                            pkt = conn['out_pkt']
+                            if len(pkt) > conn['out_sent']:
+                                if 'snd_pkt' not in conn:
+                                    offset = conn['out_sent']
+                                    conn['snd_pkt'] = pkt[offset:]
+
+                                n = conn['sock'].send(conn['snd_pkt'])
                                 if n > 0:
-                                    del(conn['snd_hdr'])
-                                    conn['out_hdr_sent'] += n
-                                    self.stats['out_bytes'] += n
+                                    del(conn['snd_pkt'])
+                                    conn['out_sent'] += n
+                                    stats['out_bytes'] += n
                             else:
-                                pkt = conn['out_pkt']
-                                if len(pkt) > conn['out_sent']:
-                                    if 'snd_pkt' not in conn:
-                                        offset = conn['out_sent']
-                                        conn['snd_pkt'] = pkt[offset:]
+                                del(conn['out_sent'])
+                                del(conn['out_hdr_sent'])
+                                del(conn['out_hdr'])
+                                del(conn['out_pkt'])
+                                stats['out_pkt'] += 1
+                                result = conn['handler'].on_send()
+                else:
+                    raise Exception('unhandled event({0})'.format(event))
 
-                                    n = conn['sock'].send(conn['snd_pkt'])
-                                    if n > 0:
-                                        del(conn['snd_pkt'])
-                                        conn['out_sent'] += n
-                                        self.stats['out_bytes'] += n
-                                else:
-                                    del(conn['out_sent'])
-                                    del(conn['out_hdr_sent'])
-                                    del(conn['out_hdr'])
-                                    del(conn['out_pkt'])
-                                    self.stats['out_pkt'] += 1
-                                    result = conn['handler'].on_send()
+                if result in (select.EPOLLIN, select.EPOLLOUT):
+                        epoll.modify(fileno, result)
+                elif result is not False:
+                    if result is True:
+                        epoll.modify(fileno, select.EPOLLIN)
                     else:
-                        raise Exception('unhandled event({0})'.format(event))
+                        conn['out_pkt'] = result
+                        conn['out_hdr'] = struct.pack('!I', len(result))
+                        conn['out_sent'] = 0
+                        conn['out_hdr_sent'] = 0
+                        epoll.modify(fileno, select.EPOLLOUT)
 
-                    if result in (select.EPOLLIN, select.EPOLLOUT):
-                            self.epoll.modify(fileno, result)
-                    elif result is not False:
-                        if result is True:
-                            self.epoll.modify(fileno, select.EPOLLIN)
-                        else:
-                            conn['out_pkt'] = result
-                            conn['out_hdr'] = struct.pack('!I', len(result))
-                            conn['out_sent'] = 0
-                            conn['out_hdr_sent'] = 0
-                            self.epoll.modify(fileno, select.EPOLLOUT)
-
-                except Exception as e:
-                    conn = self.connections[fileno]
-                    del(self.connections[fileno])
-                    self.epoll.unregister(fileno)
-                    conn['sock'].close()
-                    if conn['is_server']:
-                        self.stats['srv_disconnect'] += 1
-                    else:
-                        self.stats['cli_disconnect'] += 1
-                    if 'peer' in conn:
-                        log('disconnected peer{0} reason({1})'.format(
-                            conn['peer'], str(e)))
-                    if 'handler' in conn:
-                        if conn['handler'].on_close() is True:
-                            self.connect(conn['handler'])
-
-    def connect(self, handler):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        s.setblocking(0)
-        self.connections[s.fileno()] = dict(
-            sock=s,
-            handshake_done=False,
-            is_server=False,
-            handler=handler)
-        self.epoll.register(s.fileno(), select.EPOLLOUT)
-        try:
-            self.stats['cli_connect'] += 1
-            s.connect((handler.conn['ip'], handler.conn['port']))
-        except Exception as e:
-            if 115 != e.errno:
-                raise
+            except Exception as e:
+                conn = connections[fileno]
+                del(connections[fileno])
+                epoll.unregister(fileno)
+                conn['sock'].close()
+                if conn['is_server']:
+                    stats['srv_disconnect'] += 1
+                else:
+                    stats['cli_disconnect'] += 1
+                if 'peer' in conn:
+                    log('disconnected peer{0} reason({1})'.format(
+                        conn['peer'], str(e)))
+                if 'handler' in conn:
+                    if conn['handler'].on_close() is True:
+                        clients.append(conn['handler'])
 
 
 def log(msg):
@@ -412,11 +410,6 @@ if '__main__' == __name__:
 
         peer_state = dict((ip_port, None) for ip_port in servers)
 
-        app = EPollLoop(opt.port, {100: StatsServer, 200: LockrServer})
-
-        for peer in peer_state:
-            app.connect(StatsClient(dict(ip=peer[0], port=peer[1], proto=100)))
-
         my_state = dict(
             file_a=0,
             file_y=0,
@@ -425,9 +418,14 @@ if '__main__' == __name__:
             size_z=0,
             committed=0,
             peer_count=0,
-            stats=app.stats)
+            stats=dict())
 
-        app.run()
+        epoll_loop(
+            opt.port,
+            {100: StatsServer, 200: LockrServer},
+            map(lambda p: StatsClient(dict(ip=p[0], port=p[1], proto=100)),
+                peer_state),
+            my_state['stats'])
     else:
         cli = Lockr(servers)
 
