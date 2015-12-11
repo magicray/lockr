@@ -372,16 +372,86 @@ class Lockr(object):
 
 class LockrData(object):
     def __init__(self):
-        self.check()
+        if os.path.isdir('index.json'):
+            with open('index.json') as fd:
+                self.index = json.load(fd)
+        else:
+            self.index = dict(file=0, offset=0, docs=dict())
+            if not os.path.isdir('data'):
+                os.mkdir('data')
 
-    def check(self):
-        if not os.path.isdir('data'):
-            os.mkdir('data')
+            files = sorted(filter(lambda f: 8 == len(f) and int(f, 16),
+                                  os.listdir('data')))
+            if files:
+                chksum = None
+                for f in files:
+                    self.index['file'] = int(f, 16)
+                    with open(f) as fd:
+                        self.index['offset'] = 0
+                        while fd:
+                            if chksum is None:
+                                assert(0 == struct.unpack('!I', fd.read(4))[0])
+                                chksum = hashlib.md5(fd.read(16))
+                                self.index['offset'] += 20
+                                continue
 
-        files = sorted(filter(lambda f: 8 == len(f) and int(f, 16),
-                              os.listdir('data')))
+                            rec_length = fd.read(4)
+                            chksum.update(rec_length)
+                            rec_length = struct.unpack('!I', rec_length)[0]
+                            rec = fd.read(rec_length)
+                            chksum.update(rec)
+                            md5 = fd.read(16)
+                            assert(md5 == chksum.digest())
+                            chksum.update(md5)
 
-    def write_txn(self, buf):
+                            docs = dict()
+                            i = 0
+                            while i < len(rec):
+                                key = rec[i:i+32]
+                                prev_f = struct.unpack('!I', rec[i+32:i+36])[0]
+                                prev_o = struct.unpack('!I', rec[i+36:i+40])[0]
+                                length = struct.unpack('!I', rec[i+40:i+44])[0]
+                                docs[key] = (self.index['offset']+i+44, length)
+                                i += 44 + length
+
+                                value = self.index['docs'].get(key, (0, 0, 0))
+                                if prev_f != value[0] or prev_o != value[1]:
+                                    docs = None
+                                    break
+
+                            if docs:
+                                assert(i == len(rec))
+                                for k, v in docs.iteritems():
+                                    self.index['docs'][k] = (
+                                        int(f, 16), v[0], v[1])
+
+                            self.index['offset'] += rec_length + 20
+
+        with open('index.json', 'w') as fd:
+            json.dump(self.index, fd, indent=4, sort_keys=True)
+
+    def write(self, buf):
+        i = 1
+        n = 0
+        l = 0
+        while i < len(buf):
+            key = buf[i:i+32]
+            prev_f = struct.unpack('!I', buf[i+32:i+36])[0]
+            prev_o = struct.unpack('!I', buf[i+36:i+40])[0]
+            length = struct.unpack('!I', buf[i+40:i+44])[0]
+            l += length
+            i += 44 + length
+            n += 1
+
+            d = self.index['docs'].get(key, (0, 0, 0))
+            if prev_f != d[0] or prev_o != d[1]:
+                return None
+
+        assert (i == len(buf)), 'invalid put request'
+        assert ((n*44 + l) == len(buf)-1), 'invalid put request'
+
+        lockrdata.write_txn(buf[1:])
+
         buf_len = struct.pack('!I', len(buf))
         buf_md5 = hashlib.md5('xyz').digest()
         os.write(self.fd, ''.join([buf_len, buf, buf_md5]))
@@ -394,11 +464,11 @@ if '__main__' == __name__:
     parser.add_option('--servers', dest='servers', type='string')
     opt, args = parser.parse_args()
 
+    servers = list()
     if opt.servers:
         servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
                           map(lambda x: x.split(':'),
                               opt.servers.split(','))))
-
     if opt.port:
         os.dup2(os.open(
             'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
@@ -406,7 +476,6 @@ if '__main__' == __name__:
 
         lockrdata = LockrData()
 
-        peers = dict((ip_port, None) for ip_port in servers)
         local = dict(
             file_a=0,
             file_y=0,
@@ -417,6 +486,7 @@ if '__main__' == __name__:
             peer_count=0,
             stats=dict())
 
+        peers = dict((ip_port, None) for ip_port in servers)
         epoll_loop(
             opt.port,
             {100: StatsServer, 200: LockrServer},
