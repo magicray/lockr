@@ -4,6 +4,7 @@ import ssl
 import time
 import json
 import socket
+import pickle
 import struct
 import hashlib
 import optparse
@@ -14,7 +15,7 @@ def epoll_loop(port, servers, clients, stats):
     from OpenSSL import crypto
 
     key = crypto.PKey()
-    key.generate_key(crypto.TYPE_RSA, 1024)
+    key.generate_key(crypto.TYPE_RSA, 2048)
     cert = crypto.X509()
     cert.gmtime_adj_notBefore(0)
     cert.gmtime_adj_notAfter(30*24*60*60)
@@ -251,7 +252,7 @@ class StatsServer():
         return True
 
     def on_recv(self, buf):
-        return json.dumps(local)
+        return json.dumps(G['local'])
 
     def on_send(self):
         return True
@@ -269,14 +270,14 @@ class StatsClient():
         return ''
 
     def on_recv(self, buf):
-        peers[self.key] = json.loads(buf)
+        G['peers'][self.key] = json.loads(buf)
         return ''
 
     def on_send(self):
         return True
 
     def on_close(self):
-        peers[self.key] = None
+        G['peers'][self.key] = None
         return True
 
 
@@ -284,37 +285,43 @@ class LockrServer():
     def on_accept(self, peer):
         return True
 
+    def handle_put_request(self, buf):
+        docs = dict()
+        i = 1
+        while i < len(buf):
+            length = struct.unpack('!Q', buf[i+48:i+56])[0]
+
+            docs[buf[i:i+32]] = (
+                struct.unpack('!Q', buf[i+32:i+40])[0],
+                struct.unpack('!Q', buf[i+40:i+48])[0],
+                buf[i+56:i+56+length])
+
+            i += 56 + length
+
+        assert(i == len(buf)), 'invalid put request'
+
+        result = append_record(docs)
+        if not result:
+            return json.dumps('conflict')
+
+        return json.dumps('ok')
+
+    def handle_status_request(self, buf):
+        state = dict()
+        for ip, port in G['peers']:
+            state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
+
+        return json.dumps(dict(
+            local=G['local'],
+            peers=state,
+            timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
+
     def on_recv(self, buf):
-        cmd = struct.unpack('!B', buf[0])[0]
-        res = ''
+        handler = {
+            0: self.handle_status_request,
+            1: self.handle_put_request}
 
-        if 0 == cmd:
-            state = dict()
-            for ip, port in peers:
-                state['{0}:{1}'.format(ip, port)] = peers[(ip, port)]
-
-            res = json.dumps(dict(
-                local=local,
-                peers=state,
-                timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
-        elif 1 == cmd:
-            docs = dict()
-            i = 1
-            while i < len(buf):
-                key = buf[i:i+32]
-                file = struct.unpack('!I', buf[i+32:i+36])[0]
-                offset = struct.unpack('!I', buf[i+36:i+40])[0]
-                length = struct.unpack('!I', buf[i+40:i+44])[0]
-                i += 44 + length
-                docs[key] = (file, offset, length)
-
-            assert (len(docs)*44 + sum(map(lambda x: docs[x][2], docs)) ==
-                    len(buf)-1), 'invalid put request'
-
-            lockrdata.write_txn(buf[1:])
-            return json.dumps('ok')
-
-        return res
+        return handler[struct.unpack('!B', buf[0])[0]](buf)
 
     def on_send(self):
         return True
@@ -362,99 +369,141 @@ class Lockr(object):
     def put(self, docs):
         items = [struct.pack('!B', 1)]
         for k, v in docs.iteritems():
+            ver = '0-0' if v[0] is None else v[0]
+
             items.append(hashlib.sha256(k).digest())
-            items.append(struct.pack('!II', v[0]/(2**32), v[0] % (2**32)))
-            items.append(struct.pack('!I', len(v[1])))
+            items.append(struct.pack('!Q', int(ver.split('-')[0])))
+            items.append(struct.pack('!Q', int(ver.split('-')[1])))
+            items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
         return self.request(''.join(items))
 
 
-class LockrData(object):
-    def __init__(self):
-        if os.path.isdir('index.json'):
-            with open('index.json') as fd:
-                self.index = json.load(fd)
-        else:
-            self.index = dict(file=0, offset=0, docs=dict())
-            if not os.path.isdir('data'):
-                os.mkdir('data')
+def update_index(g):
+    files = sorted([int(f) for f in os.listdir('data')])
+    if not files:
+        g['index'] = dict(
+            file=0,
+            offset=0,
+            chksum=hashlib.sha1('').digest(),
+            docs=dict())
+        return
 
-            files = sorted(filter(lambda f: 8 == len(f) and int(f, 16),
-                                  os.listdir('data')))
-            if files:
-                chksum = None
-                for f in files:
-                    self.index['file'] = int(f, 16)
-                    with open(f) as fd:
-                        self.index['offset'] = 0
-                        while fd:
-                            if chksum is None:
-                                assert(0 == struct.unpack('!I', fd.read(4))[0])
-                                chksum = hashlib.md5(fd.read(16))
-                                self.index['offset'] += 20
-                                continue
+    if not g['index']['chksum']:
+        g['index']['file'] = min(files)
+        g['index']['offset'] = 28
+        with open(os.path.join('data', str(min(files)))) as fd:
+            assert(0 == struct.unpack('!Q', fd.read(8))[0])
+            g['index']['chksum'] = fd.read(20)
 
-                            rec_length = fd.read(4)
-                            chksum.update(rec_length)
-                            rec_length = struct.unpack('!I', rec_length)[0]
-                            rec = fd.read(rec_length)
-                            chksum.update(rec)
-                            md5 = fd.read(16)
-                            assert(md5 == chksum.digest())
-                            chksum.update(md5)
+    chksum = hashlib.sha1(g['index']['chksum'])
+    for filenum in range(min(files), max(files)+1):
+        with open(os.path.join('data', str(filenum))) as fd:
+            if filenum == g['index']['file']:
+                fd.seek(g['index']['offset'])
 
-                            docs = dict()
-                            i = 0
-                            while i < len(rec):
-                                key = rec[i:i+32]
-                                prev_f = struct.unpack('!I', rec[i+32:i+36])[0]
-                                prev_o = struct.unpack('!I', rec[i+36:i+40])[0]
-                                length = struct.unpack('!I', rec[i+40:i+44])[0]
-                                docs[key] = (self.index['offset']+i+44, length)
-                                i += 44 + length
+            while True:
+                print(fd.tell())
+                b = fd.read(8)
+                if not b:
+                    break
+               
+                x = fd.read(struct.unpack('!Q', b)[0])
+                y = fd.read(20)
 
-                                value = self.index['docs'].get(key, (0, 0, 0))
-                                if prev_f != value[0] or prev_o != value[1]:
-                                    docs = None
-                                    break
+                chksum.update(x)
+                assert(y == chksum.digest())
+                chksum.update(y)
 
-                            if docs:
-                                assert(i == len(rec))
-                                for k, v in docs.iteritems():
-                                    self.index['docs'][k] = (
-                                        int(f, 16), v[0], v[1])
+                i = 0
+                while i < len(x):
+                    size = struct.unpack('!Q', x[i+32:i+40])[0]
+                    g['index']['docs'][x[i:i+32]] = (
+                        filenum,
+                        g['index']['offset']+8+i+40,
+                        size)
+                    i += 40 + size
 
-                            self.index['offset'] += rec_length + 20
+                g['index']['file'] = filenum
+                g['index']['offset'] += len(x) + 28
+                g['index']['chksum'] = y
 
-        with open('index.json', 'w') as fd:
-            json.dump(self.index, fd, indent=4, sort_keys=True)
+    with open('index.pickle', 'w') as fd:
+        pickle.dump(G['index'], fd)
 
-    def write(self, buf):
-        i = 1
-        n = 0
-        l = 0
-        while i < len(buf):
-            key = buf[i:i+32]
-            prev_f = struct.unpack('!I', buf[i+32:i+36])[0]
-            prev_o = struct.unpack('!I', buf[i+36:i+40])[0]
-            length = struct.unpack('!I', buf[i+40:i+44])[0]
-            l += length
-            i += 44 + length
-            n += 1
 
-            d = self.index['docs'].get(key, (0, 0, 0))
-            if prev_f != d[0] or prev_o != d[1]:
-                return None
+def append_record(docs):
+    buf_len = 0
+    buf_list = list()
+    for k, v in docs.iteritems():
+        f, o, l = G['index']['docs'].get(k, (0, 0, 0))
+        assert((v[0] == f) and (v[1] == o)), 'version mismatch'
 
-        assert (i == len(buf)), 'invalid put request'
-        assert ((n*44 + l) == len(buf)-1), 'invalid put request'
+        buf_list.append(k)
+        buf_list.append(struct.pack('!Q', len(v[2])))
+        buf_list.append(v[2])
+        buf_len += 40 + len(v[2])
 
-        lockrdata.write_txn(buf[1:])
+    offset = G['index']['offset'] + 8
+    for k, v in docs.iteritems():
+        G['index']['docs'][k] = (G['index']['file'], offset+32+8, len(v[2]))
+        offset += 32 + 8 + len(v[2])
 
-        buf_len = struct.pack('!I', len(buf))
-        buf_md5 = hashlib.md5('xyz').digest()
-        os.write(self.fd, ''.join([buf_len, buf, buf_md5]))
+    chksum = hashlib.sha1(G['index']['chksum'])
+    map(lambda b: chksum.update(b), buf_list)
+
+    buf_list.insert(0, struct.pack('!Q', buf_len))
+    buf_list.append(chksum.digest())
+
+    if 'fd' not in G:
+        G['index']['file'] += 1
+        G['index']['offset'] = 0
+
+        G['fd'] = os.open(
+            os.path.join('data', str(G['index']['file'])),
+            os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
+        os.write(G['fd'], struct.pack('!Q', 0) + G['index']['chksum'])
+
+    os.write(G['fd'], ''.join(buf_list))
+
+    G['index']['offset'] += buf_len + 28
+    G['index']['chksum'] = chksum.digest()
+
+    return G['index']['file'], G['index']['offset']
+
+
+def lockr_server(servers, g):
+    os.dup2(os.open('log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
+                    os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
+
+    if os.path.isfile('index.json'):
+        with open('index.json') as fd:
+            g['index'] = json.load(fd)
+    else:
+        g['index'] = dict(file=0, offset=0, chksum='', docs=dict())
+        if not os.path.isdir('data'):
+            os.mkdir('data')
+
+    update_index(g)
+
+    G['local'] = dict(
+        file_a=0,
+        file_y=0,
+        size_y=0,
+        file_z=0,
+        size_z=0,
+        committed=0,
+        peer_count=0,
+        stats=dict())
+
+    G['peers'] = dict((ip_port, None) for ip_port in servers)
+    epoll_loop(
+        opt.port,
+        {100: StatsServer, 200: LockrServer},
+        [StatsClient(dict(ip=p[0], port=p[1], proto=100)) for p in G['peers']],
+        G['local']['stats'])
 
 
 if '__main__' == __name__:
@@ -470,33 +519,13 @@ if '__main__' == __name__:
                           map(lambda x: x.split(':'),
                               opt.servers.split(','))))
     if opt.port:
-        os.dup2(os.open(
-            'log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
-            os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
-
-        lockrdata = LockrData()
-
-        local = dict(
-            file_a=0,
-            file_y=0,
-            size_y=0,
-            file_z=0,
-            size_z=0,
-            committed=0,
-            peer_count=0,
-            stats=dict())
-
-        peers = dict((ip_port, None) for ip_port in servers)
-        epoll_loop(
-            opt.port,
-            {100: StatsServer, 200: LockrServer},
-            [StatsClient(dict(ip=p[0], port=p[1], proto=100)) for p in peers],
-            local['stats'])
+        G = dict()
+        lockr_server(servers, G)
     else:
         cli = Lockr(servers)
 
         if 'state' == opt.cmd:
             print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
         elif 'put' == opt.cmd:
-            docs = dict(abcd=(10000000001000000000, 'Bhupendra'))
+            docs = dict(abcd=(None, 'S'))
             print(json.dumps(cli.put(docs), indent=4, sort_keys=True))
