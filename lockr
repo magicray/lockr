@@ -285,6 +285,16 @@ class LockrServer():
     def on_accept(self, peer):
         return True
 
+    def handle_status_request(self, buf):
+        state = dict()
+        for ip, port in G['peers']:
+            state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
+
+        return json.dumps(dict(
+            local=G['local'],
+            peers=state,
+            timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
+
     def handle_put_request(self, buf):
         docs = dict()
         i = 1
@@ -300,26 +310,35 @@ class LockrServer():
 
         assert(i == len(buf)), 'invalid put request'
 
-        result = append_record(docs)
-        if not result:
-            return json.dumps('conflict')
+        try:
+            append_record(docs)
+            return struct.pack('!B', 0)
+        except:
+            return struct.pack('!B', 1)
 
-        return json.dumps('ok')
+    def handle_get_request(self, buf):
+        result = list()
+        i = 1
+        while i < len(buf):
+            key = buf[i:i+32]
+            f, o, l = G['index']['docs'].get(key, (0, 0, 0))
+            result.append(key)
+            result.append(struct.pack('!Q', f))
+            result.append(struct.pack('!Q', o))
+            result.append(struct.pack('!Q', l))
+            if l > 0:
+                with open(os.path.join('data', str(f))) as fd:
+                    fd.seek(o)
+                    result.append(fd.read(l))
+            i += 32
 
-    def handle_status_request(self, buf):
-        state = dict()
-        for ip, port in G['peers']:
-            state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
-
-        return json.dumps(dict(
-            local=G['local'],
-            peers=state,
-            timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
+        return ''.join(result)
 
     def on_recv(self, buf):
         handler = {
             0: self.handle_status_request,
-            1: self.handle_put_request}
+            1: self.handle_put_request,
+            2: self.handle_get_request}
 
         return handler[struct.unpack('!B', buf[0])[0]](buf)
 
@@ -379,32 +398,57 @@ class Lockr(object):
 
         return self.request(''.join(items))
 
+    def get(self, keys):
+        items = [struct.pack('!B', 2)]
+        hashdict = dict()
+        for key in keys:
+            h = hashlib.sha256(key).digest()
+            items.append(h)
+            hashdict[h] = key
+
+        buf = self.request(''.join(items))
+        i = 0
+        docs = dict()
+        while i < len(buf):
+            k = hashdict[buf[i:i+32]]
+            f = struct.unpack('!Q', buf[i+32:i+40])[0]
+            o = struct.unpack('!Q', buf[i+40:i+48])[0]
+            l = struct.unpack('!Q', buf[i+48:i+56])[0]
+            docs[k] = ('{0}-{1}'.format(f, o), buf[i+56:i+56+l])
+
+            i += 56 + l
+
+        return docs
+
 
 def update_index(g):
+    g['index'] = dict(
+        file=0,
+        offset=0,
+        chksum=hashlib.sha1('').digest(),
+        docs=dict())
+
     files = sorted([int(f) for f in os.listdir('data')])
     if not files:
-        g['index'] = dict(
-            file=0,
-            offset=0,
-            chksum=hashlib.sha1('').digest(),
-            docs=dict())
         return
 
-    if not g['index']['chksum']:
+    if os.path.isfile('index.pickle'):
+        with open('index.pickle') as fd:
+            g['index'] = pickle.load(fd)
+    else:
         g['index']['file'] = min(files)
         g['index']['offset'] = 28
         with open(os.path.join('data', str(min(files)))) as fd:
             assert(0 == struct.unpack('!Q', fd.read(8))[0])
             g['index']['chksum'] = fd.read(20)
 
-    chksum = hashlib.sha1(g['index']['chksum'])
     for filenum in range(min(files), max(files)+1):
         with open(os.path.join('data', str(filenum))) as fd:
             if filenum == g['index']['file']:
                 fd.seek(g['index']['offset'])
 
             while True:
-                print(fd.tell())
+                log('scanned file({0}) offset({1})'.format(filenum, fd.tell()))
                 b = fd.read(8)
                 if not b:
                     break
@@ -412,9 +456,10 @@ def update_index(g):
                 x = fd.read(struct.unpack('!Q', b)[0])
                 y = fd.read(20)
 
+                chksum = hashlib.sha1(g['index']['chksum'])
                 chksum.update(x)
                 assert(y == chksum.digest())
-                chksum.update(y)
+                g['index']['chksum'] = y
 
                 i = 0
                 while i < len(x):
@@ -427,7 +472,6 @@ def update_index(g):
 
                 g['index']['file'] = filenum
                 g['index']['offset'] += len(x) + 28
-                g['index']['chksum'] = y
 
     with open('index.pickle', 'w') as fd:
         pickle.dump(G['index'], fd)
@@ -456,16 +500,6 @@ def append_record(docs):
     buf_list.insert(0, struct.pack('!Q', buf_len))
     buf_list.append(chksum.digest())
 
-    if 'fd' not in G:
-        G['index']['file'] += 1
-        G['index']['offset'] = 0
-
-        G['fd'] = os.open(
-            os.path.join('data', str(G['index']['file'])),
-            os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-
-        os.write(G['fd'], struct.pack('!Q', 0) + G['index']['chksum'])
-
     os.write(G['fd'], ''.join(buf_list))
 
     G['index']['offset'] += buf_len + 28
@@ -478,13 +512,8 @@ def lockr_server(servers, g):
     os.dup2(os.open('log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
                     os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
-    if os.path.isfile('index.json'):
-        with open('index.json') as fd:
-            g['index'] = json.load(fd)
-    else:
-        g['index'] = dict(file=0, offset=0, chksum='', docs=dict())
-        if not os.path.isdir('data'):
-            os.mkdir('data')
+    if not os.path.isdir('data'):
+        os.mkdir('data')
 
     update_index(g)
 
@@ -499,6 +528,15 @@ def lockr_server(servers, g):
         stats=dict())
 
     G['peers'] = dict((ip_port, None) for ip_port in servers)
+
+    #G['index']['file'] += 1
+    #G['index']['offset'] = 0
+
+    G['fd'] = os.open(
+            os.path.join('data', str(G['index']['file'])),
+            os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+    append_record(dict())
+
     epoll_loop(
         opt.port,
         {100: StatsServer, 200: LockrServer},
@@ -509,8 +547,11 @@ def lockr_server(servers, g):
 if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('--port', dest='port', type='int')
-    parser.add_option('--cmd', dest='cmd', type='string')
     parser.add_option('--servers', dest='servers', type='string')
+    parser.add_option('--cmd', dest='cmd', type='string')
+    parser.add_option('--key', dest='key', type='string')
+    parser.add_option('--version', dest='version', type='string')
+    parser.add_option('--value', dest='value', type='string')
     opt, args = parser.parse_args()
 
     servers = list()
@@ -527,5 +568,9 @@ if '__main__' == __name__:
         if 'state' == opt.cmd:
             print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
         elif 'put' == opt.cmd:
-            docs = dict(abcd=(None, 'S'))
-            print(json.dumps(cli.put(docs), indent=4, sort_keys=True))
+            doc = {opt.key: (opt.version, opt.value)}
+            print(struct.unpack('!B', cli.put(doc))[0])
+        elif 'get' == opt.cmd:
+            for k, v in cli.get([opt.key]).iteritems():
+                print('{0}: {1} {2}'.format(k, v[0], v[1]))
+                
