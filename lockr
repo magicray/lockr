@@ -43,7 +43,7 @@ def epoll_loop(port, servers, clients, stats):
 
     while True:
         while clients:
-            handler = clients.pop()
+            ip_port_proto, handler = clients.popitem()
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.setblocking(0)
@@ -51,11 +51,12 @@ def epoll_loop(port, servers, clients, stats):
                 sock=s,
                 handshake_done=False,
                 is_server=False,
+                ip_port_proto=ip_port_proto,
                 handler=handler)
             epoll.register(s.fileno(), select.EPOLLOUT)
             try:
                 stats['cli_connect'] += 1
-                s.connect((handler.conn['ip'], handler.conn['port']))
+                s.connect((ip_port_proto[0], ip_port_proto[1]))
             except Exception as e:
                 if 115 != e.errno:
                     raise
@@ -120,7 +121,7 @@ def epoll_loop(port, servers, clients, stats):
                         continue
 
                     if 0 == len(buf):
-                        raise Exception('recv returned zero bytes')
+                        raise Exception('closed by peer')
 
                     if 'handler' not in conn:
                         proto = struct.unpack('!B', buf)[0]
@@ -129,7 +130,7 @@ def epoll_loop(port, servers, clients, stats):
                         conn['in_hdr_pkts'] = list()
                         log('accepted {0}'.format(conn['peer']))
                         stats['srv_established'] += 1
-                        result = conn['handler'].on_accept(conn['peer'])
+                        result = conn['handler'].on_accept()
                     elif 'in_size' not in conn:
                         conn['in_hdr_pkts'].append(buf)
                         conn['in_hdr_size'] -= len(buf)
@@ -159,9 +160,7 @@ def epoll_loop(port, servers, clients, stats):
                     result = select.EPOLLOUT
                     if 'out_pkt' not in conn:
                         if 'peer' not in conn:
-                            proto = struct.pack(
-                                '!B',
-                                conn['handler'].conn['proto'])
+                            proto = struct.pack('!B', conn['ip_port_proto'][2])
                             if 1 == conn['sock'].send(proto):
                                 conn['peer'] = conn['sock'].getpeername()
                                 conn['in_hdr_size'] = 4
@@ -210,17 +209,17 @@ def epoll_loop(port, servers, clients, stats):
                 else:
                     raise Exception('unhandled event({0})'.format(event))
 
+                epoll.modify(fileno, 0)
                 if result in (select.EPOLLIN, select.EPOLLOUT):
-                        epoll.modify(fileno, result)
-                elif result is not False:
-                    if result is True:
-                        epoll.modify(fileno, select.EPOLLIN)
-                    else:
-                        conn['out_pkt'] = result
-                        conn['out_hdr'] = struct.pack('!I', len(result))
-                        conn['out_sent'] = 0
-                        conn['out_hdr_sent'] = 0
-                        epoll.modify(fileno, select.EPOLLOUT)
+                    epoll.modify(fileno, result)
+                elif 'recv' == result:
+                    epoll.modify(fileno, select.EPOLLIN)
+                elif 'send' == result[0]:
+                    conn['out_pkt'] = result[1]
+                    conn['out_hdr'] = struct.pack('!I', len(result[1]))
+                    conn['out_sent'] = 0
+                    conn['out_hdr_sent'] = 0
+                    epoll.modify(fileno, select.EPOLLOUT)
 
             except Exception as e:
                 conn = connections[fileno]
@@ -235,8 +234,8 @@ def epoll_loop(port, servers, clients, stats):
                     log('disconnected peer{0} reason({1})'.format(
                         conn['peer'], str(e)))
                 if 'handler' in conn:
-                    if conn['handler'].on_close() is True:
-                        clients.append(conn['handler'])
+                    if 'reconnect' == conn['handler'].on_close():
+                        clients[conn['ip_port_proto']] = conn['handler']
 
 
 def log(msg):
@@ -248,44 +247,57 @@ def log(msg):
 
 
 class StatsServer():
-    def on_accept(self, peer):
-        return True
+    def on_accept(self):
+        return 'recv'
 
     def on_recv(self, buf):
-        return json.dumps(G['local'])
+        return ('send', json.dumps(G['local']))
 
     def on_send(self):
-        return True
+        return 'recv'
 
     def on_close(self):
         pass
 
 
 class StatsClient():
-    def __init__(self, conn):
-        self.conn = conn
-        self.key = (conn['ip'], conn['port'])
+    def __init__(self, ip, port):
+        self.key = (ip, port)
 
     def on_connect(self):
-        return ''
+        return ('send', '')
 
     def on_recv(self, buf):
         G['peers'][self.key] = json.loads(buf)
-        return ''
+        return ('send', '')
 
     def on_send(self):
-        return True
+        return 'recv'
 
     def on_close(self):
         G['peers'][self.key] = None
-        return True
+        return 'reconnect'
 
 
 class LockrServer():
-    def on_accept(self, peer):
-        return True
+    def on_accept(self):
+        return 'recv'
 
-    def handle_status_request(self, buf):
+    def on_recv(self, buf):
+        handler = [
+            self.handle_state_request,
+            self.handle_put_request,
+            self.handle_get_request]
+
+        return ('send', handler[struct.unpack('!B', buf[0])[0]](buf))
+
+    def on_send(self):
+        return 'recv'
+
+    def on_close(self):
+        pass
+
+    def handle_state_request(self, buf):
         state = dict()
         for ip, port in G['peers']:
             state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
@@ -333,20 +345,6 @@ class LockrServer():
             i += 32
 
         return ''.join(result)
-
-    def on_recv(self, buf):
-        handler = {
-            0: self.handle_status_request,
-            1: self.handle_put_request,
-            2: self.handle_get_request}
-
-        return handler[struct.unpack('!B', buf[0])[0]](buf)
-
-    def on_send(self):
-        return True
-
-    def on_close(self):
-        pass
 
 
 class Lockr(object):
@@ -529,9 +527,6 @@ def lockr_server(servers, g):
 
     G['peers'] = dict((ip_port, None) for ip_port in servers)
 
-    #G['index']['file'] += 1
-    #G['index']['offset'] = 0
-
     G['fd'] = os.open(
             os.path.join('data', str(G['index']['file'])),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND)
@@ -540,7 +535,7 @@ def lockr_server(servers, g):
     epoll_loop(
         opt.port,
         {100: StatsServer, 200: LockrServer},
-        [StatsClient(dict(ip=p[0], port=p[1], proto=100)) for p in G['peers']],
+        {(p[0], p[1], 100): StatsClient(p[0], p[1]) for p in G['peers']},
         G['local']['stats'])
 
 
