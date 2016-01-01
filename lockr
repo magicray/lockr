@@ -258,7 +258,10 @@ class StatsServer():
         return 'recv'
 
     def on_recv(self, buf):
-        return ('send', json.dumps(G['local']))
+        return ('send', json.dumps(dict(
+            file=G['index']['file'],
+            offset=G['index']['offset'],
+            netstats=G['netstats'])))
 
     def on_send(self):
         return 'recv'
@@ -297,7 +300,6 @@ class LockrServer():
             self.handle_put_request,
             self.handle_get_request]
 
-        handler[struct.unpack('!B', buf[0])[0]](buf)
         return ('send', handler[struct.unpack('!B', buf[0])[0]](buf))
 
     def on_send(self):
@@ -312,7 +314,9 @@ class LockrServer():
             state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
 
         return json.dumps(dict(
-            local=G['local'],
+            file=G['index']['file'],
+            offset=G['index']['offset'],
+            netstats=G['netstats'],
             peers=state,
             timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
 
@@ -331,10 +335,25 @@ class LockrServer():
 
         assert(i == len(buf)), 'invalid put request'
 
+        if G['index']['offset'] > 500:
+            if G['fd']:
+                os.close(G['fd'])
+            G['index']['file'] += 1
+            G['index']['offset'] = 0
+            G['fd'] = None
+
+        if not G['fd']:
+            G['fd'] = os.open(
+                os.path.join('data', str(G['index']['file'])),
+                os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
+            if 0 == G['index']['offset']:
+                append_record(dict())
+
         try:
             append_record(docs)
             return struct.pack('!B', 0)
-        except:
+        except Exception as e:
             return struct.pack('!B', 1)
 
     def handle_get_request(self, buf):
@@ -524,28 +543,12 @@ def lockr_server(servers, g):
 
     update_index(g)
 
-    G['local'] = dict(
-        file_a=0,
-        file_y=0,
-        size_y=0,
-        file_z=0,
-        size_z=0,
-        committed=0,
-        peer_count=0,
-        stats=dict())
-
     G['peers'] = dict((ip_port, None) for ip_port in servers)
 
-    G['fd'] = os.open(
-            os.path.join('data', str(G['index']['file'])),
-            os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-    append_record(dict())
-
-    epoll_loop(
-        opt.port,
-        {0: StatsServer, 1: LockrServer},
-        [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
-        G['local']['stats'])
+    epoll_loop(opt.port,
+               [StatsServer, LockrServer],
+               [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
+               G['netstats'])
 
 
 if '__main__' == __name__:
@@ -564,7 +567,7 @@ if '__main__' == __name__:
                           map(lambda x: x.split(':'),
                               opt.servers.split(','))))
     if opt.port:
-        G = dict()
+        G = dict(netstats=dict(), peers=dict(), fd=None)
         lockr_server(servers, G)
     else:
         cli = Lockr(servers)
