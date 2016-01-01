@@ -335,7 +335,7 @@ class LockrServer():
 
         assert(i == len(buf)), 'invalid put request'
 
-        if G['index']['offset'] > 500:
+        if G['index']['offset'] > opt.size:
             if G['fd']:
                 os.close(G['fd'])
             G['index']['file'] += 1
@@ -468,10 +468,12 @@ def update_index(g):
             assert(0 == struct.unpack('!Q', fd.read(8))[0])
             g['index']['chksum'] = fd.read(20)
 
-    for filenum in range(min(files), max(files)+1):
+    for filenum in range(g['index']['file'], max(files)+1):
         with open(os.path.join('data', str(filenum))) as fd:
             if filenum == g['index']['file']:
                 fd.seek(g['index']['offset'])
+            else:
+                g['index']['offset'] = 0
 
             while True:
                 log('scanned file({0}) offset({1})'.format(filenum, fd.tell()))
@@ -501,6 +503,7 @@ def update_index(g):
 
     with open('index.pickle', 'w') as fd:
         pickle.dump(G['index'], fd)
+        log('new index.pickle file created')
 
 
 def append_record(docs):
@@ -555,6 +558,7 @@ if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('--port', dest='port', type='int')
     parser.add_option('--servers', dest='servers', type='string')
+    parser.add_option('--size', dest='size', type='int', default=1073741824)
     parser.add_option('--cmd', dest='cmd', type='string')
     parser.add_option('--key', dest='key', type='string')
     parser.add_option('--version', dest='version', type='string')
