@@ -4,9 +4,9 @@ import ssl
 import time
 import json
 import socket
-import pickle
 import struct
 import hashlib
+import sqlite3
 import optparse
 
 
@@ -259,8 +259,8 @@ class StatsServer():
 
     def on_recv(self, buf):
         return ('send', json.dumps(dict(
-            file=G['index']['file'],
-            offset=G['index']['offset'],
+            file=G['index'].indexed[0],
+            offset=G['index'].indexed[1],
             netstats=G['netstats'])))
 
     def on_send(self):
@@ -314,8 +314,8 @@ class LockrServer():
             state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
 
         return json.dumps(dict(
-            file=G['index']['file'],
-            offset=G['index']['offset'],
+            file=G['index'].indexed[0],
+            offset=G['index'].indexed[1],
             netstats=G['netstats'],
             peers=state,
             timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
@@ -335,19 +335,19 @@ class LockrServer():
 
         assert(i == len(buf)), 'invalid put request'
 
-        if G['index']['offset'] > opt.size:
+        filenum, offset, checksum = G['index'].indexed
+        if offset > opt.size:
             if G['fd']:
                 os.close(G['fd'])
-            G['index']['file'] += 1
-            G['index']['offset'] = 0
+            G['index'].indexed = (filenum+1, 0, checksum)
             G['fd'] = None
 
         if not G['fd']:
             G['fd'] = os.open(
-                os.path.join('data', str(G['index']['file'])),
+                os.path.join('data', str(G['index'].indexed[0])),
                 os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-            if 0 == G['index']['offset']:
+            if 0 == G['index'].indexed[1]:
                 append_record(dict())
 
         try:
@@ -361,7 +361,7 @@ class LockrServer():
         i = 1
         while i < len(buf):
             key = buf[i:i+32]
-            f, o, l = G['index']['docs'].get(key, (0, 0, 0))
+            f, o, l = G['index'].get(key)
             result.append(key)
             result.append(struct.pack('!Q', f))
             result.append(struct.pack('!Q', o))
@@ -447,33 +447,60 @@ class Lockr(object):
         return docs
 
 
-def update_index(g):
-    g['index'] = dict(
-        file=0,
-        offset=0,
-        chksum=hashlib.sha1('').digest(),
-        docs=dict())
+class Index():
+    def __init__(self, db_file, data_dir):
+        self.timestamp = int(time.time())
+        self.db = sqlite3.connect(db_file)
+        self.db.execute('''create table if not exists docs(
+                           key blob primary key, file integer,
+                           offset integer, length integer)''')
 
-    files = sorted([int(f) for f in os.listdir('data')])
-    if not files:
-        return
+        files = sorted([int(f) for f in os.listdir(data_dir)])
 
-    if os.path.isfile('index.pickle'):
-        with open('index.pickle') as fd:
-            g['index'] = pickle.load(fd)
-    else:
-        g['index']['file'] = min(files)
-        g['index']['offset'] = 28
-        with open(os.path.join('data', str(min(files)))) as fd:
-            assert(0 == struct.unpack('!Q', fd.read(8))[0])
-            g['index']['chksum'] = fd.read(20)
-
-    for filenum in range(g['index']['file'], max(files)+1):
-        with open(os.path.join('data', str(filenum))) as fd:
-            if filenum == g['index']['file']:
-                fd.seek(g['index']['offset'])
+        result = self.db.execute('''select file, offset, length
+            from docs order by file desc, offset desc limit 1''').fetchall()
+        if result:
+            offset = result[0][1] + result[0][2]
+            with open(os.path.join('data', str(result[0][0]))) as fd:
+                fd.seek(offset)
+                self.indexed = (result[0][0], offset+20, fd.read(20))
+        else:
+            if files:
+                with open(os.path.join(data_dir, str(min(files)))) as fd:
+                    assert(0 == struct.unpack('!Q', fd.read(8))[0])
+                    self.indexed = (min(files), 28, fd.read(20))
             else:
-                g['index']['offset'] = 0
+                self.indexed = (0, 0, hashlib.sha1('').digest())
+
+        if files:
+            self.indexed = scan(data_dir, self.indexed[0], self.indexed[1],
+                self.indexed[2], max(files), 2**40, self.put)
+            self.db.commit()
+
+    def put(self, key, filenum, offset, length):
+        self.db.execute('''insert or replace into docs values(?, ?, ?, ?)''',
+            (sqlite3.Binary(key), filenum, offset, length))
+
+        self.last_record = (filenum, offset, length)
+        if int(time.time()) > self.timestamp:
+            self.db.commit()
+            self.timestamp = int(time.time())
+
+    def get(self, key):
+        result = self.db.execute('''select file, offset, length
+                                    from docs where key=?''',
+                                 (sqlite3.Binary(key),)).fetchall()
+        return result[0] if result else (0, 0, 0)
+
+
+def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
+    for filenum in range(from_file, to_file+1):
+        with open(os.path.join(path, str(filenum))) as fd:
+            if filenum == from_file:
+                fd.seek(from_offset)
+                offset = from_offset
+            else:
+                offset = 0
 
             while True:
                 log('scanned file({0}) offset({1})'.format(filenum, fd.tell()))
@@ -484,33 +511,30 @@ def update_index(g):
                 x = fd.read(struct.unpack('!Q', b)[0])
                 y = fd.read(20)
 
-                chksum = hashlib.sha1(g['index']['chksum'])
+                chksum = hashlib.sha1(checksum)
                 chksum.update(x)
                 assert(y == chksum.digest())
-                g['index']['chksum'] = y
+                checksum = y
 
                 i = 0
                 while i < len(x):
-                    size = struct.unpack('!Q', x[i+32:i+40])[0]
-                    g['index']['docs'][x[i:i+32]] = (
-                        filenum,
-                        g['index']['offset']+8+i+40,
-                        size)
-                    i += 40 + size
+                    key = x[i:i+32]
+                    length = struct.unpack('!Q', x[i+32:i+40])[0]
+                    ofst = offset+8+i+40
+                    i += 40 + length
 
-                g['index']['file'] = filenum
-                g['index']['offset'] += len(x) + 28
+                    callback(key, filenum, ofst, length)
 
-    with open('index.pickle', 'w') as fd:
-        pickle.dump(G['index'], fd)
-        log('new index.pickle file created')
+                offset += len(x) + 28
+
+    return (filenum, offset, checksum)
 
 
 def append_record(docs):
     buf_len = 0
     buf_list = list()
     for k, v in docs.iteritems():
-        f, o, l = G['index']['docs'].get(k, (0, 0, 0))
+        f, o, l = G['index'].get(k)
         assert((v[0] == f) and (v[1] == o)), 'version mismatch'
 
         buf_list.append(k)
@@ -518,12 +542,13 @@ def append_record(docs):
         buf_list.append(v[2])
         buf_len += 40 + len(v[2])
 
-    offset = G['index']['offset'] + 8
+    filenum, offset, checksum = G['index'].indexed
+    offset += 8
     for k, v in docs.iteritems():
-        G['index']['docs'][k] = (G['index']['file'], offset+32+8, len(v[2]))
+        G['index'].put(k, filenum, offset+32+8, len(v[2]))
         offset += 32 + 8 + len(v[2])
 
-    chksum = hashlib.sha1(G['index']['chksum'])
+    chksum = hashlib.sha1(checksum)
     map(lambda b: chksum.update(b), buf_list)
 
     buf_list.insert(0, struct.pack('!Q', buf_len))
@@ -531,10 +556,7 @@ def append_record(docs):
 
     os.write(G['fd'], ''.join(buf_list))
 
-    G['index']['offset'] += buf_len + 28
-    G['index']['chksum'] = chksum.digest()
-
-    return G['index']['file'], G['index']['offset']
+    G['index'].indexed = (filenum, 8 + buf_len + 20, chksum.digest())
 
 
 def lockr_server(servers, g):
@@ -544,14 +566,14 @@ def lockr_server(servers, g):
     if not os.path.isdir('data'):
         os.mkdir('data')
 
-    update_index(g)
+    g['index'] = Index(opt.index, opt.data)
 
-    G['peers'] = dict((ip_port, None) for ip_port in servers)
+    g['peers'] = dict((ip_port, None) for ip_port in servers)
 
     epoll_loop(opt.port,
                [StatsServer, LockrServer],
                [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
-               G['netstats'])
+               g['netstats'])
 
 
 if '__main__' == __name__:
@@ -559,7 +581,9 @@ if '__main__' == __name__:
     parser.add_option('--port', dest='port', type='int')
     parser.add_option('--servers', dest='servers', type='string')
     parser.add_option('--size', dest='size', type='int', default=1073741824)
-    parser.add_option('--cmd', dest='cmd', type='string')
+    parser.add_option('--index', dest='index', type='string', default='index')
+    parser.add_option('--data', dest='data', type='string', default='data')
+    parser.add_option('--cmd', dest='cmd', type='string', default='state')
     parser.add_option('--key', dest='key', type='string')
     parser.add_option('--version', dest='version', type='string')
     parser.add_option('--value', dest='value', type='string')
