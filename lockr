@@ -353,7 +353,7 @@ class LockrServer():
         try:
             append_record(docs)
             return struct.pack('!B', 0)
-        except Exception as e:
+        except:
             return struct.pack('!B', 1)
 
     def handle_get_request(self, buf):
@@ -449,13 +449,12 @@ class Lockr(object):
 
 class Index():
     def __init__(self, db_file, data_dir):
-        self.timestamp = int(time.time())
         self.db = sqlite3.connect(db_file)
-        self.db.execute('''create table if not exists docs(
-                           key blob primary key, file integer,
-                           offset integer, length integer)''')
+        self.db.execute('''create table if not exists docs
+            (key blob primary key, file int, offset int, length int)''')
 
-        files = sorted([int(f) for f in os.listdir(data_dir)])
+        self.timestamp = int(time.time())
+        self.indexed = (0, 0, '')
 
         result = self.db.execute('''select file, offset, length
             from docs order by file desc, offset desc limit 1''').fetchall()
@@ -464,32 +463,34 @@ class Index():
             with open(os.path.join('data', str(result[0][0]))) as fd:
                 fd.seek(offset)
                 self.indexed = (result[0][0], offset+20, fd.read(20))
-        else:
-            if files:
+
+        files = sorted([int(f) for f in os.listdir(data_dir)])
+        if files:
+            if '' == self.indexed[2]:
                 with open(os.path.join(data_dir, str(min(files)))) as fd:
                     assert(0 == struct.unpack('!Q', fd.read(8))[0])
                     self.indexed = (min(files), 28, fd.read(20))
-            else:
-                self.indexed = (0, 0, hashlib.sha1('').digest())
 
-        if files:
             self.indexed = scan(data_dir, self.indexed[0], self.indexed[1],
-                self.indexed[2], max(files), 2**40, self.put)
+                                self.indexed[2], max(files), 2**50, self.put)
             self.db.commit()
 
-    def put(self, key, filenum, offset, length):
-        self.db.execute('''insert or replace into docs values(?, ?, ?, ?)''',
-            (sqlite3.Binary(key), filenum, offset, length))
-
-        self.last_record = (filenum, offset, length)
+    def commit(self):
         if int(time.time()) > self.timestamp:
             self.db.commit()
             self.timestamp = int(time.time())
 
+    def put(self, key, filenum, offset, length):
+        self.commit()
+        self.db.execute(
+            'insert or replace into docs values(?, ?, ?, ?)',
+            (sqlite3.Binary(key), filenum, offset, length))
+
     def get(self, key):
-        result = self.db.execute('''select file, offset, length
-                                    from docs where key=?''',
-                                 (sqlite3.Binary(key),)).fetchall()
+        self.commit()
+        result = self.db.execute(
+            'select file, offset, length from docs where key=?',
+            (sqlite3.Binary(key),)).fetchall()
         return result[0] if result else (0, 0, 0)
 
 
@@ -507,7 +508,7 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
                 b = fd.read(8)
                 if not b:
                     break
-               
+
                 x = fd.read(struct.unpack('!Q', b)[0])
                 y = fd.read(20)
 
@@ -556,7 +557,7 @@ def append_record(docs):
 
     os.write(G['fd'], ''.join(buf_list))
 
-    G['index'].indexed = (filenum, 8 + buf_len + 20, chksum.digest())
+    G['index'].indexed = (filenum, offset + 20, chksum.digest())
 
 
 def lockr_server(servers, g):
@@ -570,17 +571,18 @@ def lockr_server(servers, g):
 
     g['peers'] = dict((ip_port, None) for ip_port in servers)
 
-    epoll_loop(opt.port,
-               [StatsServer, LockrServer],
-               [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
-               g['netstats'])
+    epoll_loop(
+        opt.port,
+        [StatsServer, LockrServer],
+        [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
+        g['netstats'])
 
 
 if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('--port', dest='port', type='int')
     parser.add_option('--servers', dest='servers', type='string')
-    parser.add_option('--size', dest='size', type='int', default=1073741824)
+    parser.add_option('--size', dest='size', type='int', default=134217728)
     parser.add_option('--index', dest='index', type='string', default='index')
     parser.add_option('--data', dest='data', type='string', default='data')
     parser.add_option('--cmd', dest='cmd', type='string', default='state')
@@ -608,4 +610,3 @@ if '__main__' == __name__:
         elif 'get' == opt.cmd:
             for k, v in cli.get([opt.key]).iteritems():
                 print('{0}: {1} {2}'.format(k, v[0], v[1]))
-                
