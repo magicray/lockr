@@ -253,6 +253,115 @@ def log(msg):
         msg))
 
 
+class Lockr(object):
+    def __init__(self, servers):
+        self.servers = servers
+        self.sock = self.connect()
+
+    def connect(self):
+        for ip, port in self.servers:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock = ssl.wrap_socket(sock)
+                sock.connect((ip, port))
+                sock.send(struct.pack('!B', 1))
+                return sock
+            except:
+                pass
+        raise Exception('could not connect to server')
+
+    def request(self, buf):
+        def recv(length):
+            pkt = list()
+            while length > 0:
+                pkt.append(self.sock.recv(length))
+                if 0 == len(pkt[-1]):
+                    raise Exception('connection closed')
+                length -= len(pkt[-1])
+            return ''.join(pkt)
+
+        self.sock.sendall(struct.pack('!I', len(buf)))
+        self.sock.sendall(buf)
+
+        return recv(struct.unpack('!I', recv(4))[0])
+
+    def get_state(self):
+        return json.loads(self.request(struct.pack('!B', 0)))
+
+    def put(self, docs):
+        items = [struct.pack('!B', 1)]
+        for k, v in docs.iteritems():
+            ver = '0-0' if v[0] is None else v[0]
+
+            items.append(hashlib.sha256(k).digest())
+            items.append(struct.pack('!Q', int(ver.split('-')[0])))
+            items.append(struct.pack('!Q', int(ver.split('-')[1])))
+            items.append(struct.pack('!Q', len(v[1])))
+            items.append(v[1])
+
+        return self.request(''.join(items))
+
+    def get(self, keys):
+        items = [struct.pack('!B', 2)]
+        hashdict = dict()
+        for key in keys:
+            h = hashlib.sha256(key).digest()
+            items.append(h)
+            hashdict[h] = key
+
+        buf = self.request(''.join(items))
+        i = 0
+        docs = dict()
+        while i < len(buf):
+            k = hashdict[buf[i:i+32]]
+            f = struct.unpack('!Q', buf[i+32:i+40])[0]
+            o = struct.unpack('!Q', buf[i+40:i+48])[0]
+            l = struct.unpack('!Q', buf[i+48:i+56])[0]
+            docs[k] = ('{0}-{1}'.format(f, o), buf[i+56:i+56+l])
+
+            i += 56 + l
+
+        return docs
+
+
+def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
+    for filenum in range(from_file, to_file+1):
+        with open(os.path.join(path, str(filenum))) as fd:
+            if filenum == from_file:
+                fd.seek(from_offset)
+                offset = from_offset
+            else:
+                offset = 0
+
+            while True:
+                log('scanned file({0}) offset({1})'.format(filenum, fd.tell()))
+                b = fd.read(8)
+                if not b:
+                    break
+
+                x = fd.read(struct.unpack('!Q', b)[0])
+                y = fd.read(20)
+
+                chksum = hashlib.sha1(checksum)
+                chksum.update(x)
+                assert(y == chksum.digest())
+                checksum = y
+
+                i = 0
+                while i < len(x):
+                    key = x[i:i+32]
+                    length = struct.unpack('!Q', x[i+32:i+40])[0]
+                    ofst = offset+8+i+40
+                    i += 40 + length
+
+                    callback(key, filenum, ofst, length)
+
+                offset += len(x) + 28
+
+    return (filenum, offset, checksum)
+
+
 class StatsServer():
     def on_accept(self, peer):
         return 'recv'
@@ -348,10 +457,10 @@ class LockrServer():
                 os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
             if 0 == G['index'].indexed[1]:
-                append_record(dict())
+                G['index'].append_record(dict())
 
         try:
-            append_record(docs)
+            G['index'].append_record(docs)
             return struct.pack('!B', 0)
         except:
             return struct.pack('!B', 1)
@@ -375,88 +484,16 @@ class LockrServer():
         return ''.join(result)
 
 
-class Lockr(object):
-    def __init__(self, servers):
-        self.servers = servers
-        self.sock = self.connect()
-
-    def connect(self):
-        for ip, port in self.servers:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock = ssl.wrap_socket(sock)
-                sock.connect((ip, port))
-                sock.send(struct.pack('!B', 1))
-                return sock
-            except:
-                pass
-        raise Exception('could not connect to server')
-
-    def request(self, buf):
-        def recv(length):
-            pkt = list()
-            while length > 0:
-                pkt.append(self.sock.recv(length))
-                if 0 == len(pkt[-1]):
-                    raise Exception('connection closed')
-                length -= len(pkt[-1])
-            return ''.join(pkt)
-
-        self.sock.sendall(struct.pack('!I', len(buf)))
-        self.sock.sendall(buf)
-
-        return recv(struct.unpack('!I', recv(4))[0])
-
-    def get_state(self):
-        return json.loads(self.request(struct.pack('!B', 0)))
-
-    def put(self, docs):
-        items = [struct.pack('!B', 1)]
-        for k, v in docs.iteritems():
-            ver = '0-0' if v[0] is None else v[0]
-
-            items.append(hashlib.sha256(k).digest())
-            items.append(struct.pack('!Q', int(ver.split('-')[0])))
-            items.append(struct.pack('!Q', int(ver.split('-')[1])))
-            items.append(struct.pack('!Q', len(v[1])))
-            items.append(v[1])
-
-        return self.request(''.join(items))
-
-    def get(self, keys):
-        items = [struct.pack('!B', 2)]
-        hashdict = dict()
-        for key in keys:
-            h = hashlib.sha256(key).digest()
-            items.append(h)
-            hashdict[h] = key
-
-        buf = self.request(''.join(items))
-        i = 0
-        docs = dict()
-        while i < len(buf):
-            k = hashdict[buf[i:i+32]]
-            f = struct.unpack('!Q', buf[i+32:i+40])[0]
-            o = struct.unpack('!Q', buf[i+40:i+48])[0]
-            l = struct.unpack('!Q', buf[i+48:i+56])[0]
-            docs[k] = ('{0}-{1}'.format(f, o), buf[i+56:i+56+l])
-
-            i += 56 + l
-
-        return docs
-
-
-class Index():
+class DB():
     def __init__(self, db_file, data_dir):
-        self.db = sqlite3.connect(db_file)
-        self.db.execute('''create table if not exists docs
+        self.index = sqlite3.connect(db_file)
+        self.index.execute('''create table if not exists docs
             (key blob primary key, file int, offset int, length int)''')
 
         self.timestamp = int(time.time())
         self.indexed = (0, 0, '')
 
-        result = self.db.execute('''select file, offset, length
+        result = self.index.execute('''select file, offset, length
             from docs order by file desc, offset desc limit 1''').fetchall()
         if result:
             offset = result[0][1] + result[0][2]
@@ -473,102 +510,63 @@ class Index():
 
             self.indexed = scan(data_dir, self.indexed[0], self.indexed[1],
                                 self.indexed[2], max(files), 2**50, self.put)
-            self.db.commit()
+            self.index.commit()
 
     def commit(self):
         if int(time.time()) > self.timestamp:
-            self.db.commit()
+            self.index.commit()
             self.timestamp = int(time.time())
 
     def put(self, key, filenum, offset, length):
         self.commit()
-        self.db.execute(
+        self.index.execute(
             'insert or replace into docs values(?, ?, ?, ?)',
             (sqlite3.Binary(key), filenum, offset, length))
 
     def get(self, key):
         self.commit()
-        result = self.db.execute(
+        result = self.index.execute(
             'select file, offset, length from docs where key=?',
             (sqlite3.Binary(key),)).fetchall()
         return result[0] if result else (0, 0, 0)
 
+    def append_record(self, docs):
+        buf_len = 0
+        buf_list = list()
+        for k, v in docs.iteritems():
+            f, o, l = self.get(k)
+            assert((v[0] == f) and (v[1] == o)), 'version mismatch'
 
-def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
-    for filenum in range(from_file, to_file+1):
-        with open(os.path.join(path, str(filenum))) as fd:
-            if filenum == from_file:
-                fd.seek(from_offset)
-                offset = from_offset
-            else:
-                offset = 0
+            buf_list.append(k)
+            buf_list.append(struct.pack('!Q', len(v[2])))
+            buf_list.append(v[2])
+            buf_len += 40 + len(v[2])
 
-            while True:
-                log('scanned file({0}) offset({1})'.format(filenum, fd.tell()))
-                b = fd.read(8)
-                if not b:
-                    break
+        filenum, offset, checksum = self.indexed
+        offset += 8
+        for k, v in docs.iteritems():
+            self.put(k, filenum, offset+32+8, len(v[2]))
+            offset += 32 + 8 + len(v[2])
 
-                x = fd.read(struct.unpack('!Q', b)[0])
-                y = fd.read(20)
+        chksum = hashlib.sha1(checksum)
+        map(lambda b: chksum.update(b), buf_list)
 
-                chksum = hashlib.sha1(checksum)
-                chksum.update(x)
-                assert(y == chksum.digest())
-                checksum = y
+        buf_list.insert(0, struct.pack('!Q', buf_len))
+        buf_list.append(chksum.digest())
 
-                i = 0
-                while i < len(x):
-                    key = x[i:i+32]
-                    length = struct.unpack('!Q', x[i+32:i+40])[0]
-                    ofst = offset+8+i+40
-                    i += 40 + length
+        os.write(G['fd'], ''.join(buf_list))
 
-                    callback(key, filenum, ofst, length)
-
-                offset += len(x) + 28
-
-    return (filenum, offset, checksum)
-
-
-def append_record(docs):
-    buf_len = 0
-    buf_list = list()
-    for k, v in docs.iteritems():
-        f, o, l = G['index'].get(k)
-        assert((v[0] == f) and (v[1] == o)), 'version mismatch'
-
-        buf_list.append(k)
-        buf_list.append(struct.pack('!Q', len(v[2])))
-        buf_list.append(v[2])
-        buf_len += 40 + len(v[2])
-
-    filenum, offset, checksum = G['index'].indexed
-    offset += 8
-    for k, v in docs.iteritems():
-        G['index'].put(k, filenum, offset+32+8, len(v[2]))
-        offset += 32 + 8 + len(v[2])
-
-    chksum = hashlib.sha1(checksum)
-    map(lambda b: chksum.update(b), buf_list)
-
-    buf_list.insert(0, struct.pack('!Q', buf_len))
-    buf_list.append(chksum.digest())
-
-    os.write(G['fd'], ''.join(buf_list))
-
-    G['index'].indexed = (filenum, offset + 20, chksum.digest())
+        self.indexed = (filenum, offset + 20, chksum.digest())
 
 
 def lockr_server(servers, g):
     os.dup2(os.open('log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
                     os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
-    if not os.path.isdir('data'):
-        os.mkdir('data')
+    if not os.path.isdir(opt.data):
+        os.mkdir(opt.data)
 
-    g['index'] = Index(opt.index, opt.data)
-
+    g['index'] = DB(opt.index, opt.data)
     g['peers'] = dict((ip_port, None) for ip_port in servers)
 
     epoll_loop(
