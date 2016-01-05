@@ -32,7 +32,7 @@ def epoll_loop(port, servers, clients, stats):
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener_sock.bind(('0.0.0.0', port))
+    listener_sock.bind((port.split(':')[0], int(port.split(':')[1])))
     listener_sock.listen(5)
     listener_sock.setblocking(0)
 
@@ -230,6 +230,7 @@ def epoll_loop(port, servers, clients, stats):
                     raise Exception('invalid return value')
 
             except Exception as e:
+                #traceback.print_exc()
                 conn = connections.pop(fileno)
                 conn['sock'].close()
                 epoll.unregister(fileno)
@@ -270,7 +271,7 @@ class Lockr(object):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock = ssl.wrap_socket(sock)
                 sock.connect((ip, port))
-                sock.send(struct.pack('!B', 1))
+                sock.send(struct.pack('!B', 0))
                 t = int((time.time()-t)*1000)
                 sys.stdout.write('succeeded in {0} msec\n'.format(t))
                 return sock
@@ -405,6 +406,23 @@ class StatsClient():
 
     def on_recv(self, buf):
         G['peers'][self.peer] = json.loads(buf)
+
+        G['leader'] = opt.port
+        leader = dict(file=G['index'].file, offset=G['index'].offset)
+        for key, value in G['peers'].iteritems():
+            key = '{0}:{1}'.format(key[0], key[1])
+            if value:
+                first = leader['file']*2**64 + leader['offset']
+                second = value['file']*2**64 + value['offset']
+
+                if first < second:
+                    G['leader'] = key
+                    leader = value
+                elif first == second:
+                    if G['leader'] < key:
+                        G['leader'] = key
+                        leader = value
+
         return ('send', '')
 
     def on_send(self):
@@ -412,7 +430,44 @@ class StatsClient():
 
     def on_close(self, peer):
         G['peers'][peer] = None
-        return ('connect', peer, 0, self)
+        return ('connect', peer, 1, self)
+
+
+class ReplicationServer():
+    def on_accept(self, peer):
+        return 'recv'
+
+    def on_recv(self, buf):
+        return ('send', json.dumps(dict(
+            file=G['index'].file,
+            offset=G['index'].offset,
+            netstats=G['netstats'])))
+
+    def on_send(self):
+        return 'recv'
+
+    def on_close(self, peer):
+        pass
+
+
+class ReplicationClient():
+    def __init__(self):
+        self.peer = None
+
+    def on_connect(self, peer):
+        self.peer = peer
+        return ('send', '')
+
+    def on_recv(self, buf):
+        G['peers'][self.peer] = json.loads(buf)
+        return ('send', '')
+
+    def on_send(self):
+        return 'recv'
+
+    def on_close(self, peer):
+        G['peers'][peer] = None
+        return ('connect', peer, 1, self)
 
 
 class LockrServer():
@@ -441,6 +496,7 @@ class LockrServer():
         return json.dumps(dict(
             file=G['index'].file,
             offset=G['index'].offset,
+            leader=G['leader'],
             netstats=G['netstats'],
             peers=state,
             timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
@@ -616,8 +672,8 @@ class Client(cmd.Cmd):
 
 if '__main__' == __name__:
     parser = optparse.OptionParser()
-    parser.add_option('-p', '--port', dest='port', type='int',
-                      help='port number. skip to start the client')
+    parser.add_option('-b', '--bind', dest='port', type='string',
+                      help='server:port pair. skip to start the client')
     parser.add_option('-s', '--servers', dest='servers', type='string',
                       help='comma separated list of ip:port')
     parser.add_option('-m', '--max-file-size', dest='size', type='int',
@@ -648,11 +704,12 @@ if '__main__' == __name__:
     G = dict(
         netstats=dict(),
         fd=None,
+        leader=None,
         index=DB(opt.index, opt.data),
         peers=dict((ip_port, None) for ip_port in servers))
 
     epoll_loop(
         opt.port,
-        [StatsServer, LockrServer],
-        [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
+        [LockrServer, StatsServer, ReplicationServer],
+        [(p[0], p[1], 1, StatsClient()) for p in G['peers']],
         G['netstats'])
