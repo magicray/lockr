@@ -559,34 +559,18 @@ class DB():
         self.indexed = (filenum, offset + 20, chksum.digest())
 
 
-def lockr_server(servers, g):
-    os.dup2(os.open('log.{0}'.format(time.strftime('%y%m%d', time.gmtime())),
-                    os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
-
-    if not os.path.isdir(opt.data):
-        os.mkdir(opt.data)
-
-    g['index'] = DB(opt.index, opt.data)
-    g['peers'] = dict((ip_port, None) for ip_port in servers)
-
-    epoll_loop(
-        opt.port,
-        [StatsServer, LockrServer],
-        [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
-        g['netstats'])
-
-
 if '__main__' == __name__:
     parser = optparse.OptionParser()
-    parser.add_option('--port', dest='port', type='int')
-    parser.add_option('--servers', dest='servers', type='string')
-    parser.add_option('--size', dest='size', type='int', default=134217728)
-    parser.add_option('--index', dest='index', type='string', default='index')
-    parser.add_option('--data', dest='data', type='string', default='data')
-    parser.add_option('--cmd', dest='cmd', type='string', default='state')
-    parser.add_option('--key', dest='key', type='string')
-    parser.add_option('--version', dest='version', type='string')
-    parser.add_option('--value', dest='value', type='string')
+    parser.add_option('-p', '--port', dest='port', type='int',
+        help='port number. skip to start the client')
+    parser.add_option('-s', '--servers', dest='servers', type='string',
+        help='comma separated list of ip:port')
+    parser.add_option('-m', '--max-file-size', dest='size', type='int',
+        help='max data file size before roll over', default=134217728)
+    parser.add_option('--index-path', dest='index', type='string',
+        help='index file path', default='index')
+    parser.add_option('-d', '--data-dir', dest='data', type='string',
+        help='data directory location', default='data')
     opt, args = parser.parse_args()
 
     servers = list()
@@ -595,16 +579,51 @@ if '__main__' == __name__:
                           map(lambda x: x.split(':'),
                               opt.servers.split(','))))
     if opt.port:
-        G = dict(netstats=dict(), peers=dict(), fd=None)
-        lockr_server(servers, G)
-    else:
-        cli = Lockr(servers)
+        os.dup2(os.open('log.{0}'.format(time.strftime('%y%m%d',
+                                                       time.gmtime())),
+                        os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
-        if 'state' == opt.cmd:
+        if not os.path.isdir(opt.data):
+            os.mkdir(opt.data)
+
+        G = dict(
+            netstats=dict(),
+            fd=None,
+            index=DB(opt.index, opt.data),
+            peers=dict((ip_port, None) for ip_port in servers))
+
+        epoll_loop(
+            opt.port,
+            [StatsServer, LockrServer],
+            [(p[0], p[1], 0, StatsClient()) for p in G['peers']],
+            G['netstats'])
+
+        exit(0)
+
+    import cmd
+    import shlex
+    cli = Lockr(servers)
+    class Client(cmd.Cmd):
+        prompt = '>'
+
+        def do_EOF(self, line):
+            return True
+
+        def do_quit(self, line):
+            return True
+
+        def do_state(self, line):
             print(json.dumps(cli.get_state(), indent=4, sort_keys=True))
-        elif 'put' == opt.cmd:
-            doc = {opt.key: (opt.version, opt.value)}
+
+        def do_get(self, line):
+            for k, v in cli.get(line.split()).iteritems():
+                print('{0} <{1}> {2}'.format(k, v[0], v[1]))
+
+        def do_put(self, line):
+            cmd = shlex.split(line)
+            version = '0-0' if len(cmd) < 3 else cmd[1]
+            value = cmd[1] if len(cmd) < 3 else cmd[2]
+            doc = {cmd[0]: (version, value)}
             print(struct.unpack('!B', cli.put(doc))[0])
-        elif 'get' == opt.cmd:
-            for k, v in cli.get([opt.key]).iteritems():
-                print('{0}: {1} {2}'.format(k, v[0], v[1]))
+
+    Client().cmdloop()
