@@ -243,10 +243,12 @@ def epoll_loop(port, servers, clients, stats):
                         conn['peer'], str(e)))
                 if 'handler' in conn:
                     peer = conn.get('peer') or conn['ip_port']
-                    result = conn['handler'].on_close(peer)
-                    if result and 'connect' == result[0]:
-                        _, peer, proto, handler = result
-                        clients.append((peer[0], peer[1], proto, handler))
+                    if 'reconnect' == conn['handler'].on_close(peer):
+                        clients.append((
+                            conn['ip_port'][0],
+                            conn['ip_port'][1],
+                            conn['proto'],
+                            conn['handler']))
 
 
 def log(msg):
@@ -384,10 +386,19 @@ class StatsServer():
         return 'recv'
 
     def on_recv(self, buf):
-        return ('send', json.dumps(dict(
-            file=G['index'].file,
-            offset=G['index'].offset,
-            netstats=G['netstats'])))
+        if 'stats' == buf:
+            return ('send', json.dumps(dict(
+                file=G['index'].file,
+                offset=G['index'].offset,
+                netstats=G['netstats'])))
+        else:
+            filenum, offset = buf.split('-')
+            if os.path.isfile(os.path.join(opt.data, filenum)):
+                with open(os.path.join(opt.data, filenum)) as fd:
+                    fd.seek(int(offset))
+                    return ('send', fd.read(10**6))
+            else:
+                return ('send', '')
 
     def on_send(self):
         return 'recv'
@@ -399,78 +410,61 @@ class StatsServer():
 class StatsClient():
     def __init__(self):
         self.peer = None
+        self.expected = 'stats'
 
     def on_connect(self, peer):
         self.peer = peer
-        return ('send', '')
+        self.expected = 'stats'
+        return ('send', 'stats')
 
     def on_recv(self, buf):
-        G['peers'][self.peer] = json.loads(buf)
+        if 'stats' == self.expected:
+            G['peers'][self.peer] = json.loads(buf)
 
-        G['candidate'] = '{0}:{1}'.format(opt.port[0], opt.port[1])
-        leader = dict(file=G['index'].file, offset=G['index'].offset)
-        for key, value in G['peers'].iteritems():
-            if not value:
-                continue
+            G['candidate'] = opt.port
+            leader = dict(file=G['index'].file, offset=G['index'].offset)
+            for key, value in G['peers'].iteritems():
+                if not value:
+                    continue
 
-            first = leader['file']*2**64 + leader['offset']
-            second = value['file']*2**64 + value['offset']
+                first = leader['file']*2**64 + leader['offset']
+                second = value['file']*2**64 + value['offset']
 
-            if first > second:
-                continue
+                if first > second:
+                    continue
 
-            key = '{0}:{1}'.format(key[0], key[1])
-            if (first == second) and (G['candidate'] > key):
-                continue
+                if (first == second) and (G['candidate'] > key):
+                    continue
 
-            G['candidate'] = key
-            leader = value
+                G['candidate'] = key
+                leader = value
 
-        return ('send', '')
+            if G['candidate'] != opt.port:
+                self.expected = '{0}-{1}'.format(G['index'].file,
+                                                G['index'].offset)
+                return ('send', self.expected)
+            else:
+                self.expected = 'stats'
+                return ('send', self.expected)
+        else:
+            if len(buf):
+                if not G['fd']:
+                    G['fd'] = os.open(
+                        os.path.join('data', str(G['index'].file)),
+                        os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+                os.write(G['fd'], buf)
+                self.expected = '0-0'
+                return ('send', self.expected)
+            else:
+                self.expected = 'stats'
+                return ('send', self.expected)
 
     def on_send(self):
         return 'recv'
 
     def on_close(self, peer):
         G['peers'][peer] = None
-        return ('connect', peer, 1, self)
-
-
-class ReplicationServer():
-    def on_accept(self, peer):
-        return 'recv'
-
-    def on_recv(self, buf):
-        return ('send', json.dumps(dict(
-            file=G['index'].file,
-            offset=G['index'].offset,
-            netstats=G['netstats'])))
-
-    def on_send(self):
-        return 'recv'
-
-    def on_close(self, peer):
-        pass
-
-
-class ReplicationClient():
-    def __init__(self):
-        self.peer = None
-
-    def on_connect(self, peer):
-        self.peer = peer
-        return ('send', '')
-
-    def on_recv(self, buf):
-        G['peers'][self.peer] = json.loads(buf)
-        return ('send', '')
-
-    def on_send(self):
-        return 'recv'
-
-    def on_close(self, peer):
-        G['peers'][peer] = None
-        return ('connect', peer, 1, self)
+        return 'reconnect'
 
 
 class LockrServer():
@@ -717,6 +711,6 @@ if '__main__' == __name__:
 
     epoll_loop(
         opt.port,
-        [LockrServer, StatsServer, ReplicationServer],
+        [LockrServer, StatsServer],
         [(p[0], p[1], 1, StatsClient()) for p in G['peers']],
         G['netstats'])
