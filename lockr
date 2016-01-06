@@ -32,7 +32,7 @@ def epoll_loop(port, servers, clients, stats):
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener_sock.bind((port.split(':')[0], int(port.split(':')[1])))
+    listener_sock.bind(port)
     listener_sock.listen(5)
     listener_sock.setblocking(0)
 
@@ -407,7 +407,7 @@ class StatsClient():
     def on_recv(self, buf):
         G['peers'][self.peer] = json.loads(buf)
 
-        G['leader'] = opt.port
+        G['candidate'] = '{0}:{1}'.format(opt.port[0], opt.port[1])
         leader = dict(file=G['index'].file, offset=G['index'].offset)
         for key, value in G['peers'].iteritems():
             key = '{0}:{1}'.format(key[0], key[1])
@@ -415,13 +415,14 @@ class StatsClient():
                 first = leader['file']*2**64 + leader['offset']
                 second = value['file']*2**64 + value['offset']
 
-                if first < second:
-                    G['leader'] = key
-                    leader = value
-                elif first == second:
-                    if G['leader'] < key:
-                        G['leader'] = key
-                        leader = value
+                if first > second:
+                    continue
+
+                if (first == second) and (G['candidate'] > key):
+                    continue
+
+                G['candidate'] = key
+                leader = value
 
         return ('send', '')
 
@@ -496,7 +497,7 @@ class LockrServer():
         return json.dumps(dict(
             file=G['index'].file,
             offset=G['index'].offset,
-            leader=G['leader'],
+            candidate=G['candidate'],
             netstats=G['netstats'],
             peers=state,
             timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
@@ -704,9 +705,13 @@ if '__main__' == __name__:
     G = dict(
         netstats=dict(),
         fd=None,
-        leader=None,
+        candidate=None,
         index=DB(opt.index, opt.data),
         peers=dict((ip_port, None) for ip_port in servers))
+
+    opt.port = (
+        socket.gethostbyname(opt.port.split(':')[0]),
+        int(opt.port.split(':')[1]))
 
     epoll_loop(
         opt.port,
