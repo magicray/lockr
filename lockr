@@ -230,7 +230,7 @@ def epoll_loop(port, servers, clients, stats):
                     raise Exception('invalid return value')
 
             except Exception as e:
-                #traceback.print_exc()
+                # traceback.print_exc()
                 conn = connections.pop(fileno)
                 conn['sock'].close()
                 epoll.unregister(fileno)
@@ -410,19 +410,21 @@ class StatsClient():
         G['candidate'] = '{0}:{1}'.format(opt.port[0], opt.port[1])
         leader = dict(file=G['index'].file, offset=G['index'].offset)
         for key, value in G['peers'].iteritems():
+            if not value:
+                continue
+
+            first = leader['file']*2**64 + leader['offset']
+            second = value['file']*2**64 + value['offset']
+
+            if first > second:
+                continue
+
             key = '{0}:{1}'.format(key[0], key[1])
-            if value:
-                first = leader['file']*2**64 + leader['offset']
-                second = value['file']*2**64 + value['offset']
+            if (first == second) and (G['candidate'] > key):
+                continue
 
-                if first > second:
-                    continue
-
-                if (first == second) and (G['candidate'] > key):
-                    continue
-
-                G['candidate'] = key
-                leader = value
+            G['candidate'] = key
+            leader = value
 
         return ('send', '')
 
