@@ -345,40 +345,52 @@ class Lockr(object):
 
 
 def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
+    total_size = 0
+    file_closed = False
     for filenum in range(from_file, to_file+1):
         with open(os.path.join(path, str(filenum))) as fd:
-            if filenum == from_file:
-                fd.seek(from_offset)
-                offset = from_offset
-            else:
-                offset = 0
+            fd.seek(0, 2)
+            total_size = fd.tell()
 
-            while True:
-                log('scanned file({0}) offset({1})'.format(filenum, fd.tell()))
-                b = fd.read(8)
-                if not b:
-                    break
+            offset = from_offset if(filenum == from_file) else 0
+            fd.seek(offset)
 
-                x = fd.read(struct.unpack('!Q', b)[0])
-                y = fd.read(20)
+            try:
+                while(offset < total_size):
+                    b = fd.read(8)
+                    assert(len(b) == 8)
 
-                chksum = hashlib.sha1(checksum)
-                chksum.update(x)
-                assert(y == chksum.digest())
-                checksum = y
+                    x = fd.read(struct.unpack('!Q', b)[0])
+                    y = fd.read(20)
+                    assert(len(y) == 20)
 
-                i = 0
-                while i < len(x):
-                    key = x[i:i+32]
-                    length = struct.unpack('!Q', x[i+32:i+40])[0]
-                    ofst = offset+8+i+40
-                    i += 40 + length
+                    if (0 == len(x)) and (offset != 0):
+                        file_closed = True
 
-                    callback(key, filenum, ofst, length)
+                    chksum = hashlib.sha1(checksum)
+                    chksum.update(x)
+                    assert(y == chksum.digest())
+                    checksum = y
 
-                offset += len(x) + 28
+                    i = 0
+                    while i < len(x):
+                        key = x[i:i+32]
+                        length = struct.unpack('!Q', x[i+32:i+40])[0]
+                        ofst = offset+8+i+40
+                        i += 40 + length
 
-    return (filenum, offset, checksum)
+                        callback(key, filenum, ofst, length)
+
+                    offset += len(x) + 28
+                    assert(offset <= total_size)
+
+                    log('scanned file({0}) offset({1})'.format(
+                        filenum, fd.tell()))
+            except:
+                traceback.print_exc()
+                break
+
+    return (filenum, offset, checksum, total_size, file_closed)
 
 
 class StatsServer():
@@ -419,41 +431,44 @@ class StatsClient():
 
     def on_recv(self, buf):
         if 'stats' == self.expected:
-            G['peers'][self.peer] = json.loads(buf)
+            stats = json.loads(buf)
+            G['peers'][self.peer] = stats
 
-            G['candidate'] = opt.port
-            leader = dict(file=G['index'].file, offset=G['index'].offset)
-            for key, value in G['peers'].iteritems():
-                if not value:
-                    continue
+            local = G['index'].file*2**64 + G['index'].offset
+            peer = stats['file']*2**64 + stats['offset']
 
-                first = leader['file']*2**64 + leader['offset']
-                second = value['file']*2**64 + value['offset']
-
-                if first > second:
-                    continue
-
-                if (first == second) and (G['candidate'] > key):
-                    continue
-
-                G['candidate'] = key
-                leader = value
-
-            if G['candidate'] != opt.port:
-                self.expected = '{0}-{1}'.format(G['index'].file,
-                                                G['index'].offset)
+            if peer > local:
+                self.expected = '{0}-{1}'.format(
+                    G['index'].file, G['index'].total_size)
                 return ('send', self.expected)
-            else:
-                self.expected = 'stats'
-                return ('send', self.expected)
+
+            return ('send', self.expected)
         else:
             if len(buf):
                 if not G['fd']:
                     G['fd'] = os.open(
                         os.path.join('data', str(G['index'].file)),
                         os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
                 os.write(G['fd'], buf)
-                self.expected = '0-0'
+                filenum, offset, chksum, total_size, file_closed = scan(
+                    opt.data, G['index'].file, G['index'].offset,
+                    G['index'].checksum, G['index'].file,
+                    2**50, G['index'].put)
+
+                G['index'].checksum = chksum
+                if not file_closed:
+                    G['index'].offset = offset
+                    G['index'].total_size = total_size
+                else:
+                    os.close(G['fd'])
+                    G['fd'] = None
+                    G['index'].offset = 0
+                    G['index'].total_size = 0
+                    G['index'].file += 1
+
+                self.expected = '{0}-{1}'.format(
+                    G['index'].file, G['index'].total_size)
                 return ('send', self.expected)
             else:
                 self.expected = 'stats'
@@ -563,6 +578,7 @@ class DB():
         self.timestamp = int(time.time())
         self.file = 0
         self.offset = 0
+        self.total_size = 0
         self.checksum = ''
 
         result = self.index.execute('''select file, offset, length
@@ -584,9 +600,12 @@ class DB():
                     self.offset = 28
                     self.checksum = fd.read(20)
 
-            self.file, self.offset, self.checksum = scan(
+            self.file, self.offset, self.checksum, self.total_size, _ = scan(
                 data_dir, self.file, self.offset, self.checksum, max(files),
                 2**50, self.put)
+            assert(max(files) == self.file)
+            with open(os.path.join(data_dir, str(self.file)), 'w') as fd:
+                fd.truncate(self.offset)
             self.index.commit()
 
     def commit(self):
