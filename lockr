@@ -604,8 +604,8 @@ class DB():
                 data_dir, self.file, self.offset, self.checksum, max(files),
                 2**50, self.put)
             assert(max(files) == self.file)
-            with open(os.path.join(data_dir, str(self.file)), 'w') as fd:
-                fd.truncate(self.offset)
+            #with open(os.path.join(data_dir, str(self.file)), 'w') as fd:
+            #    fd.truncate(self.offset)
             self.index.commit()
 
     def commit(self):
