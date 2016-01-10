@@ -206,6 +206,7 @@ def epoll_loop(port, handler, clients, stats):
                 if conn['is_server']:
                     stats['srv_disconnect'] += 1
                 else:
+                    handler(conn['ip_port'], None, 'disconnected')
                     stats['cli_disconnect'] += 1
                     clients.add((conn['ip_port'][0], conn['ip_port'][1]))
 
@@ -365,6 +366,22 @@ def process_stats_response(peer, buf):
     return [(peer, 256, '')]
 
 
+def process_replication_request(peer, buf):
+    return [(peer, 259, '')]
+
+
+def process_replication_response(peer, buf):
+    return [(peer, 258, '')]
+
+
+def process_leader_request(peer, buf):
+    return [(peer, 261, '')]
+
+
+def process_leader_response(peer, buf):
+    return [(peer, 260, '')]
+
+
 def process_lockr_state_request(peer, buf):
     state = dict()
     for ip, port in G['peers']:
@@ -438,26 +455,26 @@ def process_lockr_get_request(peer, buf):
     return [(peer, 0, ''.join(result))]
 
 
-def big_msg(peer, buf):
-    log('from{0} length({1}M)'.format(peer, len(buf)/1000000))
-    return [(peer, 1000, buf)]
-
-
 def handler(peer, type, buf):
     handlers = {
-        1: process_lockr_state_request,
-        2: process_lockr_get_request,
-        3: process_lockr_put_request,
+          1: process_lockr_state_request,
+          2: process_lockr_get_request,
+          3: process_lockr_put_request,
         256: process_stats_request,
         257: process_stats_response,
-        1000: big_msg
+        258: process_replication_request,
+        259: process_replication_response,
+        260: process_leader_request,
+        261: process_leader_response
     }
 
-    if not type:
-        if 'connected' == buf:
-            return [(peer, 256, ''), (peer, 1000, ' '*5*10**7)]
+    if type:
+        return handlers[type](peer, buf)
 
-    return handlers[type](peer, buf)
+    if 'connected' == buf:
+        return [(peer, 256, '')]
+    if 'disconnected' == buf:
+        G['peers'][peer] = None
 
 
 class StatsServer():
@@ -664,16 +681,14 @@ if '__main__' == __name__:
     if not os.path.isdir(opt.data):
         os.mkdir(opt.data)
 
-    G = dict(
-        netstats=dict(),
-        fd=None,
-        candidate=None,
-        index=DB(opt.index, opt.data),
-        peers=dict((ip_port, None) for ip_port in servers))
+    G = dict(netstats=dict(),
+             fd=None,
+             candidate=None,
+             index=DB(opt.index, opt.data),
+             peers=dict((ip_port, None) for ip_port in servers))
 
-    opt.port = (
-        socket.gethostbyname(opt.port.split(':')[0]),
-        int(opt.port.split(':')[1]))
+    opt.port = (socket.gethostbyname(opt.port.split(':')[0]),
+                int(opt.port.split(':')[1]))
 
     epoll_loop(opt.port,
                handler,
