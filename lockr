@@ -16,7 +16,7 @@ import traceback
 from OpenSSL import crypto
 
 
-def epoll_loop(port, on_recv, on_connect, clients, stats):
+def epoll_loop(port, handler, clients, stats):
     key = crypto.PKey()
     key.generate_key(crypto.TYPE_RSA, 2048)
     cert = crypto.X509()
@@ -100,7 +100,7 @@ def epoll_loop(port, on_recv, on_connect, clients, stats):
                         if conn['is_server']:
                             epoll.modify(fileno, select.EPOLLIN)
                         else:
-                            for r in on_connect(conn['peer']):
+                            for r in handler(conn['peer'], None, 'connected'):
                                 conn['msgs'].append(r)
                                 epoll.modify(fileno, select.EPOLLOUT)
                     except ssl.SSLError as e:
@@ -175,28 +175,18 @@ def epoll_loop(port, on_recv, on_connect, clients, stats):
                     else:
                         select_flags |= select.EPOLLOUT
                         if 8 != conn['out_hdr_sent']:
-                            if 'snd_hdr' not in conn:
-                                pkt = conn['out_hdr']
-                                offset = conn['out_hdr_sent']
-                                conn['snd_hdr'] = pkt[offset:]
-
-                            n = conn['sock'].send(conn['snd_hdr'])
-                            if n > 0:
-                                del(conn['snd_hdr'])
-                                conn['out_hdr_sent'] += n
-                                stats['out_bytes'] += n
+                            pkt = conn['out_hdr']
+                            offset = conn['out_hdr_sent']
+                            n = conn['sock'].send(pkt[offset:])
+                            conn['out_hdr_sent'] += n
+                            stats['out_bytes'] += n
                         else:
                             pkt = conn['out_pkt']
                             if len(pkt) > conn['out_sent']:
-                                if 'snd_pkt' not in conn:
-                                    offset = conn['out_sent']
-                                    conn['snd_pkt'] = pkt[offset:]
-
-                                n = conn['sock'].send(conn['snd_pkt'])
-                                if n > 0:
-                                    del(conn['snd_pkt'])
-                                    conn['out_sent'] += n
-                                    stats['out_bytes'] += n
+                                offset = conn['out_sent']
+                                n = conn['sock'].send(pkt[offset:])
+                                conn['out_sent'] += n
+                                stats['out_bytes'] += n
                             else:
                                 del(conn['out_sent'])
                                 del(conn['out_hdr_sent'])
@@ -275,7 +265,7 @@ class Lockr(object):
         return recv(size)
 
     def get_state(self):
-        return json.loads(self.request(2, ''))
+        return json.loads(self.request(1, ''))
 
     def put(self, docs):
         items = [struct.pack('!B', 1)]
@@ -288,7 +278,7 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
-        return self.request(4, ''.join(items))
+        return self.request(3, ''.join(items))
 
     def get(self, keys):
         items = [struct.pack('!B', 2)]
@@ -298,7 +288,7 @@ class Lockr(object):
             items.append(h)
             hashdict[h] = key
 
-        buf = self.request(3, ''.join(items))
+        buf = self.request(2, ''.join(items))
         i = 0
         docs = dict()
         while i < len(buf):
@@ -362,25 +352,25 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
     return (filenum, offset, checksum, total_size, file_closed)
 
 
-def stats_server(peer, buf):
+def process_stats_request(peer, buf):
     msg = json.dumps(dict(
-                file=G['index'].file,
-                offset=G['index'].offset,
-                netstats=G['netstats']))
-    return [(peer, 1, msg)]
+        file=G['index'].file,
+        offset=G['index'].offset,
+        netstats=G['netstats']))
+    return [(peer, 257, msg)]
 
 
-def stats_client(peer, buf):
+def process_stats_response(peer, buf):
     G['peers'][peer] = json.loads(buf)
-    return [(peer, 0, '')]
+    return [(peer, 256, '')]
 
 
-def lockr_state_handler(peer, buf):
+def process_lockr_state_request(peer, buf):
     state = dict()
     for ip, port in G['peers']:
         state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
 
-    return [(peer, 2, json.dumps(dict(
+    return [(peer, 0, json.dumps(dict(
         file=G['index'].file,
         offset=G['index'].offset,
         candidate=G['candidate'],
@@ -389,7 +379,7 @@ def lockr_state_handler(peer, buf):
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))]
 
 
-def lockr_put_handler(peer, buf):
+def process_lockr_put_request(peer, buf):
     docs = dict()
     i = 1
     while i < len(buf):
@@ -429,7 +419,7 @@ def lockr_put_handler(peer, buf):
     return [(peer, 0, result)]
 
 
-def lockr_get_handler(peer, buf):
+def process_lockr_get_request(peer, buf):
     result = list()
     i = 1
     while i < len(buf):
@@ -448,19 +438,26 @@ def lockr_get_handler(peer, buf):
     return [(peer, 0, ''.join(result))]
 
 
+def big_msg(peer, buf):
+    log('from{0} length({1}M)'.format(peer, len(buf)/1000000))
+    return [(peer, 1000, buf)]
+
+
 def handler(peer, type, buf):
-    return [
-        stats_server,
-        stats_client,
-        lockr_state_handler,
-        lockr_get_handler,
-        lockr_put_handler
-    ][type](peer, buf)
+    handlers = {
+        1: process_lockr_state_request,
+        2: process_lockr_get_request,
+        3: process_lockr_put_request,
+        256: process_stats_request,
+        257: process_stats_response,
+        1000: big_msg
+    }
 
+    if not type:
+        if 'connected' == buf:
+            return [(peer, 256, ''), (peer, 1000, ' '*5*10**7)]
 
-def on_connect(peer):
-    log('on_connect {0}'.format(peer))
-    return [(peer, 0, '')]
+    return handlers[type](peer, buf)
 
 
 class StatsServer():
@@ -678,9 +675,7 @@ if '__main__' == __name__:
         socket.gethostbyname(opt.port.split(':')[0]),
         int(opt.port.split(':')[1]))
 
-    epoll_loop(
-        opt.port,
-        handler,
-        on_connect,
-        [(p[0], int(p[1])) for p in G['peers']],
-        G['netstats'])
+    epoll_loop(opt.port,
+               handler,
+               [(p[0], int(p[1])) for p in G['peers']],
+               G['netstats'])
