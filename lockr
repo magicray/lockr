@@ -98,11 +98,17 @@ def epoll_loop(port, handler, clients, stats):
                         conn['in_hdr_pkts'] = list()
                         conn['msgs'] = list()
                         if conn['is_server']:
+                            event = 'server-connected'
                             epoll.modify(fileno, select.EPOLLIN)
                         else:
-                            for r in handler(conn['peer'], None, 'connected'):
+                            event = 'client-connected'
+                            epoll.modify(fileno, select.EPOLLOUT)
+
+                        result = handler(conn['peer'], event, None)
+                        if result:
+                            for r in result:
                                 conn['msgs'].append(r)
-                                epoll.modify(fileno, select.EPOLLOUT)
+
                     except ssl.SSLError as e:
                         if ssl.SSL_ERROR_WANT_READ == e.errno:
                             epoll.modify(fileno, select.EPOLLIN)
@@ -155,10 +161,10 @@ def epoll_loop(port, handler, clients, stats):
                             del(conn['in_pkts'])
                             stats['in_pkt'] += 1
                             result = handler(conn['peer'], conn['type'], pkt)
-
-                    for r in result:
-                        conn['msgs'].append(r)
-                        select_flags |= select.EPOLLOUT
+                    if result:
+                        for r in result:
+                            conn['msgs'].append(r)
+                            select_flags |= select.EPOLLOUT
 
                 elif event & select.EPOLLOUT:
                     if 'out_pkt' not in conn:
@@ -204,9 +210,10 @@ def epoll_loop(port, handler, clients, stats):
                 conn['sock'].close()
                 epoll.unregister(fileno)
                 if conn['is_server']:
+                    handler(conn['peer'], 'server-disconnected', None)
                     stats['srv_disconnect'] += 1
                 else:
-                    handler(conn['ip_port'], None, 'disconnected')
+                    handler(conn['ip_port'], 'client-disconnected', None)
                     stats['cli_disconnect'] += 1
                     clients.add((conn['ip_port'][0], conn['ip_port'][1]))
 
@@ -456,7 +463,15 @@ def process_lockr_get_request(peer, buf):
 
 
 def handler(peer, type, buf):
-    handlers = {
+    if 'client-connected' == type:
+        return [(peer, 256, '')]
+    if 'client-disconnected' == type:
+        G['peers'][peer] = None
+        return
+    if type in ('server-connected', 'server-disconnected'):
+        return
+
+    return {
           1: process_lockr_state_request,
           2: process_lockr_get_request,
           3: process_lockr_put_request,
@@ -466,15 +481,7 @@ def handler(peer, type, buf):
         259: process_replication_response,
         260: process_leader_request,
         261: process_leader_response
-    }
-
-    if type:
-        return handlers[type](peer, buf)
-
-    if 'connected' == buf:
-        return [(peer, 256, '')]
-    if 'disconnected' == buf:
-        G['peers'][peer] = None
+    }[type](peer, buf)
 
 
 class StatsServer():
