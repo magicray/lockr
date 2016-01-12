@@ -10,13 +10,19 @@ import socket
 import select
 import struct
 import hashlib
+import inspect
 import sqlite3
 import optparse
 import traceback
 from OpenSSL import crypto
 
 
-def epoll_loop(port, handler, clients, stats):
+def epoll_loop(module, port, clients):
+    callbacks = dict()
+    for m in inspect.getmembers(module, inspect.isfunction):
+       if m[0].startswith('process_'):
+            callbacks[hashlib.sha1(m[0][8:]).digest()] = getattr(module, m[0])
+
     key = crypto.PKey()
     key.generate_key(crypto.TYPE_RSA, 2048)
     cert = crypto.X509()
@@ -39,9 +45,10 @@ def epoll_loop(port, handler, clients, stats):
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
 
-    stats.update(dict(in_pkt=0, in_bytes=0, out_pkt=0, out_bytes=0,
-                      srv_accept=0, srv_established=0, srv_disconnect=0,
-                      cli_connect=0, cli_established=0, cli_disconnect=0))
+    stats = dict(in_pkt=0, in_bytes=0, out_pkt=0, out_bytes=0,
+                 srv_accept=0, srv_established=0, srv_disconnect=0,
+                 cli_connect=0, cli_established=0, cli_disconnect=0)
+
     connections = dict()
     clients = set(clients)
 
@@ -94,17 +101,17 @@ def epoll_loop(port, handler, clients, stats):
                         conn['sock'].do_handshake()
                         conn['handshake_done'] = True
                         conn['peer'] = conn['sock'].getpeername()
-                        conn['in_hdr_size'] = 8
+                        conn['in_hdr_size'] = 24
                         conn['in_hdr_pkts'] = list()
                         conn['msgs'] = list()
                         if conn['is_server']:
-                            event = 'server-connected'
+                            method = getattr(module, 'on_accept')
                             epoll.modify(fileno, select.EPOLLIN)
                         else:
-                            event = 'client-connected'
+                            method = getattr(module, 'on_connect')
                             epoll.modify(fileno, select.EPOLLOUT)
 
-                        result = handler(conn['peer'], event, None)
+                        result = method(conn['peer'])
                         if result:
                             for r in result:
                                 conn['msgs'].append(r)
@@ -140,17 +147,17 @@ def epoll_loop(port, handler, clients, stats):
                         conn['in_hdr_pkts'].append(buf)
                         conn['in_hdr_size'] -= len(buf)
                         if 0 == conn['in_hdr_size']:
-                            type, size = struct.unpack(
-                                '!II',
-                                ''.join(conn['in_hdr_pkts']))
-                            conn['type'] = type
+                            b = ''.join(conn['in_hdr_pkts'])
+                            name = b[0:20]
+                            size = struct.unpack('!I', b[20:])[0]
                             if 0 == size:
                                 stats['in_pkt'] += 1
-                                result = handler(conn['peer'], type, '')
+                                result = callbacks[name](conn['peer'], '')
                             else:
                                 conn['in_size'] = size
                                 conn['in_pkts'] = list()
-                            conn['in_hdr_size'] = 8
+                                conn['name'] = name
+                            conn['in_hdr_size'] = 24
                             conn['in_hdr_pkts'] = list()
                     else:
                         conn['in_pkts'].append(buf)
@@ -160,7 +167,8 @@ def epoll_loop(port, handler, clients, stats):
                             del(conn['in_size'])
                             del(conn['in_pkts'])
                             stats['in_pkt'] += 1
-                            result = handler(conn['peer'], conn['type'], pkt)
+                            result = callbacks[conn['name']](conn['peer'], pkt)
+
                     if result:
                         for r in result:
                             conn['msgs'].append(r)
@@ -172,15 +180,15 @@ def epoll_loop(port, handler, clients, stats):
                         if conn['msgs']:
                             peer, type, msg = conn['msgs'].pop(0)
                             conn['out_pkt'] = msg
-                            conn['out_hdr'] = struct.pack('!II',
-                                                          type,
-                                                          len(msg))
+                            conn['out_hdr'] = ''.join([
+                                hashlib.sha1(type).digest(),
+                                struct.pack('!I', len(msg))])
                             conn['out_sent'] = 0
                             conn['out_hdr_sent'] = 0
                             select_flags |= select.EPOLLOUT
                     else:
                         select_flags |= select.EPOLLOUT
-                        if 8 != conn['out_hdr_sent']:
+                        if 24 != conn['out_hdr_sent']:
                             pkt = conn['out_hdr']
                             offset = conn['out_hdr_sent']
                             n = conn['sock'].send(pkt[offset:])
@@ -210,12 +218,14 @@ def epoll_loop(port, handler, clients, stats):
                 conn['sock'].close()
                 epoll.unregister(fileno)
                 if conn['is_server']:
-                    handler(conn['peer'], 'server-disconnected', None)
+                    getattr(module, 'on_reject')(conn['peer'])
                     stats['srv_disconnect'] += 1
                 else:
-                    handler(conn['ip_port'], 'client-disconnected', None)
+                    getattr(module, 'on_disconnect')(conn['ip_port'])
                     stats['cli_disconnect'] += 1
                     clients.add((conn['ip_port'][0], conn['ip_port'][1]))
+
+        getattr(module, 'on_stats')(stats)
 
 
 def log(msg):
@@ -262,18 +272,19 @@ class Lockr(object):
             try:
                 if not self.sock:
                     self.sock = self.connect()
-                self.sock.sendall(struct.pack('!II', req, len(buf)))
+                self.sock.sendall(''.join([
+                    hashlib.sha1(req).digest(),
+                    struct.pack('!I', len(buf))]))
                 self.sock.sendall(buf)
                 break
             except:
                 time.sleep(1)
                 self.sock = None
 
-        type, size = struct.unpack('!II', recv(8))
-        return recv(size)
+        return recv(struct.unpack('!I', recv(24)[20:])[0])
 
     def get_state(self):
-        return json.loads(self.request(1, ''))
+        return json.loads(self.request('lockr_state_request', ''))
 
     def put(self, docs):
         items = [struct.pack('!B', 1)]
@@ -286,7 +297,7 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
-        return self.request(3, ''.join(items))
+        return self.request('lockr_put_request', ''.join(items))
 
     def get(self, keys):
         items = [struct.pack('!B', 2)]
@@ -296,7 +307,7 @@ class Lockr(object):
             items.append(h)
             hashdict[h] = key
 
-        buf = self.request(2, ''.join(items))
+        buf = self.request('lockr_get_request', ''.join(items))
         i = 0
         docs = dict()
         while i < len(buf):
@@ -365,12 +376,12 @@ def process_stats_request(peer, buf):
         file=G['index'].file,
         offset=G['index'].offset,
         netstats=G['netstats']))
-    return [(peer, 257, msg)]
+    return [(peer, 'stats_response', msg)]
 
 
 def process_stats_response(peer, buf):
     G['peers'][peer] = json.loads(buf)
-    return [(peer, 256, '')]
+    return [(peer, 'stats_request', '')]
 
 
 def process_replication_request(peer, buf):
@@ -394,7 +405,7 @@ def process_lockr_state_request(peer, buf):
     for ip, port in G['peers']:
         state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
 
-    return [(peer, 0, json.dumps(dict(
+    return [(peer, '', json.dumps(dict(
         file=G['index'].file,
         offset=G['index'].offset,
         candidate=G['candidate'],
@@ -440,7 +451,7 @@ def process_lockr_put_request(peer, buf):
     except:
         result = struct.pack('!B', 1)
 
-    return [(peer, 0, result)]
+    return [(peer, '', result)]
 
 
 def process_lockr_get_request(peer, buf):
@@ -459,29 +470,20 @@ def process_lockr_get_request(peer, buf):
                 result.append(fd.read(l))
         i += 32
 
-    return [(peer, 0, ''.join(result))]
+    return [(peer, '', ''.join(result))]
 
 
-def handler(peer, type, buf):
-    if 'client-connected' == type:
-        return [(peer, 256, '')]
-    if 'client-disconnected' == type:
-        G['peers'][peer] = None
-        return
-    if type in ('server-connected', 'server-disconnected'):
-        return
+def on_stats(stats):
+    G['netstats'] = stats
 
-    return {
-          1: process_lockr_state_request,
-          2: process_lockr_get_request,
-          3: process_lockr_put_request,
-        256: process_stats_request,
-        257: process_stats_response,
-        258: process_replication_request,
-        259: process_replication_response,
-        260: process_leader_request,
-        261: process_leader_response
-    }[type](peer, buf)
+
+def on_connect(peer):
+    return [(peer, 'stats_request', '')]
+
+
+def on_disconnect(peer): pass
+def on_accept(peer): pass
+def on_reject(peer): pass
 
 
 class StatsServer():
@@ -697,7 +699,6 @@ if '__main__' == __name__:
     opt.port = (socket.gethostbyname(opt.port.split(':')[0]),
                 int(opt.port.split(':')[1]))
 
-    epoll_loop(opt.port,
-               handler,
-               [(p[0], int(p[1])) for p in G['peers']],
-               G['netstats'])
+    epoll_loop(sys.modules[__name__],
+               opt.port,
+               [(p[0], int(p[1])) for p in G['peers']])
