@@ -15,7 +15,11 @@ class Globals():
         self.index = 'index'
         self.data = 'data'
         self.size = 128*1024*1024
-        self.db = None
+        self.filenum = 0
+        self.offset = 0
+        self.total_size = 0
+        self.checksum = ''
+        self.commit_timestamp = int(time.time())
         self.fd = None
 
 
@@ -81,8 +85,8 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
 
 def process_stats_request(peer, buf):
     msg = json.dumps(dict(
-        file=g.db.file,
-        offset=g.db.offset,
+        file=g.filenum,
+        offset=g.offset,
         netstats=g.stats))
     return [(peer, 'stats_response', msg)]
 
@@ -114,8 +118,8 @@ def process_lockr_state_request(peer, buf):
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
 
     return [(peer, '', json.dumps(dict(
-        file=g.db.file,
-        offset=g.db.offset,
+        file=g.filenum,
+        offset=g.offset,
         candidate=g.candidate,
         netstats=g.stats,
         peers=state,
@@ -137,26 +141,27 @@ def process_lockr_put_request(peer, buf):
 
     assert(i == len(buf)), 'invalid put request'
 
-    if g.db.offset > g.size:
+    if g.offset > g.size:
         if g.fd:
-            g.db.append_record(dict())
+            append(dict())
             os.close(g.fd)
-        g.db.file += 1
-        g.db.offset = 0
+        g.filenum += 1
+        g.offset = 0
         g.fd = None
 
     if not g.fd:
         g.fd = os.open(
-            os.path.join(g.data, str(g.db.file)),
+            os.path.join(g.data, str(g.filenum)),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-        if 0 == g.db.offset:
-            g.db.append_record(dict())
+        if 0 == g.offset:
+            append(dict())
 
     try:
-        g.db.append_record(docs)
+        append(docs)
         result = struct.pack('!B', 0)
     except:
+        # traceback.print_exc()
         result = struct.pack('!B', 1)
 
     return [(peer, '', result)]
@@ -167,7 +172,7 @@ def process_lockr_get_request(peer, buf):
     i = 1
     while i < len(buf):
         key = buf[i:i+32]
-        f, o, l = g.db.get(key)
+        f, o, l = get(key)
         result.append(key)
         result.append(struct.pack('!Q', f))
         result.append(struct.pack('!Q', o))
@@ -206,8 +211,86 @@ def on_init(port, servers, conf_file):
         os.mkdir(g.data)
 
     g.peers = dict((ip_port, None) for ip_port in servers)
-    g.db = DB(g.index, g.data)
-    g.fd = None
+
+    g.sqlite = sqlite3.connect(g.index)
+    g.sqlite.execute('''create table if not exists docs
+        (key blob primary key, file int, offset int, length int)''')
+
+    result = g.sqlite.execute('''select file, offset, length
+        from docs order by file desc, offset desc limit 1''').fetchall()
+    if result:
+        offset = result[0][1] + result[0][2]
+        with open(os.path.join(g.data, str(result[0][0]))) as fd:
+            fd.seek(offset)
+            g.filenum = result[0][0]
+            g.offset = offset+20
+            g.checksum = fd.read(20)
+
+    files = sorted([int(f) for f in os.listdir(g.data)])
+    if files:
+        if '' == g.checksum:
+            with open(os.path.join(g.data, str(min(files)))) as fd:
+                assert(0 == struct.unpack('!Q', fd.read(8))[0])
+                g.filenum = min(files)
+                g.offset = 28
+                g.checksum = fd.read(20)
+
+        g.filenum, g.offset, g.checksum, g.total_size, _ = scan(g.data,
+            g.filenum, g.offset, g.checksum, max(files), 2**50, put)
+        assert(max(files) == g.filenum)
+        # with open(os.path.join(data_dir, str(self.file)), 'w') as fd:
+        #     fd.truncate(self.offset)
+        commit()
+
+
+def commit():
+    if int(time.time()) > g.commit_timestamp:
+        g.sqlite.commit()
+        g.commit_timestamp = int(time.time())
+
+
+def put(key, filenum, offset, length):
+    commit()
+    g.sqlite.execute('insert or replace into docs values(?, ?, ?, ?)',
+        (sqlite3.Binary(key), filenum, offset, length))
+
+
+def get(key):
+    commit()
+    result = g.sqlite.execute(
+        'select file, offset, length from docs where key=?',
+        (sqlite3.Binary(key),)).fetchall()
+    return result[0] if result else (0, 0, 0)
+
+
+def append(docs):
+    buf_len = 0
+    buf_list = list()
+    for k, v in docs.iteritems():
+        f, o, l = get(k)
+        assert((v[0] == f) and (v[1] == o)), 'version mismatch'
+
+        buf_list.append(k)
+        buf_list.append(struct.pack('!Q', len(v[2])))
+        buf_list.append(v[2])
+        buf_len += 40 + len(v[2])
+
+    offset = g.offset
+    offset += 8
+    for k, v in docs.iteritems():
+        put(k, g.filenum, offset+32+8, len(v[2]))
+        offset += 32 + 8 + len(v[2])
+
+    chksum = hashlib.sha1(g.checksum)
+    map(lambda b: chksum.update(b), buf_list)
+
+    buf_list.insert(0, struct.pack('!Q', buf_len))
+    buf_list.append(chksum.digest())
+
+    os.write(g.fd, ''.join(buf_list))
+
+    g.offset = offset + 20
+    g.checksum = chksum.digest()
 
 
 class StatsServer():
@@ -269,90 +352,3 @@ class StatsClient():
             else:
                 self.expected = 'stats'
                 return ('send', self.expected)
-
-
-class DB():
-    def __init__(self, db_file, data_dir):
-        self.index = sqlite3.connect(db_file)
-        self.index.execute('''create table if not exists docs
-            (key blob primary key, file int, offset int, length int)''')
-
-        self.timestamp = int(time.time())
-        self.file = 0
-        self.offset = 0
-        self.total_size = 0
-        self.checksum = ''
-
-        result = self.index.execute('''select file, offset, length
-            from docs order by file desc, offset desc limit 1''').fetchall()
-        if result:
-            offset = result[0][1] + result[0][2]
-            with open(os.path.join(g.data, str(result[0][0]))) as fd:
-                fd.seek(offset)
-                self.file = result[0][0]
-                self.offset = offset+20
-                self.checksum = fd.read(20)
-
-        files = sorted([int(f) for f in os.listdir(data_dir)])
-        if files:
-            if '' == self.checksum:
-                with open(os.path.join(data_dir, str(min(files)))) as fd:
-                    assert(0 == struct.unpack('!Q', fd.read(8))[0])
-                    self.file = min(files)
-                    self.offset = 28
-                    self.checksum = fd.read(20)
-
-            self.file, self.offset, self.checksum, self.total_size, _ = scan(
-                data_dir, self.file, self.offset, self.checksum, max(files),
-                2**50, self.put)
-            assert(max(files) == self.file)
-            # with open(os.path.join(data_dir, str(self.file)), 'w') as fd:
-            #     fd.truncate(self.offset)
-            self.index.commit()
-
-    def commit(self):
-        if int(time.time()) > self.timestamp:
-            self.index.commit()
-            self.timestamp = int(time.time())
-
-    def put(self, key, filenum, offset, length):
-        self.commit()
-        self.index.execute(
-            'insert or replace into docs values(?, ?, ?, ?)',
-            (sqlite3.Binary(key), filenum, offset, length))
-
-    def get(self, key):
-        self.commit()
-        result = self.index.execute(
-            'select file, offset, length from docs where key=?',
-            (sqlite3.Binary(key),)).fetchall()
-        return result[0] if result else (0, 0, 0)
-
-    def append_record(self, docs):
-        buf_len = 0
-        buf_list = list()
-        for k, v in docs.iteritems():
-            f, o, l = self.get(k)
-            assert((v[0] == f) and (v[1] == o)), 'version mismatch'
-
-            buf_list.append(k)
-            buf_list.append(struct.pack('!Q', len(v[2])))
-            buf_list.append(v[2])
-            buf_len += 40 + len(v[2])
-
-        offset = self.offset
-        offset += 8
-        for k, v in docs.iteritems():
-            self.put(k, self.file, offset+32+8, len(v[2]))
-            offset += 32 + 8 + len(v[2])
-
-        chksum = hashlib.sha1(self.checksum)
-        map(lambda b: chksum.update(b), buf_list)
-
-        buf_list.insert(0, struct.pack('!Q', buf_len))
-        buf_list.append(chksum.digest())
-
-        os.write(g.fd, ''.join(buf_list))
-
-        self.offset = offset + 20
-        self.checksum = chksum.digest()
