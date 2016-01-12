@@ -7,8 +7,16 @@ import sqlite3
 import traceback
 
 
-G = dict()
-C = dict()
+class Globals():
+    def __init__(self):
+        self.candidate = None
+        self.stats = None
+        self.peers = None
+        self.size = 100
+        self.db = None
+        self.fd = None
+
+g = None
 
 
 def log(msg):
@@ -70,14 +78,14 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
 
 def process_stats_request(peer, buf):
     msg = json.dumps(dict(
-        file=G['index'].file,
-        offset=G['index'].offset,
-        netstats=G['netstats']))
+        file=g.db.file,
+        offset=g.db.offset,
+        netstats=g.stats))
     return [(peer, 'stats_response', msg)]
 
 
 def process_stats_response(peer, buf):
-    G['peers'][peer] = json.loads(buf)
+    g.peers[peer] = json.loads(buf)
     return [(peer, 'stats_request', '')]
 
 
@@ -99,14 +107,14 @@ def process_leader_response(peer, buf):
 
 def process_lockr_state_request(peer, buf):
     state = dict()
-    for ip, port in G['peers']:
-        state['{0}:{1}'.format(ip, port)] = G['peers'][(ip, port)]
+    for ip, port in g.peers:
+        state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
 
     return [(peer, '', json.dumps(dict(
-        file=G['index'].file,
-        offset=G['index'].offset,
-        candidate=G['candidate'],
-        netstats=G['netstats'],
+        file=g.db.file,
+        offset=g.db.offset,
+        candidate=g.candidate,
+        netstats=g.stats,
         peers=state,
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))]
 
@@ -126,24 +134,24 @@ def process_lockr_put_request(peer, buf):
 
     assert(i == len(buf)), 'invalid put request'
 
-    if G['index'].offset > C['size']:
-        if G['fd']:
-            G['index'].append_record(dict())
-            os.close(G['fd'])
-        G['index'].file += 1
-        G['index'].offset = 0
-        G['fd'] = None
+    if g.db.offset > g.size:
+        if g.fd:
+            g.db.append_record(dict())
+            os.close(g.fd)
+        g.db.file += 1
+        g.db.offset = 0
+        g.fd = None
 
-    if not G['fd']:
-        G['fd'] = os.open(
-            os.path.join('data', str(G['index'].file)),
+    if not g.fd:
+        g.fd = os.open(
+            os.path.join('data', str(g.db.file)),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-        if 0 == G['index'].offset:
-            G['index'].append_record(dict())
+        if 0 == g.db.offset:
+            g.db.append_record(dict())
 
     try:
-        G['index'].append_record(docs)
+        g.db.append_record(docs)
         result = struct.pack('!B', 0)
     except:
         result = struct.pack('!B', 1)
@@ -156,7 +164,7 @@ def process_lockr_get_request(peer, buf):
     i = 1
     while i < len(buf):
         key = buf[i:i+32]
-        f, o, l = G['index'].get(key)
+        f, o, l = g.db.get(key)
         result.append(key)
         result.append(struct.pack('!Q', f))
         result.append(struct.pack('!Q', o))
@@ -171,7 +179,7 @@ def process_lockr_get_request(peer, buf):
 
 
 def on_stats(stats):
-    G['netstats'] = stats
+    g.stats = stats
 
 
 def on_connect(peer):
@@ -188,6 +196,19 @@ def on_accept(peer):
 
 def on_reject(peer):
     pass
+
+
+def on_init(config_file, port, servers):
+    global g
+
+    g = Globals()
+
+    if not os.path.isdir('data'):
+        os.mkdir('data')
+
+    g.peers = dict((ip_port, None) for ip_port in servers)
+    g.db = DB('index', 'data')
+    g.fd = None
 
 
 class StatsServer():
@@ -208,43 +229,43 @@ class StatsClient():
     def on_recv(self, buf):
         if 'stats' == self.expected:
             stats = json.loads(buf)
-            G['peers'][self.peer] = stats
+            g_peers[self.peer] = stats
 
-            local = G['index'].file*2**64 + G['index'].offset
+            local =g_db.file*2**64 + g_db.offset
             peer = stats['file']*2**64 + stats['offset']
 
             if peer > local:
                 self.expected = '{0}-{1}'.format(
-                    G['index'].file, G['index'].total_size)
+                    g_db.file, g_db.total_size)
                 return ('send', self.expected)
 
             return ('send', self.expected)
         else:
             if len(buf):
-                if not G['fd']:
-                    G['fd'] = os.open(
-                        os.path.join('data', str(G['index'].file)),
+                if not g_fd:
+                    g_fd = os.open(
+                        os.path.join('data', str(g_db.file)),
                         os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-                os.write(G['fd'], buf)
+                os.write(g_fd, buf)
                 filenum, offset, chksum, total_size, file_closed = scan(
-                    C['data'], G['index'].file, G['index'].offset,
-                    G['index'].checksum, G['index'].file,
-                    2**50, G['index'].put)
+                    C['data'], g_db.file, g_db.offset,
+                    g_db.checksum, g_db.file,
+                    2**50, g_db.put)
 
-                G['index'].checksum = chksum
+                g_db.checksum = chksum
                 if not file_closed:
-                    G['index'].offset = offset
-                    G['index'].total_size = total_size
+                    g_db.offset = offset
+                    g_db.total_size = total_size
                 else:
-                    os.close(G['fd'])
-                    G['fd'] = None
-                    G['index'].offset = 0
-                    G['index'].total_size = 0
-                    G['index'].file += 1
+                    os.close(g_fd)
+                    g_fd = None
+                    g_db.offset = 0
+                    g_db.total_size = 0
+                    g_db.file += 1
 
                 self.expected = '{0}-{1}'.format(
-                    G['index'].file, G['index'].total_size)
+                    g_db.file, g_db.total_size)
                 return ('send', self.expected)
             else:
                 self.expected = 'stats'
@@ -332,24 +353,7 @@ class DB():
         buf_list.insert(0, struct.pack('!Q', buf_len))
         buf_list.append(chksum.digest())
 
-        os.write(G['fd'], ''.join(buf_list))
+        os.write(g.fd, ''.join(buf_list))
 
         self.offset = offset + 20
         self.checksum = chksum.digest()
-
-
-def on_init(config_file, port, servers):
-    global G
-    global C
-
-    if not config_file:
-        C = dict(index='index', data='data', size=100)
-
-    if not os.path.isdir(C['data']):
-        os.mkdir(C['data'])
-
-    G = dict(netstats=dict(),
-             fd=None,
-             candidate=None,
-             index=DB(C['index'], C['data']),
-             peers=dict((ip_port, None) for ip_port in servers))
