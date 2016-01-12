@@ -12,11 +12,14 @@ class Globals():
         self.candidate = None
         self.stats = None
         self.peers = None
-        self.size = 100
+        self.index = 'index'
+        self.data = 'data'
+        self.size = 128*1024*1024
         self.db = None
         self.fd = None
 
-g = None
+
+g = Globals()
 
 
 def log(msg):
@@ -144,7 +147,7 @@ def process_lockr_put_request(peer, buf):
 
     if not g.fd:
         g.fd = os.open(
-            os.path.join('data', str(g.db.file)),
+            os.path.join(g.data, str(g.db.file)),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
         if 0 == g.db.offset:
@@ -170,7 +173,7 @@ def process_lockr_get_request(peer, buf):
         result.append(struct.pack('!Q', o))
         result.append(struct.pack('!Q', l))
         if l > 0:
-            with open(os.path.join('data', str(f))) as fd:
+            with open(os.path.join(g.data, str(f))) as fd:
                 fd.seek(o)
                 result.append(fd.read(l))
         i += 32
@@ -198,16 +201,12 @@ def on_reject(peer):
     pass
 
 
-def on_init(config_file, port, servers):
-    global g
-
-    g = Globals()
-
-    if not os.path.isdir('data'):
-        os.mkdir('data')
+def on_init(port, servers, conf_file):
+    if not os.path.isdir(g.data):
+        os.mkdir(g.data)
 
     g.peers = dict((ip_port, None) for ip_port in servers)
-    g.db = DB('index', 'data')
+    g.db = DB(g.index, g.data)
     g.fd = None
 
 
@@ -288,7 +287,7 @@ class DB():
             from docs order by file desc, offset desc limit 1''').fetchall()
         if result:
             offset = result[0][1] + result[0][2]
-            with open(os.path.join('data', str(result[0][0]))) as fd:
+            with open(os.path.join(g.data, str(result[0][0]))) as fd:
                 fd.seek(offset)
                 self.file = result[0][0]
                 self.offset = offset+20

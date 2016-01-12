@@ -7,6 +7,7 @@ import struct
 import hashlib
 import inspect
 import optparse
+import importlib
 
 
 def epoll_loop(module, port, clients):
@@ -209,7 +210,7 @@ def epoll_loop(module, port, clients):
 if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('-b', '--bind', dest='port', type='string',
-                      help='server:port pair. skip to start the client')
+                      help='server:port tuple. skip to start the client')
     parser.add_option('-c', '--cert', dest='cert', type='string',
                       help='certificate file path', default='cert.pem')
     parser.add_option('-s', '--servers', dest='servers', type='string',
@@ -217,11 +218,11 @@ if '__main__' == __name__:
     parser.add_option('-m', '--module_name', dest='module', type='string',
                       help='module name')
     parser.add_option('--conf', dest='conf', type='string',
-                      help='configuration file path')
+                      help='configuration file')
     opt, args = parser.parse_args()
 
     os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
-              ' -subj "/" -out cert.pem -keyout cert.pem >& /dev/null')
+              ' -subj "/" -out cert.pem -keyout cert.pem 2> /dev/null')
 
     servers = list()
     if opt.servers:
@@ -231,6 +232,6 @@ if '__main__' == __name__:
     port = (socket.gethostbyname(opt.port.split(':')[0]),
             int(opt.port.split(':')[1]))
 
-    module = __import__(opt.module)
-    module.on_init(opt.conf, port, servers)
+    module = importlib.import_module(opt.module)
+    module.on_init(port, servers, opt.conf)
     epoll_loop(module, port, servers)
