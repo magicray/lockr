@@ -7,7 +7,7 @@ import struct
 import hashlib
 import inspect
 import optparse
-import importlib
+import traceback
 
 
 def epoll_loop(module, port, clients):
@@ -192,8 +192,9 @@ def epoll_loop(module, port, clients):
                 epoll.modify(fileno, select_flags)
 
             except Exception as e:
-                # import traceback; traceback.print_exc()
                 conn = connections.pop(fileno)
+                if conn['handshake_done'] and (str(e) != 'closed by peer'):
+                    traceback.print_exc()
                 conn['sock'].close()
                 epoll.unregister(fileno)
                 if conn['is_server']:
@@ -232,6 +233,6 @@ if '__main__' == __name__:
     port = (socket.gethostbyname(opt.port.split(':')[0]),
             int(opt.port.split(':')[1]))
 
-    module = importlib.import_module(opt.module)
+    module = __import__(opt.module)
     module.on_init(port, servers, opt.conf)
     epoll_loop(module, port, servers)

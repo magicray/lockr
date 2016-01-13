@@ -12,9 +12,10 @@ import traceback
 
 
 class Lockr(object):
-    def __init__(self, servers):
+    def __init__(self, servers, timeout=30):
         self.servers = servers
         self.sock = None
+        self.timeout = timeout
 
     def connect(self):
         for ip, port in self.servers:
@@ -25,12 +26,12 @@ class Lockr(object):
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock = ssl.wrap_socket(sock)
                 sock.connect((ip, port))
-                t = int((time.time()-t)*1000)
-                sys.stdout.write('succeeded in {0} msec\n'.format(t))
+                t = ((time.time()-t)*1000)
+                sys.stdout.write('succeeded in %.03f msec\n' % t)
                 return sock
             except:
-                t = int((time.time()-t)*1000)
-                sys.stdout.write('failed in {0} msec\n'.format(t))
+                t = ((time.time()-t)*1000)
+                sys.stdout.write('failed in %.3f msec\n' % t)
         raise Exception('could not connect to server')
 
     def request(self, req, buf):
@@ -43,7 +44,8 @@ class Lockr(object):
                 length -= len(pkt[-1])
             return ''.join(pkt)
 
-        while True:
+        t = time.time()
+        while time.time() < (t + self.timeout):
             try:
                 if not self.sock:
                     self.sock = self.connect()
@@ -51,12 +53,14 @@ class Lockr(object):
                     hashlib.sha1(req).digest(),
                     struct.pack('!I', len(buf))]))
                 self.sock.sendall(buf)
-                break
+                t = ((time.time() - t)*1000)
+                sys.stdout.write('successful in %.3f msec\n' % t)
+                return recv(struct.unpack('!I', recv(24)[20:])[0])
             except:
                 time.sleep(1)
                 self.sock = None
 
-        return recv(struct.unpack('!I', recv(24)[20:])[0])
+        raise Exception('timed out')
 
     def get_state(self):
         return json.loads(self.request('lockr_state_request', ''))
