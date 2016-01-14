@@ -83,7 +83,7 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
     return (filenum, offset, checksum, total_size, file_closed)
 
 
-def process_stats_request(peer, buf):
+def callback_stats_request(peer, buf):
     msg = json.dumps(dict(
         file=g.filenum,
         offset=g.offset,
@@ -91,28 +91,28 @@ def process_stats_request(peer, buf):
     return [(peer, 'stats_response', msg)]
 
 
-def process_stats_response(peer, buf):
+def callback_stats_response(peer, buf):
     g.peers[peer] = json.loads(buf)
     return [(peer, 'stats_request', '')]
 
 
-def process_replication_request(peer, buf):
+def callback_replication_request(peer, buf):
     return [(peer, 259, '')]
 
 
-def process_replication_response(peer, buf):
+def callback_replication_response(peer, buf):
     return [(peer, 258, '')]
 
 
-def process_leader_request(peer, buf):
+def callback_leader_request(peer, buf):
     return [(peer, 261, '')]
 
 
-def process_leader_response(peer, buf):
+def callback_leader_response(peer, buf):
     return [(peer, 260, '')]
 
 
-def process_lockr_state_request(peer, buf):
+def callback_lockr_state_request(peer, buf):
     state = dict()
     for ip, port in g.peers:
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
@@ -126,7 +126,7 @@ def process_lockr_state_request(peer, buf):
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))]
 
 
-def process_lockr_put_request(peer, buf):
+def callback_lockr_put_request(peer, buf):
     docs = dict()
     i = 1
     while i < len(buf):
@@ -167,7 +167,7 @@ def process_lockr_put_request(peer, buf):
     return [(peer, '', result)]
 
 
-def process_lockr_get_request(peer, buf):
+def callback_lockr_get_request(peer, buf):
     result = list()
     i = 1
     while i < len(buf):

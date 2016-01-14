@@ -53,8 +53,8 @@ class Lockr(object):
                     hashlib.sha1(req).digest(),
                     struct.pack('!I', len(buf))]))
                 self.sock.sendall(buf)
-                t = ((time.time() - t)*1000)
-                sys.stdout.write('successful in %.3f msec\n' % t)
+                t2 = ((time.time() - t)*1000)
+                sys.stdout.write('successful in %.3f msec\n' % t2)
                 return recv(struct.unpack('!I', recv(24)[20:])[0])
             except:
                 time.sleep(1)
