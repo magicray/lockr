@@ -85,15 +85,16 @@ def epoll_loop(module, port, clients):
                         conn['msgs'] = list()
                         if conn['is_server']:
                             method = getattr(module, 'on_accept')
-                            epoll.modify(fileno, select.EPOLLIN)
                         else:
                             method = getattr(module, 'on_connect')
-                            epoll.modify(fileno, select.EPOLLOUT)
 
+                        epoll.modify(fileno, select.EPOLLIN)
                         result = method(conn['peer'])
                         if result:
                             for r in result:
                                 conn['msgs'].append(r)
+                            epoll.modify(fileno,
+                                         select.EPOLLIN | select.EPOLLOUT)
 
                     except ssl.SSLError as e:
                         if ssl.SSL_ERROR_WANT_READ == e.errno:
@@ -111,13 +112,8 @@ def epoll_loop(module, port, clients):
                     else:
                         read_bytes = conn['in_size']
 
-                    try:
-                        buf = conn['sock'].recv(read_bytes)
-                        stats['in_bytes'] += len(buf)
-                    except Exception as e:
-                        epoll.modify(fileno, select.EPOLLIN)
-                        continue
-
+                    buf = conn['sock'].recv(read_bytes)
+                    stats['in_bytes'] += len(buf)
                     if 0 == len(buf):
                         raise Exception('closed by peer')
 
@@ -153,14 +149,13 @@ def epoll_loop(module, port, clients):
                             conn['msgs'].append(r)
                             select_flags |= select.EPOLLOUT
 
-                elif event & select.EPOLLOUT:
+                if event & select.EPOLLOUT:
                     if 'out_pkt' not in conn:
-                        stats['out_pkt'] += 1
                         if conn['msgs']:
-                            peer, type, msg = conn['msgs'].pop(0)
+                            peer, msg_type, msg = conn['msgs'].pop(0)
                             conn['out_pkt'] = msg
                             conn['out_hdr'] = ''.join([
-                                hashlib.sha1(type).digest(),
+                                hashlib.sha1(msg_type).digest(),
                                 struct.pack('!I', len(msg))])
                             conn['out_sent'] = 0
                             conn['out_hdr_sent'] = 0
@@ -186,7 +181,8 @@ def epoll_loop(module, port, clients):
                                 del(conn['out_hdr'])
                                 del(conn['out_pkt'])
                                 stats['out_pkt'] += 1
-                else:
+
+                if( event & ~(select.EPOLLIN | select.EPOLLOUT)):
                     raise Exception('unhandled event({0})'.format(event))
 
                 epoll.modify(fileno, select_flags)

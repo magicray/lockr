@@ -9,7 +9,10 @@ import traceback
 
 class Globals():
     def __init__(self):
-        self.candidate = None
+        self.port = None
+        self.quorum = None
+        self.leader = None
+        self.followers = set()
         self.stats = None
         self.peers = None
         self.index = 'index'
@@ -85,15 +88,90 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
 
 def callback_stats_request(peer, buf):
     msg = json.dumps(dict(
-        file=g.filenum,
+        filenum=g.filenum,
+        leader=g.leader,
         offset=g.offset,
         netstats=g.stats))
     return [(peer, 'stats_response', msg)]
 
 
 def callback_stats_response(peer, buf):
+    assert(peer in g.peers)
     g.peers[peer] = json.loads(buf)
-    return [(peer, 'stats_request', '')]
+
+    msgs = [(peer, 'stats_request', '')]
+
+    if not g.leader:
+        if 'self' == g.peers[peer]['leader']:
+            g.leader = peer
+            msgs.append((peer, 'leader_request', ''))
+            log('sent leader-request to the leader {0}'.format(peer))
+        else:
+            leader = (g.port, dict(filenum=g.filenum, offset=g.offset))
+            count = 0
+            for k, v in g.peers.iteritems():
+                if v:
+                    count += 1
+                    if leader[1]['filenum'] != v['filenum']:
+                        if leader[1]['filenum'] < v['filenum']:
+                            leader = (k, v)
+                        continue
+
+                    if leader[1]['offset'] != v['offset']:
+                        if leader[1]['offset'] < v['offset']:
+                            leader = (k, v)
+                        continue
+
+                    if k > leader[0]:
+                        leader = (k, v)
+
+            if (peer == leader[0]) and (count >= g.quorum):
+                g.leader = peer
+                msgs.append((peer, 'leader_request', ''))
+                log('sent leader-request to candidate {0}'.format(peer))
+
+        if g.leader:
+            while g.followers:
+                p = g.followers.pop()
+                msgs.append((p, 'leader_reject', ''))
+                log('sent leader-reject to {0}'.format(p))
+
+    return msgs
+
+
+def callback_leader_request(peer, buf):
+    log('received leader-request from {0}'.format(peer))
+
+    if g.leader and ('self' != g.leader):
+        log('sent leader-rejected to {0}'.format(peer))
+        return [(peer, 'leader_reject', '')]
+
+    g.followers.add(peer)
+
+    if 'self' == g.leader:
+        log('sent leader-accept to {0}'.format(peer))
+        return [(peer, 'leader_accept', '')]
+     
+    if len(g.followers) >= g.quorum:
+        g.leader = 'self'
+        msgs = list()
+        log('quorum reached({0}) for leader election'.format(g.quorum))
+        for p in g.followers:
+            msgs.append((p, 'leader_accept', ''))
+            log('sent leader-accept to {0}'.format(p))
+
+        return msgs
+
+
+def callback_leader_reject(peer, buf):
+    g.leader = None
+    log('received leader-reject from {0}'.format(peer))
+
+
+def callback_leader_accept(peer, buf):
+    log('leader_accept')
+    assert(g.leader == peer)
+    log('received leader-accept from {0}'.format(peer))
 
 
 def callback_replication_request(peer, buf):
@@ -104,26 +182,61 @@ def callback_replication_response(peer, buf):
     return [(peer, 258, '')]
 
 
-def callback_leader_request(peer, buf):
-    return [(peer, 261, '')]
-
-
-def callback_leader_response(peer, buf):
-    return [(peer, 260, '')]
-
-
 def callback_lockr_state_request(peer, buf):
     state = dict()
     for ip, port in g.peers:
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
 
     return [(peer, '', json.dumps(dict(
-        file=g.filenum,
+        filenum=g.filenum,
         offset=g.offset,
-        candidate=g.candidate,
+        leader=g.leader,
         netstats=g.stats,
         peers=state,
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))]
+
+
+def on_connect(peer):
+    return [(peer, 'stats_request', '')]
+
+
+def on_disconnect(peer):
+    g.peers[peer] = None
+
+    if peer == g.leader:
+        log('leader {0} disconnected'.format(peer))
+        g.leader = None
+
+    if peer in g.followers:
+        g.followers.remove(peer)
+        log('follower removed from {0}'.format(peer))
+
+    if ('self' == g.leader) and (len(g.followers) < g.quorum):
+        log('less followers({0}) than quorum({1}). stepping down'.format(
+            len(g.followers), g.quorum))
+
+        g.leader = None
+        msgs = list()
+        while g.followers:
+            p = g.followers.pop()
+            msgs.append((p, 'leader_reject', ''))
+            log('leader reject sent to {0}'.format(p))
+
+        return msgs
+
+
+def on_accept(peer):
+    pass
+
+
+def on_reject(peer):
+    if peer in g.followers:
+        g.followers.remove(peer)
+        log('removed leader request from {0}'.format(peer))
+
+
+def on_stats(stats):
+    g.stats = stats
 
 
 def callback_lockr_put_request(peer, buf):
@@ -186,31 +299,13 @@ def callback_lockr_get_request(peer, buf):
     return [(peer, '', ''.join(result))]
 
 
-def on_stats(stats):
-    g.stats = stats
-
-
-def on_connect(peer):
-    return [(peer, 'stats_request', '')]
-
-
-def on_disconnect(peer):
-    pass
-
-
-def on_accept(peer):
-    pass
-
-
-def on_reject(peer):
-    pass
-
-
 def on_init(port, servers, conf_file):
     if not os.path.isdir(g.data):
         os.mkdir(g.data)
 
     g.peers = dict((ip_port, None) for ip_port in servers)
+    g.quorum = int(len(g.peers)/2.0 + 0.6)
+    g.port = port
 
     g.sqlite = sqlite3.connect(g.index)
     g.sqlite.execute('''create table if not exists docs
@@ -291,64 +386,3 @@ def append(docs):
 
     g.offset = offset + 20
     g.checksum = chksum.digest()
-
-
-class StatsServer():
-    def on_recv(self, buf):
-        if 'stats' == buf:
-            pass
-        else:
-            filenum, offset = buf.split('-')
-            if os.path.isfile(os.path.join(C['data'], filenum)):
-                with open(os.path.join(C['data'], filenum)) as fd:
-                    fd.seek(int(offset))
-                    return ('send', fd.read(10**6))
-            else:
-                return ('send', '')
-
-
-class StatsClient():
-    def on_recv(self, buf):
-        if 'stats' == self.expected:
-            stats = json.loads(buf)
-            g_peers[self.peer] = stats
-
-            local =g_db.file*2**64 + g_db.offset
-            peer = stats['file']*2**64 + stats['offset']
-
-            if peer > local:
-                self.expected = '{0}-{1}'.format(
-                    g_db.file, g_db.total_size)
-                return ('send', self.expected)
-
-            return ('send', self.expected)
-        else:
-            if len(buf):
-                if not g_fd:
-                    g_fd = os.open(
-                        os.path.join('data', str(g_db.file)),
-                        os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-
-                os.write(g_fd, buf)
-                filenum, offset, chksum, total_size, file_closed = scan(
-                    C['data'], g_db.file, g_db.offset,
-                    g_db.checksum, g_db.file,
-                    2**50, g_db.put)
-
-                g_db.checksum = chksum
-                if not file_closed:
-                    g_db.offset = offset
-                    g_db.total_size = total_size
-                else:
-                    os.close(g_fd)
-                    g_fd = None
-                    g_db.offset = 0
-                    g_db.total_size = 0
-                    g_db.file += 1
-
-                self.expected = '{0}-{1}'.format(
-                    g_db.file, g_db.total_size)
-                return ('send', self.expected)
-            else:
-                self.expected = 'stats'
-                return ('send', self.expected)
