@@ -107,26 +107,27 @@ def callback_stats_response(peer, buf):
             msgs.append((peer, 'leader_request', ''))
             log('sent leader-request to the leader {0}'.format(peer))
         else:
-            leader = (g.port, dict(filenum=g.filenum, offset=g.offset))
+            leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
             count = 0
             for k, v in g.peers.iteritems():
                 if v:
                     count += 1
                     if leader[1]['filenum'] != v['filenum']:
                         if leader[1]['filenum'] < v['filenum']:
-                            leader = (k, v)
+                            leader = (k, v, 'filenum')
                         continue
 
                     if leader[1]['offset'] != v['offset']:
                         if leader[1]['offset'] < v['offset']:
-                            leader = (k, v)
+                            leader = (k, v, 'offset')
                         continue
 
                     if k > leader[0]:
-                        leader = (k, v)
+                        leader = (k, v, 'address')
 
             if (peer == leader[0]) and (count >= g.quorum):
                 g.leader = peer
+                log('candidate is {0} due to ({1})'.format(peer, leader[2]))
                 msgs.append((peer, 'leader_request', ''))
                 log('sent leader-request to candidate {0}'.format(peer))
 
@@ -169,7 +170,6 @@ def callback_leader_reject(peer, buf):
 
 
 def callback_leader_accept(peer, buf):
-    log('leader_accept')
     assert(g.leader == peer)
     log('received leader-accept from {0}'.format(peer))
 
@@ -212,7 +212,7 @@ def on_disconnect(peer):
         log('follower removed from {0}'.format(peer))
 
     if ('self' == g.leader) and (len(g.followers) < g.quorum):
-        log('less followers({0}) than quorum({1}). stepping down'.format(
+        log('relinquishing leadership as followers({0}) < quorum({1})'.format(
             len(g.followers), g.quorum))
 
         g.leader = None
@@ -232,7 +232,8 @@ def on_accept(peer):
 def on_reject(peer):
     if peer in g.followers:
         g.followers.remove(peer)
-        log('removed leader request from {0}'.format(peer))
+        log('removed follower{0} remaining({1})'.format(
+            peer, len(g.followers)))
 
 
 def on_stats(stats):

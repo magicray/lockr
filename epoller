@@ -30,6 +30,7 @@ def epoll_loop(module, port, clients):
                  cli_connect=0, cli_established=0, cli_disconnect=0)
 
     connections = dict()
+    addr2fd = dict()
     clients = set(clients)
 
     while True:
@@ -83,18 +84,22 @@ def epoll_loop(module, port, clients):
                         conn['in_hdr_size'] = 24
                         conn['in_hdr_pkts'] = list()
                         conn['msgs'] = list()
+                        addr2fd[conn['peer']] = fileno
                         if conn['is_server']:
                             method = getattr(module, 'on_accept')
                         else:
                             method = getattr(module, 'on_connect')
 
                         epoll.modify(fileno, select.EPOLLIN)
+
                         result = method(conn['peer'])
                         if result:
                             for r in result:
-                                conn['msgs'].append(r)
-                            epoll.modify(fileno,
-                                         select.EPOLLIN | select.EPOLLOUT)
+                                if r[0] in addr2fd:
+                                    f = addr2fd[r[0]]
+                                    connections[f]['msgs'].append(r)
+                                    epoll.modify(f,
+                                        select.EPOLLIN | select.EPOLLOUT)
 
                     except ssl.SSLError as e:
                         if ssl.SSL_ERROR_WANT_READ == e.errno:
@@ -105,16 +110,18 @@ def epoll_loop(module, port, clients):
                             raise
                     continue
 
-                select_flags = select.EPOLLIN
+                epoll.modify(fileno, select.EPOLLIN)
                 if event & select.EPOLLIN:
                     if 'in_size' not in conn:
                         read_bytes = conn['in_hdr_size']
                     else:
                         read_bytes = conn['in_size']
 
-                    buf = conn['sock'].recv(read_bytes)
-                    stats['in_bytes'] += len(buf)
-                    if 0 == len(buf):
+                    try:
+                        buf = conn['sock'].recv(read_bytes)
+                        stats['in_bytes'] += len(buf)
+                        assert(len(buf) > 0)
+                    except:
                         raise Exception('closed by peer')
 
                     result = []
@@ -146,22 +153,28 @@ def epoll_loop(module, port, clients):
 
                     if result:
                         for r in result:
-                            conn['msgs'].append(r)
-                            select_flags |= select.EPOLLOUT
+                            if r[0] in addr2fd:
+                                f = addr2fd[r[0]]
+                                connections[f]['msgs'].append(r)
+                                epoll.modify(f,
+                                    select.EPOLLIN | select.EPOLLOUT)
 
                 if event & select.EPOLLOUT:
                     if 'out_pkt' not in conn:
                         if conn['msgs']:
                             peer, msg_type, msg = conn['msgs'].pop(0)
+                            assert(peer == conn['peer'])
                             conn['out_pkt'] = msg
                             conn['out_hdr'] = ''.join([
                                 hashlib.sha1(msg_type).digest(),
                                 struct.pack('!I', len(msg))])
                             conn['out_sent'] = 0
                             conn['out_hdr_sent'] = 0
-                            select_flags |= select.EPOLLOUT
+                            epoll.modify(fileno,
+                                         select.EPOLLIN | select.EPOLLOUT)
                     else:
-                        select_flags |= select.EPOLLOUT
+                        epoll.modify(fileno,
+                                     select.EPOLLIN | select.EPOLLOUT)
                         if 24 != conn['out_hdr_sent']:
                             pkt = conn['out_hdr']
                             offset = conn['out_hdr_sent']
@@ -172,7 +185,10 @@ def epoll_loop(module, port, clients):
                             pkt = conn['out_pkt']
                             if len(pkt) > conn['out_sent']:
                                 offset = conn['out_sent']
-                                n = conn['sock'].send(pkt[offset:])
+                                try:
+                                    n = conn['sock'].send(pkt[offset:])
+                                except:
+                                    raise Exception('closed by peer')
                                 conn['out_sent'] += n
                                 stats['out_bytes'] += n
                             else:
@@ -185,14 +201,16 @@ def epoll_loop(module, port, clients):
                 if( event & ~(select.EPOLLIN | select.EPOLLOUT)):
                     raise Exception('unhandled event({0})'.format(event))
 
-                epoll.modify(fileno, select_flags)
-
             except Exception as e:
                 conn = connections.pop(fileno)
                 if conn['handshake_done'] and (str(e) != 'closed by peer'):
                     traceback.print_exc()
+                    exit(1)
                 conn['sock'].close()
                 epoll.unregister(fileno)
+
+                addr2fd.pop(conn.get('peer'), None)
+
                 if conn['is_server']:
                     getattr(module, 'on_reject')(conn['peer'])
                     stats['srv_disconnect'] += 1
