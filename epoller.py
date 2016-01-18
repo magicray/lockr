@@ -51,18 +51,24 @@ def epoll_loop(module, port, clients):
                 if 115 != e.errno:
                     raise
 
-        def append_msg_to_send_list(d, peer):
-            msg_to = d.get('peer', peer)
-            msg_type = d.get('type', 'default')
-            msg = d.get('msg', '')
+        def handle_out_messages(msg_list, peer):
+            if not msg_list:
+                msg_list = []
+            elif type(msg_list) is dict:
+                msg_list = [msg_list]
 
-            if msg_to in addr2fd:
-                f = addr2fd[msg_to]
-                connections[f]['msgs'].append(''.join([
-                    hashlib.sha1(msg_type).digest(),
-                    struct.pack('!I', len(msg))]))
-                connections[f]['msgs'].append(msg)
-                epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
+            for d in msg_list:
+                msg_to = d.get('peer', peer)
+                msg_type = d.get('type', 'default')
+                msg = d.get('msg', '')
+
+                if msg_to in addr2fd:
+                    f = addr2fd[msg_to]
+                    connections[f]['msgs'].append(''.join([
+                        hashlib.sha1(msg_type).digest(),
+                        struct.pack('!I', len(msg))]))
+                    connections[f]['msgs'].append(msg)
+                    epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
 
         for fileno, event in epoll.poll():
             if listener_sock.fileno() == fileno:
@@ -104,10 +110,9 @@ def epoll_loop(module, port, clients):
 
                         epoll.modify(fileno, select.EPOLLIN)
 
-                        result = method(conn['peer'])
-                        if result:
-                            for r in result:
-                                append_msg_to_send_list(r, conn['peer'])
+                        handle_out_messages(
+                            method(conn['peer']),
+                            conn['peer'])
 
                     except ssl.SSLError as e:
                         if ssl.SSL_ERROR_WANT_READ == e.errno:
@@ -132,7 +137,6 @@ def epoll_loop(module, port, clients):
                     except:
                         raise Exception('closed by peer')
 
-                    result = []
                     if 'in_size' not in conn:
                         conn['in_hdr_pkts'].append(buf)
                         conn['in_hdr_size'] -= len(buf)
@@ -142,7 +146,9 @@ def epoll_loop(module, port, clients):
                             size = struct.unpack('!I', b[20:])[0]
                             if 0 == size:
                                 stats['in_pkt'] += 1
-                                result = callbacks[name](conn['peer'], '')
+                                handle_out_messages(
+                                    callbacks[name](conn['peer'], ''),
+                                    conn['peer'])
                             else:
                                 conn['in_size'] = size
                                 conn['in_pkts'] = list()
@@ -157,11 +163,9 @@ def epoll_loop(module, port, clients):
                             del(conn['in_size'])
                             del(conn['in_pkts'])
                             stats['in_pkt'] += 1
-                            result = callbacks[conn['name']](conn['peer'], pkt)
-
-                    if result:
-                        for r in result:
-                            append_msg_to_send_list(r, conn['peer'])
+                            handle_out_messages(
+                                callbacks[conn['name']](conn['peer'], pkt),
+                                conn['peer'])
 
                 if event & select.EPOLLOUT:
                     if 'pkt' not in conn:
@@ -189,7 +193,7 @@ def epoll_loop(module, port, clients):
                             epoll.modify(fileno,
                                          select.EPOLLIN | select.EPOLLOUT)
 
-                if(event & ~(select.EPOLLIN | select.EPOLLOUT)):
+                if event & ~(select.EPOLLIN | select.EPOLLOUT):
                     raise Exception('unhandled event({0})'.format(event))
 
             except Exception as e:

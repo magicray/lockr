@@ -92,7 +92,7 @@ def callback_stats_request(peer, buf):
         leader=g.leader,
         offset=g.offset,
         netstats=g.stats))
-    return [dict(type='stats_response', msg=msg)]
+    return dict(type='stats_response', msg=msg)
 
 
 def callback_stats_response(peer, buf):
@@ -145,13 +145,13 @@ def callback_leader_request(peer, buf):
 
     if g.leader and ('self' != g.leader):
         log('sent leader-rejected to {0}'.format(peer))
-        return [dict(type='leader_reject')]
+        return dict(type='leader_reject')
 
     g.followers.add(peer)
 
     if 'self' == g.leader:
         log('sent leader-accept to {0}'.format(peer))
-        return [dict(type='leader_accept')]
+        return dict(type='leader_accept')
 
     if len(g.followers) >= g.quorum:
         g.leader = 'self'
@@ -187,17 +187,17 @@ def callback_lockr_state_request(peer, buf):
     for ip, port in g.peers:
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
 
-    return [dict(msg=json.dumps(dict(
+    return dict(msg=json.dumps(dict(
         filenum=g.filenum,
         offset=g.offset,
         leader=g.leader,
         netstats=g.stats,
         peers=state,
-        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))]
+        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
 
 
 def on_connect(peer):
-    return [dict(type='stats_request')]
+    return dict(type='stats_request')
 
 
 def on_disconnect(peer):
@@ -278,7 +278,7 @@ def callback_lockr_put_request(peer, buf):
         # traceback.print_exc()
         result = struct.pack('!B', 1)
 
-    return [dict(msg=result)]
+    return dict(msg=result)
 
 
 def callback_lockr_get_request(peer, buf):
@@ -297,7 +297,7 @@ def callback_lockr_get_request(peer, buf):
                 result.append(fd.read(l))
         i += 32
 
-    return [dict(msg=''.join(result))]
+    return dict(msg=''.join(result))
 
 
 def on_init(port, servers, conf_file):
