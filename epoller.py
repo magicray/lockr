@@ -51,6 +51,19 @@ def epoll_loop(module, port, clients):
                 if 115 != e.errno:
                     raise
 
+        def append_msg_to_send_list(d, peer):
+            msg_to = d.get('peer', peer)
+            msg_type = d.get('type', 'default')
+            msg = d.get('msg', '')
+
+            if msg_to in addr2fd:
+                f = addr2fd[msg_to]
+                connections[f]['msgs'].append(''.join([
+                    hashlib.sha1(msg_type).digest(),
+                    struct.pack('!I', len(msg))]))
+                connections[f]['msgs'].append(msg)
+                epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
+
         for fileno, event in epoll.poll():
             if listener_sock.fileno() == fileno:
                 s, addr = listener_sock.accept()
@@ -94,11 +107,7 @@ def epoll_loop(module, port, clients):
                         result = method(conn['peer'])
                         if result:
                             for r in result:
-                                if r[0] in addr2fd:
-                                    f = addr2fd[r[0]]
-                                    connections[f]['msgs'].append(r)
-                                    epoll.modify(f,
-                                        select.EPOLLIN | select.EPOLLOUT)
+                                append_msg_to_send_list(r, conn['peer'])
 
                     except ssl.SSLError as e:
                         if ssl.SSL_ERROR_WANT_READ == e.errno:
@@ -152,52 +161,35 @@ def epoll_loop(module, port, clients):
 
                     if result:
                         for r in result:
-                            if r[0] in addr2fd:
-                                f = addr2fd[r[0]]
-                                connections[f]['msgs'].append(r)
-                                epoll.modify(f,
-                                    select.EPOLLIN | select.EPOLLOUT)
+                            append_msg_to_send_list(r, conn['peer'])
 
                 if event & select.EPOLLOUT:
-                    if 'out_pkt' not in conn:
+                    if 'pkt' not in conn:
                         if conn['msgs']:
-                            peer, msg_type, msg = conn['msgs'].pop(0)
-                            assert(peer == conn['peer'])
-                            conn['out_pkt'] = msg
-                            conn['out_hdr'] = ''.join([
-                                hashlib.sha1(msg_type).digest(),
-                                struct.pack('!I', len(msg))])
-                            conn['out_sent'] = 0
-                            conn['out_hdr_sent'] = 0
+                            conn['pkt'] = conn['msgs'].pop(0)
+                            conn['sent'] = 0
+
+                    if 'pkt' in conn:
+                        if len(conn['pkt']) > conn['sent']:
+                            try:
+                                pkt = conn['pkt']
+                                n = conn['sock'].send(pkt[conn['sent']:])
+                            except:
+                                raise Exception('closed by peer')
+
+                            conn['sent'] += n
+                            stats['out_bytes'] += n
+
+                        if len(conn['pkt']) == conn['sent']:
+                            del(conn['pkt'])
+                            del(conn['sent'])
+                            stats['out_pkt'] += 1
+
+                        if conn['msgs'] or ('pkt' in conn):
                             epoll.modify(fileno,
                                          select.EPOLLIN | select.EPOLLOUT)
-                    else:
-                        epoll.modify(fileno,
-                                     select.EPOLLIN | select.EPOLLOUT)
-                        if 24 != conn['out_hdr_sent']:
-                            pkt = conn['out_hdr']
-                            offset = conn['out_hdr_sent']
-                            n = conn['sock'].send(pkt[offset:])
-                            conn['out_hdr_sent'] += n
-                            stats['out_bytes'] += n
-                        else:
-                            pkt = conn['out_pkt']
-                            if len(pkt) > conn['out_sent']:
-                                offset = conn['out_sent']
-                                try:
-                                    n = conn['sock'].send(pkt[offset:])
-                                except:
-                                    raise Exception('closed by peer')
-                                conn['out_sent'] += n
-                                stats['out_bytes'] += n
-                            else:
-                                del(conn['out_sent'])
-                                del(conn['out_hdr_sent'])
-                                del(conn['out_hdr'])
-                                del(conn['out_pkt'])
-                                stats['out_pkt'] += 1
 
-                if( event & ~(select.EPOLLIN | select.EPOLLOUT)):
+                if(event & ~(select.EPOLLIN | select.EPOLLOUT)):
                     raise Exception('unhandled event({0})'.format(event))
 
             except Exception as e:
