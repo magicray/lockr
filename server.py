@@ -86,7 +86,7 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
     return (filenum, offset, checksum, total_size, file_closed)
 
 
-def callback_stats_request(peer, buf):
+def callback_stats_request(src, buf):
     msg = json.dumps(dict(
         filenum=g.filenum,
         leader=g.leader,
@@ -95,17 +95,17 @@ def callback_stats_request(peer, buf):
     return dict(type='stats_response', msg=msg)
 
 
-def callback_stats_response(peer, buf):
-    assert(peer in g.peers)
-    g.peers[peer] = json.loads(buf)
+def callback_stats_response(src, buf):
+    assert(src in g.peers)
+    g.peers[src] = json.loads(buf)
 
     msgs = [dict(type='stats_request')]
 
     if not g.leader:
-        if 'self' == g.peers[peer]['leader']:
-            g.leader = peer
-            msgs.append(dict(peer=peer, type='leader_request'))
-            log('sent leader-request to the leader {0}'.format(peer))
+        if 'self' == g.peers[src]['leader']:
+            g.leader = src
+            msgs.append(dict(peer=src, type='leader_request'))
+            log('sent leader-request to the leader {0}'.format(src))
         else:
             leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
             count = 0
@@ -125,11 +125,11 @@ def callback_stats_response(peer, buf):
                     if k > leader[0]:
                         leader = (k, v, 'address')
 
-            if (peer == leader[0]) and (count >= g.quorum):
-                g.leader = peer
-                log('candidate is {0} due to ({1})'.format(peer, leader[2]))
+            if (src == leader[0]) and (count >= g.quorum):
+                g.leader = src
+                log('candidate is {0} due to ({1})'.format(src, leader[2]))
                 msgs.append(dict(type='leader_request'))
-                log('sent leader-request to candidate {0}'.format(peer))
+                log('sent leader-request to candidate {0}'.format(src))
 
         if g.leader:
             while g.followers:
@@ -140,17 +140,17 @@ def callback_stats_response(peer, buf):
     return msgs
 
 
-def callback_leader_request(peer, buf):
-    log('received leader-request from {0}'.format(peer))
+def callback_leader_request(src, buf):
+    log('received leader-request from {0}'.format(src))
 
     if g.leader and ('self' != g.leader):
-        log('sent leader-rejected to {0}'.format(peer))
+        log('sent leader-rejected to {0}'.format(src))
         return dict(type='leader_reject')
 
-    g.followers.add(peer)
+    g.followers.add(src)
 
     if 'self' == g.leader:
-        log('sent leader-accept to {0}'.format(peer))
+        log('sent leader-accept to {0}'.format(src))
         return dict(type='leader_accept')
 
     if len(g.followers) >= g.quorum:
@@ -164,25 +164,25 @@ def callback_leader_request(peer, buf):
         return msgs
 
 
-def callback_leader_reject(peer, buf):
+def callback_leader_reject(src, buf):
     g.leader = None
-    log('received leader-reject from {0}'.format(peer))
+    log('received leader-reject from {0}'.format(src))
 
 
-def callback_leader_accept(peer, buf):
-    assert(g.leader == peer)
-    log('received leader-accept from {0}'.format(peer))
+def callback_leader_accept(src, buf):
+    assert(g.leader == src)
+    log('received leader-accept from {0}'.format(src))
 
 
-def callback_replication_request(peer, buf):
-    return [(peer, 259, '')]
+def callback_replication_request(src, buf):
+    return [(src, 259, '')]
 
 
-def callback_replication_response(peer, buf):
-    return [(peer, 258, '')]
+def callback_replication_response(src, buf):
+    return [(src, 258, '')]
 
 
-def callback_lockr_state_request(peer, buf):
+def callback_lockr_state_request(src, buf):
     state = dict()
     for ip, port in g.peers:
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
@@ -196,20 +196,20 @@ def callback_lockr_state_request(peer, buf):
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
 
 
-def on_connect(peer):
+def on_connect(src):
     return dict(type='stats_request')
 
 
-def on_disconnect(peer):
-    g.peers[peer] = None
+def on_disconnect(src):
+    g.peers[src] = None
 
-    if peer == g.leader:
-        log('leader {0} disconnected'.format(peer))
+    if src == g.leader:
+        log('leader {0} disconnected'.format(src))
         g.leader = None
 
-    if peer in g.followers:
-        g.followers.remove(peer)
-        log('follower removed from {0}'.format(peer))
+    if src in g.followers:
+        g.followers.remove(src)
+        log('follower removed from {0}'.format(src))
 
     if ('self' == g.leader) and (len(g.followers) < g.quorum):
         log('relinquishing leadership as followers({0}) < quorum({1})'.format(
@@ -225,22 +225,22 @@ def on_disconnect(peer):
         return msgs
 
 
-def on_accept(peer):
+def on_accept(src):
     pass
 
 
-def on_reject(peer):
-    if peer in g.followers:
-        g.followers.remove(peer)
+def on_reject(src):
+    if src in g.followers:
+        g.followers.remove(src)
         log('removed follower{0} remaining({1})'.format(
-            peer, len(g.followers)))
+            src, len(g.followers)))
 
 
 def on_stats(stats):
     g.stats = stats
 
 
-def callback_lockr_put_request(peer, buf):
+def callback_lockr_put_request(src, buf):
     docs = dict()
     i = 1
     while i < len(buf):
@@ -281,7 +281,7 @@ def callback_lockr_put_request(peer, buf):
     return dict(msg=result)
 
 
-def callback_lockr_get_request(peer, buf):
+def callback_lockr_get_request(src, buf):
     result = list()
     i = 1
     while i < len(buf):

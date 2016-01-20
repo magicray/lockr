@@ -187,7 +187,8 @@ def epoll_loop(module, port, clients):
                         if len(conn['pkt']) == conn['sent']:
                             del(conn['pkt'])
                             del(conn['sent'])
-                            stats['out_pkt'] += 1
+                            if(0 == len(conn['msgs'])%2):
+                                stats['out_pkt'] += 1
 
                         if conn['msgs'] or ('pkt' in conn):
                             epoll.modify(fileno,
