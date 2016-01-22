@@ -58,16 +58,16 @@ def epoll_loop(module, port, clients):
                 msg_list = [msg_list]
 
             for d in msg_list:
-                msg_to = d.get('peer', peer)
+                dst = d.get('dst', peer)
                 msg_type = d.get('type', 'default')
-                msg = d.get('msg', '')
+                buf = d.get('buf', '')
 
-                if msg_to in addr2fd:
-                    f = addr2fd[msg_to]
+                if dst in addr2fd:
+                    f = addr2fd[dst]
                     connections[f]['msgs'].append(''.join([
                         hashlib.sha1(msg_type).digest(),
-                        struct.pack('!I', len(msg))]))
-                    connections[f]['msgs'].append(msg)
+                        struct.pack('!I', len(buf))]))
+                    connections[f]['msgs'].append(buf)
                     epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
 
         for fileno, event in epoll.poll():
@@ -134,6 +134,9 @@ def epoll_loop(module, port, clients):
                         buf = conn['sock'].recv(read_bytes)
                         stats['in_bytes'] += len(buf)
                         assert(len(buf) > 0)
+                    except ssl.SSLError as e:
+                        print('recv error : {0}'.format(e.errno))
+                        exit(0)
                     except:
                         raise Exception('closed by peer')
 
@@ -144,6 +147,8 @@ def epoll_loop(module, port, clients):
                             b = ''.join(conn['in_hdr_pkts'])
                             name = b[0:20]
                             size = struct.unpack('!I', b[20:])[0]
+                            if name not in callbacks:
+                                raise Exception('closed by peer')
                             if 0 == size:
                                 stats['in_pkt'] += 1
                                 handle_out_messages(
@@ -177,7 +182,8 @@ def epoll_loop(module, port, clients):
                         if len(conn['pkt']) > conn['sent']:
                             try:
                                 pkt = conn['pkt']
-                                n = conn['sock'].send(pkt[conn['sent']:])
+                                n = conn['sock'].send(
+                                    pkt[conn['sent']:conn['sent']+8*1024])
                             except:
                                 raise Exception('closed by peer')
 

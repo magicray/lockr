@@ -92,7 +92,7 @@ def callback_stats_request(src, buf):
         leader=g.leader,
         offset=g.offset,
         netstats=g.stats))
-    return dict(type='stats_response', msg=msg)
+    return dict(type='stats_response', buf=msg)
 
 
 def callback_stats_response(src, buf):
@@ -104,7 +104,7 @@ def callback_stats_response(src, buf):
     if not g.leader:
         if 'self' == g.peers[src]['leader']:
             g.leader = src
-            msgs.append(dict(peer=src, type='leader_request'))
+            msgs.append(dict(dst=src, type='leader_request'))
             log('sent leader-request to the leader {0}'.format(src))
         else:
             leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
@@ -134,7 +134,7 @@ def callback_stats_response(src, buf):
         if g.leader:
             while g.followers:
                 p = g.followers.pop()
-                msgs.append(dict(peer=p, type='leader_reject'))
+                msgs.append(dict(dst=p, type='leader_reject'))
                 log('sent leader-reject to {0}'.format(p))
 
     return msgs
@@ -158,7 +158,7 @@ def callback_leader_request(src, buf):
         msgs = list()
         log('quorum reached({0}) for leader election'.format(g.quorum))
         for p in g.followers:
-            msgs.append(dict(peer=p, type='leader_accept'))
+            msgs.append(dict(dst=p, type='leader_accept'))
             log('sent leader-accept to {0}'.format(p))
 
         return msgs
@@ -187,7 +187,7 @@ def callback_lockr_state_request(src, buf):
     for ip, port in g.peers:
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
 
-    return dict(msg=json.dumps(dict(
+    return dict(buf=json.dumps(dict(
         filenum=g.filenum,
         offset=g.offset,
         leader=g.leader,
@@ -196,8 +196,14 @@ def callback_lockr_state_request(src, buf):
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
 
 
+def callback_random_packet(src, buf):
+    import random
+    log('received len({0})'.format(len(buf)))
+    return dict(type='random_packet', buf=' '*(int(random.random()*100000000)))
+
+
 def on_connect(src):
-    return dict(type='stats_request')
+    return dict(type='stats_request'), dict(type='random_packet')
 
 
 def on_disconnect(src):
@@ -219,7 +225,7 @@ def on_disconnect(src):
         msgs = list()
         while g.followers:
             p = g.followers.pop()
-            msgs.append(dict(peer=p, type='leader_reject'))
+            msgs.append(dict(dst=p, type='leader_reject'))
             log('leader reject sent to {0}'.format(p))
 
         return msgs
@@ -278,7 +284,7 @@ def callback_lockr_put_request(src, buf):
         # traceback.print_exc()
         result = struct.pack('!B', 1)
 
-    return dict(msg=result)
+    return dict(buf=result)
 
 
 def callback_lockr_get_request(src, buf):
@@ -297,7 +303,7 @@ def callback_lockr_get_request(src, buf):
                 result.append(fd.read(l))
         i += 32
 
-    return dict(msg=''.join(result))
+    return dict(buf=''.join(result))
 
 
 def on_init(port, servers, conf_file):
