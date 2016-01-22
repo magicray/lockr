@@ -135,6 +135,7 @@ def epoll_loop(module, port, clients):
                         stats['in_bytes'] += len(buf)
                         assert(len(buf) > 0)
                     except ssl.SSLError as e:
+                        traceback.print_exc()
                         print('recv error : {0}'.format(e.errno))
                         exit(0)
                     except:
@@ -184,6 +185,9 @@ def epoll_loop(module, port, clients):
                                 pkt = conn['pkt']
                                 n = conn['sock'].send(
                                     pkt[conn['sent']:conn['sent']+8*1024])
+                            except ssl.SSLError as e:
+                                traceback.print_exc()
+                                exit(0)
                             except:
                                 raise Exception('closed by peer')
 
