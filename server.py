@@ -193,14 +193,8 @@ def callback_lockr_state_request(src, buf):
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
 
 
-def callback_random_packet(src, buf):
-    import random
-    logging.critical('received len({0})'.format(len(buf)))
-    return dict(type='random_packet', buf=' '*(int(random.random()*10*2**20)))
-
-
 def on_connect(src):
-    return dict(type='stats_request'), dict(type='random_packet')
+    return dict(type='stats_request')
 
 
 def on_disconnect(src):
@@ -305,10 +299,6 @@ def callback_lockr_get_request(src, buf):
 
 
 def on_init(port, servers, conf):
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s: %(message)s')
-
     if not os.path.isdir(g.data):
         os.mkdir(g.data)
 

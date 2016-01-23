@@ -81,6 +81,7 @@ def epoll_loop(module, port, clients):
                 if conn['handshake_done'] and event & select.EPOLLIN:
                     buf = conn['sock'].recv(conn['in_size'])
                     stats['in_bytes'] += len(buf)
+                    assert(len(buf) > 0)
 
                     conn['in_pkts'].append(buf)
                     conn['in_size'] -= len(buf)
@@ -158,17 +159,15 @@ def epoll_loop(module, port, clients):
                     raise Exception('unhandled event({0})'.format(event))
 
             except ssl.SSLError as e:
+                peer = conn['sock'].getpeername()
                 if ssl.SSL_ERROR_WANT_READ == e.errno:
                     conn['ssl_error'] = select.EPOLLIN
-                    logging.warning('peer{0} sslerror(want_read)'.format(
-                        conn.get('peer')))
+                    logging.warning('peer{0} ssl(want_read)'.format(peer))
                 elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
                     conn['ssl_error'] = select.EPOLLOUT
-                    logging.warning('peer{0} sslerror(want_write)'.format(
-                        conn.get('peer')))
+                    logging.warning('peer{0} ssl(want_write)'.format(peer))
                 else:
-                    logging.error('peer{0} sslerror({1})'.format(
-                        conn.get('peer'), e.errno))
+                    logging.error('peer{0} ssl({1})'.format(peer, e.errno))
                     traceback.print_exc()
                     exit(1)
             except Exception as e:
@@ -229,15 +228,27 @@ if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('-b', '--bind', dest='port', type='string',
                       help='server:port tuple. skip to start the client')
-    parser.add_option('-c', '--cert', dest='cert', type='string',
-                      help='certificate file path', default='cert.pem')
     parser.add_option('-s', '--servers', dest='servers', type='string',
                       help='comma separated list of ip:port')
     parser.add_option('-m', '--module_name', dest='module', type='string',
                       help='module name')
-    parser.add_option('--conf', dest='conf', type='string',
+    parser.add_option('-f', '--file', dest='cert', type='string',
+                      help='certificate file path', default='cert.pem')
+    parser.add_option('-c', '--conf', dest='conf', type='string',
                       help='configuration option')
+    parser.add_option('-l', '--log', dest='log', type='string',
+                      help='logging level', default='warning')
     opt, args = parser.parse_args()
+
+    logging.basicConfig(
+        format='%(asctime)s: %(message)s',
+        level={
+            'critical': logging.CRITICAL,
+            'error': logging.ERROR,
+            'warning': logging.WARNING,
+            'info': logging.INFO,
+            'debug': logging.DEBUG,
+            'notset': logging.NOTSET}[opt.log])
 
     os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
               ' -subj "/" -out cert.pem -keyout cert.pem 2> /dev/null')
@@ -250,6 +261,8 @@ if '__main__' == __name__:
     port = (socket.gethostbyname(opt.port.split(':')[0]),
             int(opt.port.split(':')[1]))
 
-    module = __import__(opt.module)
+    module = __import__(
+        opt.module,
+        fromlist='.'.join(opt.module.split('.')[:-1]))
     module.on_init(port, servers, opt.conf)
     epoll_loop(module, port, servers)
