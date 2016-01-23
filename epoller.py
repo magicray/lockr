@@ -86,94 +86,46 @@ def epoll_loop(module, port, clients):
                     handshake_done=False)
                 epoll.register(s.fileno(), select.EPOLLIN)
                 continue
+
             try:
                 conn = connections[fileno]
+                conn['ssl_error'] = None
 
-                if False == conn['handshake_done']:
-                    if getattr(conn['sock'], 'do_handshake', None) is None:
-                        conn['sock'] = ssl.wrap_socket(
-                            conn['sock'],
-                            do_handshake_on_connect=False,
-                            server_side=False)
-                    try:
-                        conn['sock'].do_handshake()
-                        conn['handshake_done'] = True
-                        conn['peer'] = conn['sock'].getpeername()
-                        conn['in_hdr_size'] = 24
-                        conn['in_hdr_pkts'] = list()
-                        conn['msgs'] = list()
-                        addr2fd[conn['peer']] = fileno
-                        if conn['is_server']:
-                            method = getattr(module, 'on_accept')
-                        else:
-                            method = getattr(module, 'on_connect')
+                if conn['handshake_done'] and event & select.EPOLLIN:
+                    buf = conn['sock'].recv(conn['in_size'])
+                    stats['in_bytes'] += len(buf)
 
-                        epoll.modify(fileno, select.EPOLLIN)
+                    conn['in_pkts'].append(buf)
+                    conn['in_size'] -= len(buf)
 
-                        handle_out_messages(
-                            method(conn['peer']),
-                            conn['peer'])
+                    if 0 == conn['in_size']:
+                        buf = ''.join(conn['in_pkts'])
+                        if 'name' not in conn:
+                            name = buf[0:20]
+                            size = struct.unpack('!I', buf[20:])[0]
+                            assert(name in callbacks), 'closed by peer'
 
-                    except ssl.SSLError as e:
-                        if ssl.SSL_ERROR_WANT_READ == e.errno:
-                            epoll.modify(fileno, select.EPOLLIN)
-                        elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
-                            epoll.modify(fileno, select.EPOLLOUT)
-                        else:
-                            raise
-                    continue
-
-                epoll.modify(fileno, select.EPOLLIN)
-                if event & select.EPOLLIN:
-                    if 'in_size' not in conn:
-                        read_bytes = conn['in_hdr_size']
-                    else:
-                        read_bytes = conn['in_size']
-
-                    try:
-                        buf = conn['sock'].recv(read_bytes)
-                        stats['in_bytes'] += len(buf)
-                        assert(len(buf) > 0)
-                    except ssl.SSLError as e:
-                        traceback.print_exc()
-                        print('recv error : {0}'.format(e.errno))
-                        exit(0)
-                    except:
-                        raise Exception('closed by peer')
-
-                    if 'in_size' not in conn:
-                        conn['in_hdr_pkts'].append(buf)
-                        conn['in_hdr_size'] -= len(buf)
-                        if 0 == conn['in_hdr_size']:
-                            b = ''.join(conn['in_hdr_pkts'])
-                            name = b[0:20]
-                            size = struct.unpack('!I', b[20:])[0]
-                            if name not in callbacks:
-                                raise Exception('closed by peer')
+                            conn['name'] = name
                             if 0 == size:
-                                stats['in_pkt'] += 1
-                                handle_out_messages(
-                                    callbacks[name](conn['peer'], ''),
-                                    conn['peer'])
+                                conn['buf'] = ''
                             else:
                                 conn['in_size'] = size
                                 conn['in_pkts'] = list()
-                                conn['name'] = name
-                            conn['in_hdr_size'] = 24
-                            conn['in_hdr_pkts'] = list()
-                    else:
-                        conn['in_pkts'].append(buf)
-                        conn['in_size'] -= len(buf)
-                        if 0 == conn['in_size']:
-                            pkt = ''.join(conn['in_pkts'])
-                            del(conn['in_size'])
-                            del(conn['in_pkts'])
-                            stats['in_pkt'] += 1
-                            handle_out_messages(
-                                callbacks[conn['name']](conn['peer'], pkt),
-                                conn['peer'])
+                        else:
+                            conn['buf'] = buf
 
-                if event & select.EPOLLOUT:
+                    if 'buf' in conn:
+                        handle_out_messages(
+                            callbacks[conn['name']](conn['peer'], conn['buf']),
+                            conn['peer'])
+
+                        stats['in_pkt'] += 1
+                        conn['in_size'] = 24
+                        conn['in_pkts'] = list()
+                        del(conn['name'])
+                        del(conn['buf'])
+
+                if conn['handshake_done'] and event & select.EPOLLOUT:
                     if 'pkt' not in conn:
                         if conn['msgs']:
                             conn['pkt'] = conn['msgs'].pop(0)
@@ -181,15 +133,8 @@ def epoll_loop(module, port, clients):
 
                     if 'pkt' in conn:
                         if len(conn['pkt']) > conn['sent']:
-                            try:
-                                pkt = conn['pkt']
-                                n = conn['sock'].send(
-                                    pkt[conn['sent']:conn['sent']+8*1024])
-                            except ssl.SSLError as e:
-                                traceback.print_exc()
-                                exit(0)
-                            except:
-                                raise Exception('closed by peer')
+                            n = conn['sock'].send(conn['pkt'][
+                                    conn['sent']:conn['sent']+8*1024])
 
                             conn['sent'] += n
                             stats['out_bytes'] += n
@@ -200,30 +145,65 @@ def epoll_loop(module, port, clients):
                             if(0 == len(conn['msgs'])%2):
                                 stats['out_pkt'] += 1
 
-                        if conn['msgs'] or ('pkt' in conn):
-                            epoll.modify(fileno,
-                                         select.EPOLLIN | select.EPOLLOUT)
+                if False == conn['handshake_done']:
+                    if getattr(conn['sock'], 'do_handshake', None) is None:
+                        conn['sock'] = ssl.wrap_socket(
+                            conn['sock'],
+                            do_handshake_on_connect=False,
+                            server_side=False)
+
+                    conn['sock'].do_handshake()
+                    conn['handshake_done'] = True
+                    conn['peer'] = conn['sock'].getpeername()
+                    conn['in_size'] = 24
+                    conn['in_pkts'] = list()
+                    conn['msgs'] = list()
+                    addr2fd[conn['peer']] = fileno
+                    if conn['is_server']:
+                        method = getattr(module, 'on_accept')
+                    else:
+                        method = getattr(module, 'on_connect')
+
+                    handle_out_messages( method(conn['peer']), conn['peer'])
 
                 if event & ~(select.EPOLLIN | select.EPOLLOUT):
                     raise Exception('unhandled event({0})'.format(event))
 
-            except Exception as e:
-                conn = connections.pop(fileno)
-                if conn['handshake_done'] and (str(e) != 'closed by peer'):
+            except ssl.SSLError as e:
+                if ssl.SSL_ERROR_WANT_READ == e.errno:
+                    conn['ssl_error'] = select.EPOLLIN
+                elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                    conn['ssl_error'] = select.EPOLLOUT
+                else:
                     traceback.print_exc()
                     exit(1)
-                conn['sock'].close()
-                epoll.unregister(fileno)
+            except Exception as e:
+                conn['close'] = str(e)
+            finally:
+                if 'close' in conn:
+                    conn = connections.pop(fileno)
 
-                addr2fd.pop(conn.get('peer'), None)
+                    conn['sock'].close()
+                    epoll.unregister(fileno)
 
-                if conn['is_server']:
-                    getattr(module, 'on_reject')(conn['peer'])
-                    stats['srv_disconnect'] += 1
+                    addr2fd.pop(conn.get('peer'), None)
+
+                    if conn['is_server']:
+                        if conn['handshake_done']:
+                            getattr(module, 'on_reject')(conn['peer'])
+                        stats['srv_disconnect'] += 1
+                    else:
+                        if conn['handshake_done']:
+                            getattr(module, 'on_disconnect')(conn['ip_port'])
+                        stats['cli_disconnect'] += 1
+                        clients.add((conn['ip_port'][0], conn['ip_port'][1]))
                 else:
-                    getattr(module, 'on_disconnect')(conn['ip_port'])
-                    stats['cli_disconnect'] += 1
-                    clients.add((conn['ip_port'][0], conn['ip_port'][1]))
+                    if conn['ssl_error']:
+                        epoll.modify(fileno, conn['ssl_error'])
+                    elif conn['msgs'] or ('pkt' in conn):
+                        epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
+                    else:
+                        epoll.modify(fileno, select.EPOLLIN)
 
         getattr(module, 'on_stats')(stats)
 

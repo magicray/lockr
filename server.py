@@ -199,7 +199,7 @@ def callback_lockr_state_request(src, buf):
 def callback_random_packet(src, buf):
     import random
     log('received len({0})'.format(len(buf)))
-    return dict(type='random_packet', buf=' '*(int(random.random()*100*2**20)))
+    return dict(type='random_packet', buf=' '*(int(random.random()*10*2**20)))
 
 
 def on_connect(src):
