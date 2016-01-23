@@ -4,6 +4,7 @@ import json
 import struct
 import hashlib
 import sqlite3
+import logging
 import traceback
 
 
@@ -27,14 +28,6 @@ class Globals():
 
 
 g = Globals()
-
-
-def log(msg):
-    timestamp = time.time()
-    os.write(2, '{0}.{1} : {2}\n'.format(
-        time.strftime('%y%m%d.%H%M%S', time.gmtime(timestamp)),
-        '%06d' % ((timestamp - int(timestamp)) * 10**6),
-        msg))
 
 
 def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
@@ -77,7 +70,7 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
                     offset += len(x) + 28
                     assert(offset <= total_size)
 
-                    log('scanned file({0}) offset({1})'.format(
+                    logging.critical('scanned file({0}) offset({1})'.format(
                         filenum, fd.tell()))
             except:
                 traceback.print_exc()
@@ -105,7 +98,8 @@ def callback_stats_response(src, buf):
         if 'self' == g.peers[src]['leader']:
             g.leader = src
             msgs.append(dict(dst=src, type='leader_request'))
-            log('sent leader-request to the leader {0}'.format(src))
+            logging.critical('sent leader-request to the leader {0}'.format(
+                src))
         else:
             leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
             count = 0
@@ -127,51 +121,54 @@ def callback_stats_response(src, buf):
 
             if (src == leader[0]) and (count >= g.quorum):
                 g.leader = src
-                log('candidate is {0} due to ({1})'.format(src, leader[2]))
+                logging.critical('candidate is {0} due to ({1})'.format(
+                    src, leader[2]))
                 msgs.append(dict(type='leader_request'))
-                log('sent leader-request to candidate {0}'.format(src))
+                logging.critical('sent leader-request to candidate {0}'.format(
+                    src))
 
         if g.leader:
             while g.followers:
                 p = g.followers.pop()
                 msgs.append(dict(dst=p, type='leader_reject'))
-                log('sent leader-reject to {0}'.format(p))
+                logging.critical('sent leader-reject to {0}'.format(p))
 
     return msgs
 
 
 def callback_leader_request(src, buf):
-    log('received leader-request from {0}'.format(src))
+    logging.critical('received leader-request from {0}'.format(src))
 
     if g.leader and ('self' != g.leader):
-        log('sent leader-rejected to {0}'.format(src))
+        logging.critical('sent leader-rejected to {0}'.format(src))
         return dict(type='leader_reject')
 
     g.followers.add(src)
 
     if 'self' == g.leader:
-        log('sent leader-accept to {0}'.format(src))
+        logging.critical('sent leader-accept to {0}'.format(src))
         return dict(type='leader_accept')
 
     if len(g.followers) >= g.quorum:
         g.leader = 'self'
         msgs = list()
-        log('quorum reached({0}) for leader election'.format(g.quorum))
+        logging.critical('quorum reached({0}) for leader election'.format(
+            g.quorum))
         for p in g.followers:
             msgs.append(dict(dst=p, type='leader_accept'))
-            log('sent leader-accept to {0}'.format(p))
+            logging.critical('sent leader-accept to {0}'.format(p))
 
         return msgs
 
 
 def callback_leader_reject(src, buf):
     g.leader = None
-    log('received leader-reject from {0}'.format(src))
+    logging.critical('received leader-reject from {0}'.format(src))
 
 
 def callback_leader_accept(src, buf):
     assert(g.leader == src)
-    log('received leader-accept from {0}'.format(src))
+    logging.critical('received leader-accept from {0}'.format(src))
 
 
 def callback_replication_request(src, buf):
@@ -198,7 +195,7 @@ def callback_lockr_state_request(src, buf):
 
 def callback_random_packet(src, buf):
     import random
-    log('received len({0})'.format(len(buf)))
+    logging.critical('received len({0})'.format(len(buf)))
     return dict(type='random_packet', buf=' '*(int(random.random()*10*2**20)))
 
 
@@ -210,23 +207,24 @@ def on_disconnect(src):
     g.peers[src] = None
 
     if src == g.leader:
-        log('leader {0} disconnected'.format(src))
+        logging.critical('leader {0} disconnected'.format(src))
         g.leader = None
 
     if src in g.followers:
         g.followers.remove(src)
-        log('follower removed from {0}'.format(src))
+        logging.critical('follower removed from {0}'.format(src))
 
     if ('self' == g.leader) and (len(g.followers) < g.quorum):
-        log('relinquishing leadership as followers({0}) < quorum({1})'.format(
-            len(g.followers), g.quorum))
+        logging.critical(
+            'relinquishing leadership as followers({0}) < quorum({1})'.format(
+                len(g.followers), g.quorum))
 
         g.leader = None
         msgs = list()
         while g.followers:
             p = g.followers.pop()
             msgs.append(dict(dst=p, type='leader_reject'))
-            log('leader reject sent to {0}'.format(p))
+            logging.critical('leader reject sent to {0}'.format(p))
 
         return msgs
 
@@ -238,7 +236,7 @@ def on_accept(src):
 def on_reject(src):
     if src in g.followers:
         g.followers.remove(src)
-        log('removed follower{0} remaining({1})'.format(
+        logging.critical('removed follower{0} remaining({1})'.format(
             src, len(g.followers)))
 
 
@@ -306,7 +304,11 @@ def callback_lockr_get_request(src, buf):
     return dict(buf=''.join(result))
 
 
-def on_init(port, servers, conf_file):
+def on_init(port, servers, conf):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s: %(message)s')
+
     if not os.path.isdir(g.data):
         os.mkdir(g.data)
 

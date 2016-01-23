@@ -5,6 +5,7 @@ import select
 import struct
 import hashlib
 import inspect
+import logging
 import optparse
 import traceback
 
@@ -13,13 +14,16 @@ def epoll_loop(module, port, clients):
     callbacks = dict()
     for m in inspect.getmembers(module, inspect.isfunction):
         if m[0].startswith('callback_'):
-            callbacks[hashlib.sha1(m[0][9:]).digest()] = getattr(module, m[0])
+            callbacks[hashlib.sha1(m[0][9:]).digest()] = (
+                getattr(module, m[0]), m[0][9:])
+            logging.critical('registered {0}'.format(m[0]))
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener_sock.bind(port)
     listener_sock.listen(5)
     listener_sock.setblocking(0)
+    logging.critical('listening on {0}'.format(port))
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
@@ -46,29 +50,11 @@ def epoll_loop(module, port, clients):
             epoll.register(s.fileno(), select.EPOLLOUT)
             try:
                 stats['cli_connect'] += 1
+                logging.debug('connect initiated to {0}'.format(ip_port))
                 s.connect(ip_port)
             except Exception as e:
                 if 115 != e.errno:
                     raise
-
-        def handle_out_messages(msg_list, peer):
-            if not msg_list:
-                msg_list = []
-            elif type(msg_list) is dict:
-                msg_list = [msg_list]
-
-            for d in msg_list:
-                dst = d.get('dst', peer)
-                msg_type = d.get('type', 'default')
-                buf = d.get('buf', '')
-
-                if dst in addr2fd:
-                    f = addr2fd[dst]
-                    connections[f]['msgs'].append(''.join([
-                        hashlib.sha1(msg_type).digest(),
-                        struct.pack('!I', len(buf))]))
-                    connections[f]['msgs'].append(buf)
-                    epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
 
         for fileno, event in epoll.poll():
             if listener_sock.fileno() == fileno:
@@ -90,6 +76,7 @@ def epoll_loop(module, port, clients):
             try:
                 conn = connections[fileno]
                 conn['ssl_error'] = None
+                out_msg_list = None
 
                 if conn['handshake_done'] and event & select.EPOLLIN:
                     buf = conn['sock'].recv(conn['in_size'])
@@ -115,9 +102,10 @@ def epoll_loop(module, port, clients):
                             conn['buf'] = buf
 
                     if 'buf' in conn:
-                        handle_out_messages(
-                            callbacks[conn['name']](conn['peer'], conn['buf']),
-                            conn['peer'])
+                        method, name = callbacks[conn['name']]
+                        logging.debug('peer{0} callback({1}) size({2})'.format(
+                            conn['peer'], name, len(conn['buf'])))
+                        out_msg_list = method(conn['peer'], conn['buf'])
 
                         stats['in_pkt'] += 1
                         conn['in_size'] = 24
@@ -159,12 +147,12 @@ def epoll_loop(module, port, clients):
                     conn['in_pkts'] = list()
                     conn['msgs'] = list()
                     addr2fd[conn['peer']] = fileno
-                    if conn['is_server']:
-                        method = getattr(module, 'on_accept')
-                    else:
-                        method = getattr(module, 'on_connect')
+                    name = 'on_accept' if conn['is_server'] else 'on_connect'
 
-                    handle_out_messages( method(conn['peer']), conn['peer'])
+                    logging.info('peer({0}) callback({1})'.format(
+                            conn['peer'], name))
+
+                    out_msg_list = getattr(module, name)(conn['peer'])
 
                 if event & ~(select.EPOLLIN | select.EPOLLOUT):
                     raise Exception('unhandled event({0})'.format(event))
@@ -172,9 +160,15 @@ def epoll_loop(module, port, clients):
             except ssl.SSLError as e:
                 if ssl.SSL_ERROR_WANT_READ == e.errno:
                     conn['ssl_error'] = select.EPOLLIN
+                    logging.warning('peer{0} sslerror(want_read)'.format(
+                        conn.get('peer')))
                 elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
                     conn['ssl_error'] = select.EPOLLOUT
+                    logging.warning('peer{0} sslerror(want_write)'.format(
+                        conn.get('peer')))
                 else:
+                    logging.error('peer{0} sslerror({1})'.format(
+                        conn.get('peer'), e.errno))
                     traceback.print_exc()
                     exit(1)
             except Exception as e:
@@ -191,13 +185,36 @@ def epoll_loop(module, port, clients):
                     if conn['is_server']:
                         if conn['handshake_done']:
                             getattr(module, 'on_reject')(conn['peer'])
+                            logging.info('peer({0}) callback({1})'.format(
+                                conn['peer'], 'on_reject'))
                         stats['srv_disconnect'] += 1
                     else:
                         if conn['handshake_done']:
                             getattr(module, 'on_disconnect')(conn['ip_port'])
+                            logging.info('peer({0}) callback({1})'.format(
+                                conn['ip_port'], 'on_disconnect'))
                         stats['cli_disconnect'] += 1
                         clients.add((conn['ip_port'][0], conn['ip_port'][1]))
                 else:
+                    if out_msg_list:
+                        if type(out_msg_list) is dict:
+                            out_msg_list = [out_msg_list]
+
+                        for d in out_msg_list:
+                            dst = d.get('dst', conn['peer'])
+                            msg_type = d.get('type', 'default')
+                            buf = d.get('buf', '')
+
+                            if dst in addr2fd:
+                                f = addr2fd[dst]
+                                connections[f]['msgs'].append(''.join([
+                                    hashlib.sha1(msg_type).digest(),
+                                    struct.pack('!I', len(buf))]))
+                                connections[f]['msgs'].append(buf)
+                                epoll.modify(
+                                    f,
+                                    select.EPOLLIN | select.EPOLLOUT)
+
                     if conn['ssl_error']:
                         epoll.modify(fileno, conn['ssl_error'])
                     elif conn['msgs'] or ('pkt' in conn):
@@ -219,7 +236,7 @@ if '__main__' == __name__:
     parser.add_option('-m', '--module_name', dest='module', type='string',
                       help='module name')
     parser.add_option('--conf', dest='conf', type='string',
-                      help='configuration file')
+                      help='configuration option')
     opt, args = parser.parse_args()
 
     os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
