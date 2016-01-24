@@ -114,7 +114,7 @@ def callback_leader_request(src, buf):
 
 def callback_leader_reject(src, buf):
     logging.critical('received leader-reject from {0}'.format(src))
-    #assert(src == g.leader)
+    assert(src == g.leader)
     g.leader = None
 
 
@@ -122,13 +122,52 @@ def callback_leader_accept(src, buf):
     assert(src == g.leader)
     logging.critical('received leader-accept from {0}'.format(src))
 
+    logging.critical('sent replication-request file({0}) offset({1})'.format(
+        g.filenum, g.offset))
+
+    return dict(type='replication_request', buf=json.dumps(dict(
+        filenum=g.filenum,
+        offset=g.offset)))
+
 
 def callback_replication_request(src, buf):
-    return [(src, 259, '')]
+    logging.critical('received replication-request from {0}'.format(src))
+    req = json.loads(buf)
+
+    with open(os.path.join(g.data, str(req['filenum']))) as fd:
+        fd.seek(req['offset'])
+        buf=fd.read(100*2**20)
+        logging.critical(('sent replication-response to {0} file({1}) '
+            'offset({2}) size({3})').format(src, req['filenum'], req['offset'],
+                                            len(buf)))
+        return dict(type='replication_response', buf=buf)
 
 
 def callback_replication_response(src, buf):
-    return [(src, 258, '')]
+    assert(src == g.leader)
+    logging.critical('received replication-response from {0} size({1})'.format(
+        src, len(buf)))
+
+    f = os.open(os.path.join(g.data, str(g.filenum)),
+                os.O_CREAT| os.O_WRONLY | os.O_APPEND)
+
+    assert(g.offset == os.fstat(f).st_size)
+    assert(len(buf) == os.write(f, buf))
+    assert(g.offset+len(buf) == os.fstat(f).st_size)
+
+    os.fsync(f)
+    os.close(f)
+
+    if not g.checksum:
+        with open(os.path.join(g.data, str(g.filenum))) as fd:
+            fd.seek(8)
+            g.checksum = fd.read(20)
+            g.offset = 28
+
+    g.filenum, g.offset, g.checksum, g.total_size, _ = scan(
+        g.data, g.filenum, g.offset, g.checksum, g.filenum, 2**50, put)
+
+    g.sqlite.commit()
 
 
 def callback_lockr_state_request(src, buf):
@@ -284,11 +323,20 @@ def on_init(port, servers, conf):
         g.filenum, g.offset, g.checksum, g.total_size, _ = scan(
             g.data, g.filenum, g.offset, g.checksum, max(files), 2**50, put)
         assert(max(files) == g.filenum)
-        f = os.open(os.path.join(g.data, str(g.filenum)), os.O_WRONLY)
-        os.ftruncate(f, g.offset)
-        os.fsync(f)
+
+        f = os.open(os.path.join(g.data, str(g.filenum)), os.O_RDWR)
+        n = os.fstat(f).st_size
+        assert(n >= g.offset)
+        if n > g.offset:
+            if n >= g.offset + 8:
+                os.lseek(f, g.offset, os.SEEK_SET)
+                assert(struct.unpack('!Q', os.read(f, 8))[0] + g.offset < n)
+            os.ftruncate(f, g.offset)
+            os.fsync(f)
+            logging.critical('file({0}) truncated({1}) original({2})'.format(
+                g.filenum, g.offset, n))
         os.close(f)
-        commit()
+        g.sqlite.commit()
 
 
 def commit():

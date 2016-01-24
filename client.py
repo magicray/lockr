@@ -145,19 +145,11 @@ if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('-s', '--servers', dest='servers', type='string',
                       help='comma separated list of ip:port')
-    parser.add_option('-l', '--log', dest='log', type='string',
-                      help='logging level', default='warning')
     opt, args = parser.parse_args()
 
     logging.basicConfig(
-        format='%(asctime)s: %(message)s',
-        level={
-            'critical': logging.CRITICAL,
-            'error': logging.ERROR,
-            'warning': logging.WARNING,
-            'info': logging.INFO,
-            'debug': logging.DEBUG,
-            'notset': logging.NOTSET}[opt.log])
+        level=logging.NOTSET,
+        format='%(asctime)s: %(message)s')
 
     servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
                       map(lambda x: x.split(':'),
