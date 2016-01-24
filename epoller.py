@@ -1,5 +1,6 @@
 import os
 import ssl
+import time
 import socket
 import select
 import struct
@@ -162,10 +163,10 @@ def epoll_loop(module, port, clients):
                 peer = conn['sock'].getpeername()
                 if ssl.SSL_ERROR_WANT_READ == e.errno:
                     conn['ssl_error'] = select.EPOLLIN
-                    logging.warning('peer{0} ssl(want_read)'.format(peer))
+                    logging.debug('peer{0} ssl(want_read)'.format(peer))
                 elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
                     conn['ssl_error'] = select.EPOLLOUT
-                    logging.warning('peer{0} ssl(want_write)'.format(peer))
+                    logging.debug('peer{0} ssl(want_write)'.format(peer))
                 else:
                     logging.error('peer{0} ssl({1})'.format(peer, e.errno))
                     traceback.print_exc()
@@ -183,37 +184,42 @@ def epoll_loop(module, port, clients):
 
                     if conn['is_server']:
                         if conn['handshake_done']:
-                            getattr(module, 'on_reject')(conn['peer'])
+                            out_msg_list = getattr(module, 'on_reject')(
+                                conn['peer'])
                             logging.info('peer({0}) callback({1})'.format(
                                 conn['peer'], 'on_reject'))
                         stats['srv_disconnect'] += 1
                     else:
                         if conn['handshake_done']:
-                            getattr(module, 'on_disconnect')(conn['ip_port'])
+                            out_msg_list = getattr(module, 'on_disconnect')(
+                                conn['ip_port'])
                             logging.info('peer({0}) callback({1})'.format(
                                 conn['ip_port'], 'on_disconnect'))
                         stats['cli_disconnect'] += 1
                         clients.add((conn['ip_port'][0], conn['ip_port'][1]))
-                else:
-                    if out_msg_list:
-                        if type(out_msg_list) is dict:
-                            out_msg_list = [out_msg_list]
 
-                        for d in out_msg_list:
-                            dst = d.get('dst', conn['peer'])
-                            msg_type = d.get('type', 'default')
-                            buf = d.get('buf', '')
+                if out_msg_list:
+                    if type(out_msg_list) is dict:
+                        out_msg_list = [out_msg_list]
 
-                            if dst in addr2fd:
-                                f = addr2fd[dst]
-                                connections[f]['msgs'].append(''.join([
-                                    hashlib.sha1(msg_type).digest(),
-                                    struct.pack('!I', len(buf))]))
-                                connections[f]['msgs'].append(buf)
-                                epoll.modify(
-                                    f,
-                                    select.EPOLLIN | select.EPOLLOUT)
+                    for d in out_msg_list:
+                        dst = d.get('dst', conn['peer'])
+                        msg_type = d.get('type', 'default')
+                        buf = d.get('buf', '')
 
+                        if dst in addr2fd:
+                            f = addr2fd[dst]
+                            connections[f]['msgs'].append(''.join([
+                                hashlib.sha1(msg_type).digest(),
+                                struct.pack('!I', len(buf))]))
+                            connections[f]['msgs'].append(buf)
+                            epoll.modify(
+                                f,
+                                select.EPOLLIN | select.EPOLLOUT)
+                        else:
+                            logging.critical('{0} not found'.format(dst))
+
+                if 'close' not in conn:
                     if conn['ssl_error']:
                         epoll.modify(fileno, conn['ssl_error'])
                     elif conn['msgs'] or ('pkt' in conn):
@@ -240,6 +246,8 @@ if '__main__' == __name__:
                       help='logging level', default='warning')
     opt, args = parser.parse_args()
 
+    time.sleep(1)
+
     logging.basicConfig(
         format='%(asctime)s: %(message)s',
         level={
@@ -250,8 +258,10 @@ if '__main__' == __name__:
             'debug': logging.DEBUG,
             'notset': logging.NOTSET}[opt.log])
 
-    os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
-              ' -subj "/" -out cert.pem -keyout cert.pem 2> /dev/null')
+    if not os.path.isfile(opt.cert):
+        os.mknod(opt.cert)
+        os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
+              ' -subj "/" -out {0} -keyout {0} 2> /dev/null'.format(opt.cert))
 
     servers = list()
     if opt.servers:

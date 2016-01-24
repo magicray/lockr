@@ -7,6 +7,7 @@ import shlex
 import socket
 import struct
 import hashlib
+import logging
 import optparse
 import traceback
 
@@ -17,45 +18,54 @@ class Lockr(object):
         self.sock = None
         self.timeout = timeout
 
-    def connect(self):
-        for ip, port in self.servers:
-            sys.stdout.write('connection with {0}:{1}.....'.format(ip, port))
-            try:
-                t = time.time()
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock = ssl.wrap_socket(sock)
-                sock.connect((ip, port))
-                t = ((time.time()-t)*1000)
-                sys.stdout.write('succeeded in %.03f msec\n' % t)
-                return sock
-            except:
-                t = ((time.time()-t)*1000)
-                sys.stdout.write('failed in %.3f msec\n' % t)
-        raise Exception('could not connect to server')
-
-    def request(self, req, buf):
+    def sndrcv(self, sock, req, buf=''):
         def recv(length):
             pkt = list()
             while length > 0:
-                pkt.append(self.sock.recv(length))
+                pkt.append(sock.recv(length))
                 if 0 == len(pkt[-1]):
                     raise Exception('connection closed')
                 length -= len(pkt[-1])
             return ''.join(pkt)
 
         t = time.time()
+        sock.sendall(hashlib.sha1(req).digest() + struct.pack('!I', len(buf)))
+        if buf:
+            sock.sendall(buf)
+        result = recv(struct.unpack('!I', recv(24)[20:])[0])
+        logging.critical('received response(%s) from %s in %.3f msec' % (
+            req, sock.getpeername(), (time.time() - t)*1000))
+        return result
+
+    def connect(self):
+        for ip, port in self.servers:
+            try:
+                t = time.time()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock = ssl.wrap_socket(sock)
+                sock.connect((ip, port))
+                logging.critical(
+                    'connection to %s:%d succeeded in %.03f msec' % (
+                        ip, port, (time.time()-t)*1000))
+                stats = json.loads(self.sndrcv(sock, 'lockr_state_request'))
+                if 'self' == stats['self']['leader']:
+                    logging.critical('connected to leader {0}'.format(
+                        sock.getpeername()))
+                    return sock
+            except:
+                logging.critical(
+                    'connection to %s:%d failed in %.03f msec' % (
+                        ip, port, (time.time()-t)*1000))
+        raise Exception('could not connect to server')
+
+    def request(self, req, buf):
+        t = time.time()
         while time.time() < (t + self.timeout):
             try:
                 if not self.sock:
                     self.sock = self.connect()
-                self.sock.sendall(''.join([
-                    hashlib.sha1(req).digest(),
-                    struct.pack('!I', len(buf))]))
-                self.sock.sendall(buf)
-                t2 = ((time.time() - t)*1000)
-                sys.stdout.write('successful in %.3f msec\n' % t2)
-                return recv(struct.unpack('!I', recv(24)[20:])[0])
+                return self.sndrcv(self.sock, req, buf)
             except:
                 time.sleep(1)
                 self.sock = None
@@ -135,7 +145,19 @@ if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('-s', '--servers', dest='servers', type='string',
                       help='comma separated list of ip:port')
+    parser.add_option('-l', '--log', dest='log', type='string',
+                      help='logging level', default='warning')
     opt, args = parser.parse_args()
+
+    logging.basicConfig(
+        format='%(asctime)s: %(message)s',
+        level={
+            'critical': logging.CRITICAL,
+            'error': logging.ERROR,
+            'warning': logging.WARNING,
+            'info': logging.INFO,
+            'debug': logging.DEBUG,
+            'notset': logging.NOTSET}[opt.log])
 
     servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
                       map(lambda x: x.split(':'),
