@@ -13,7 +13,7 @@ class Globals():
         self.port = None
         self.quorum = None
         self.leader = None
-        self.followers = set()
+        self.followers = dict()
         self.stats = None
         self.peers = None
         self.index = 'index'
@@ -21,9 +21,7 @@ class Globals():
         self.size = 500#128*1024*1024
         self.filenum = 0
         self.offset = 0
-        self.total_size = 0
         self.checksum = ''
-        self.commit_timestamp = int(time.time())
         self.fd = None
 
 
@@ -45,101 +43,83 @@ def callback_stats_response(src, buf):
 
     msgs = [dict(type='stats_request')]
 
-    if not g.leader:
-        if 'self' == g.peers[src]['leader']:
+    if g.leader:
+        return msgs
+
+    if 'self' == g.peers[src]['leader']:
+        g.leader = src
+        logging.critical('identified current leader{0}'.format(src))
+    elif g.peers[src]['leader'] is None:
+        leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
+        count = 0
+        for k, v in g.peers.iteritems():
+            if v:
+                count += 1
+                if leader[1]['filenum'] != v['filenum']:
+                    if leader[1]['filenum'] < v['filenum']:
+                        leader = (k, v, 'filenum')
+                    continue
+
+                if leader[1]['offset'] != v['offset']:
+                    if leader[1]['offset'] < v['offset']:
+                        leader = (k, v, 'offset')
+                    continue
+
+                if k > leader[0]:
+                    leader = (k, v, 'address')
+
+        if (src == leader[0]) and (count >= g.quorum):
             g.leader = src
-            msgs.append(dict(type='leader_request'))
-            logging.critical('sent leader-request to the leader {0}'.format(
-                src))
-        else:
-            leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
-            count = 0
-            for k, v in g.peers.iteritems():
-                if v:
-                    count += 1
-                    if leader[1]['filenum'] != v['filenum']:
-                        if leader[1]['filenum'] < v['filenum']:
-                            leader = (k, v, 'filenum')
-                        continue
+            logging.critical('leader({0}) selected due to ({1})'.format(
+                src, leader[2]))
 
-                    if leader[1]['offset'] != v['offset']:
-                        if leader[1]['offset'] < v['offset']:
-                            leader = (k, v, 'offset')
-                        continue
+    if g.leader:
+        if g.followers:
+            logging.critical('exiting to reject followers({0})'.format(
+                len(g.follwers)))
+            exit(0)
 
-                    if k > leader[0]:
-                        leader = (k, v, 'address')
+        msgs.append(dict(type='replication_request',
+                         buf=json.dumps(dict(filenum=g.filenum,
+                                             offset=g.offset))))
 
-            if (src == leader[0]) and (count >= g.quorum):
-                g.leader = src
-                logging.critical('candidate is {0} due to ({1})'.format(
-                    src, leader[2]))
-                msgs.append(dict(type='leader_request'))
-                logging.critical('sent leader-request to candidate {0}'.format(
-                    src))
-
-        if g.leader:
-            while g.followers:
-                p = g.followers.pop()
-                msgs.append(dict(dst=p, type='leader_reject'))
-                logging.critical('sent leader-reject to {0}'.format(p))
+        logging.critical(('sent replication-request to {0} file({1}) '
+            'offset({2})').format(src, g.filenum, g.offset))
 
     return msgs
 
 
-def callback_leader_request(src, buf):
-    logging.critical('received leader-request from {0}'.format(src))
-
-    if g.leader and ('self' != g.leader):
-        logging.critical('sent leader-reject to {0}'.format(src))
-        return dict(type='leader_reject')
-
-    g.followers.add(src)
-
-    if 'self' == g.leader:
-        logging.critical('sent leader-accept to {0}'.format(src))
-        return dict(type='leader_accept')
-
-    if len(g.followers) >= g.quorum:
-        g.leader = 'self'
-        logging.critical('quorum reached({0}) for leader election'.format(
-            g.quorum))
-        msgs = list()
-        for p in g.followers:
-            msgs.append(dict(dst=p, type='leader_accept'))
-            logging.critical('sent leader-accept to {0}'.format(p))
-
-        return msgs
-
-
-def callback_leader_reject(src, buf):
-    logging.critical('received leader-reject from {0}'.format(src))
-    assert(src == g.leader)
-    g.leader = None
-
-
-def callback_leader_accept(src, buf):
-    assert(src == g.leader)
-    logging.critical('received leader-accept from {0}'.format(src))
-
-    logging.critical('sent replication-request file({0}) offset({1})'.format(
-        g.filenum, g.offset))
-
-    return dict(type='replication_request', buf=json.dumps(dict(
-        filenum=g.filenum,
-        offset=g.offset)))
-
-
 def callback_replication_request(src, buf):
-    logging.critical('received replication-request from {0}'.format(src))
     req = json.loads(buf)
 
-    with open(os.path.join(g.data, str(req['filenum']))) as fd:
-        fd.seek(req['offset'])
+    logging.critical(
+        'received replication-request from{0} file({1}) offset({2})'.format(
+            src, req['filenum'], req['offset']))
+
+    if g.leader and 'self' != g.leader:
+        logging.critical(('rejecting replication-request from{0} as '
+            ' already following{1}').format(src, g.leader))
+        raise Exception('reject-replication-request')
+
+    g.followers[src] = json.loads(buf)
+    logging.critical('accepted {0} as follower({1})'.format(
+        src, len(g.followers)))
+
+    if len(g.followers) == g.quorum:
+        g.leader = 'self'
+        logging.critical('assuming leadership as quorum reached({0})'.format(
+            g.quorum))
+
+    return
+
+    filenum, offset = g.followers[src]
+
+    with open(os.path.join(g.data, str(filenum))) as fd:
+        fd.seek(offset)
         buf=fd.read(100*2**20)
         logging.critical(('sent replication-response to {0} file({1}) '
-            'offset({2}) size({3})').format(src, req['filenum'], req['offset'],
-                                            len(buf)))
+            'offset({2}) size({3})').format(src, filenum, offset, len(buf)))
+        g.followers[src] = None
         return dict(type='replication_response', buf=buf)
 
 
@@ -164,10 +144,44 @@ def callback_replication_response(src, buf):
             g.checksum = fd.read(20)
             g.offset = 28
 
-    g.filenum, g.offset, g.checksum, g.total_size, _ = scan(
+    g.filenum, g.offset, g.checksum, _ = scan(
         g.data, g.filenum, g.offset, g.checksum, g.filenum, 2**50, put)
 
     g.sqlite.commit()
+
+
+def on_connect(src):
+    logging.critical('connected to {0}'.format(src))
+    return dict(type='stats_request')
+
+
+def on_disconnect(src):
+    g.peers[src] = None
+    if src == g.leader:
+        logging.critical('exiting as leader{0} disconnected'.format(src))
+        exit(0)
+
+
+def on_accept(src):
+    logging.critical('accepted connection from {0}'.format(src))
+
+
+def on_reject(src):
+    logging.critical('terminated connection from {0}'.format(src))
+
+    if src in g.followers:
+        g.followers.pop(src)
+        logging.critical('removed follower{0} remaining({1})'.format(
+            src, len(g.followers)))
+
+        if len(g.followers) < g.quorum:
+            logging.critical(('relinquishing leadership as a followers({0}) < '
+                'quorum({1})').format(len(g.followers), g.quorum))
+            exit(0)
+
+
+def on_stats(stats):
+    g.stats = stats
 
 
 def callback_lockr_state_request(src, buf):
@@ -182,51 +196,6 @@ def callback_lockr_state_request(src, buf):
         state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
 
     return dict(buf=json.dumps(state))
-
-
-def on_connect(src):
-    logging.critical('connected to {0}'.format(src))
-    return dict(type='stats_request')
-
-
-def on_disconnect(src):
-    logging.critical('disconnected from {0}'.format(src))
-    g.peers[src] = None
-
-    if src == g.leader:
-        g.leader = None
-        logging.critical('leader {0} disconnected'.format(src))
-
-
-def on_accept(src):
-    logging.critical('accepted connection from {0}'.format(src))
-
-
-def on_reject(src):
-    logging.critical('terminated connection from {0}'.format(src))
-
-    if src in g.followers:
-        g.followers.remove(src)
-        logging.critical('removed follower{0} remaining({1})'.format(
-            src, len(g.followers)))
-
-    if ('self' == g.leader) and (len(g.followers) < g.quorum):
-        g.leader = None
-
-        logging.critical('relinquishing leadership due to quorum({0})'.format(
-                g.quorum))
-
-        msgs = list()
-        while g.followers:
-            p = g.followers.pop()
-            msgs.append(dict(dst=p, type='leader_reject'))
-            logging.critical('sent leader-reject to {0}'.format(p))
-
-        return msgs
-
-
-def on_stats(stats):
-    g.stats = stats
 
 
 def callback_lockr_put_request(src, buf):
@@ -275,7 +244,7 @@ def callback_lockr_get_request(src, buf):
     i = 1
     while i < len(buf):
         key = buf[i:i+32]
-        f, o, l = get(key)
+        f, o, l = index_get(key)
         result.append(key)
         result.append(struct.pack('!Q', f))
         result.append(struct.pack('!Q', o))
@@ -304,12 +273,12 @@ def on_init(port, servers, conf):
     result = g.sqlite.execute('''select file, offset, length
         from docs order by file desc, offset desc limit 1''').fetchall()
     if result:
-        offset = result[0][1] + result[0][2]
         with open(os.path.join(g.data, str(result[0][0]))) as fd:
-            fd.seek(offset)
             g.filenum = result[0][0]
-            g.offset = offset+20
+            fd.seek(result[0][1] + result[0][2])
             g.checksum = fd.read(20)
+            g.offset = fd.tell()
+            assert(g.offset == result[0][1] + result[0][2] + 20)
 
     files = sorted([int(f) for f in os.listdir(g.data)])
     if files:
@@ -320,17 +289,14 @@ def on_init(port, servers, conf):
                 g.offset = 28
                 g.checksum = fd.read(20)
 
-        g.filenum, g.offset, g.checksum, g.total_size, _ = scan(
-            g.data, g.filenum, g.offset, g.checksum, max(files), 2**50, put)
+        g.filenum, g.offset, g.checksum = scan(g.data, g.filenum, g.offset,
+                                               g.checksum, index_put)
         assert(max(files) == g.filenum)
 
         f = os.open(os.path.join(g.data, str(g.filenum)), os.O_RDWR)
         n = os.fstat(f).st_size
         assert(n >= g.offset)
         if n > g.offset:
-            if n >= g.offset + 8:
-                os.lseek(f, g.offset, os.SEEK_SET)
-                assert(struct.unpack('!Q', os.read(f, 8))[0] + g.offset < n)
             os.ftruncate(f, g.offset)
             os.fsync(f)
             logging.critical('file({0}) truncated({1}) original({2})'.format(
@@ -339,21 +305,13 @@ def on_init(port, servers, conf):
         g.sqlite.commit()
 
 
-def commit():
-    if int(time.time()) > g.commit_timestamp:
-        g.sqlite.commit()
-        g.commit_timestamp = int(time.time())
-
-
-def put(key, filenum, offset, length):
-    commit()
+def index_put(key, filenum, offset, length):
     g.sqlite.execute(
         'insert or replace into docs values(?, ?, ?, ?)',
         (sqlite3.Binary(key), filenum, offset, length))
 
 
-def get(key):
-    commit()
+def index_get(key):
     result = g.sqlite.execute(
         'select file, offset, length from docs where key=?',
         (sqlite3.Binary(key),)).fetchall()
@@ -375,7 +333,7 @@ def append(docs):
     offset = g.offset
     offset += 8
     for k, v in docs.iteritems():
-        put(k, g.filenum, offset+32+8, len(v[2]))
+        index_put(k, g.filenum, offset+32+8, len(v[2]))
         offset += 32 + 8 + len(v[2])
 
     chksum = hashlib.sha1(g.checksum)
@@ -390,28 +348,18 @@ def append(docs):
     g.checksum = chksum.digest()
 
 
-def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
-    total_size = 0
-    file_closed = False
-    for filenum in range(from_file, to_file+1):
-        with open(os.path.join(path, str(filenum))) as fd:
-            fd.seek(0, 2)
-            total_size = fd.tell()
+def scan(path, filenum, offset, checksum, callback):
+    result = (filenum, offset, checksum)
+    while True:
+        try:
+            with open(os.path.join(path, str(filenum))) as fd:
+                fd.seek(0, 2)
+                total_size = fd.tell()
+                fd.seek(offset)
 
-            offset = from_offset if(filenum == from_file) else 0
-            fd.seek(offset)
-
-            try:
                 while(offset < total_size):
-                    b = fd.read(8)
-                    assert(len(b) == 8)
-
-                    x = fd.read(struct.unpack('!Q', b)[0])
+                    x = fd.read(struct.unpack('!Q', fd.read(8))[0])
                     y = fd.read(20)
-                    assert(len(y) == 20)
-
-                    if (0 == len(x)) and (offset != 0):
-                        file_closed = True
 
                     chksum = hashlib.sha1(checksum)
                     chksum.update(x)
@@ -429,11 +377,13 @@ def scan(path, from_file, from_offset, checksum, to_file, to_offset, callback):
 
                     offset += len(x) + 28
                     assert(offset <= total_size)
+                    assert(offset == fd.tell())
 
+                    result = (filenum, offset, checksum)
                     logging.critical('scanned file({0}) offset({1})'.format(
-                        filenum, fd.tell()))
-            except:
-                traceback.print_exc()
-                break
+                        filenum, offset))
 
-    return (filenum, offset, checksum, total_size, file_closed)
+            filenum += 1
+            offset = 0
+        except:
+            return result
