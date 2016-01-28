@@ -18,7 +18,7 @@ class Globals():
         self.peers = None
         self.index = 'index'
         self.data = 'data'
-        self.size = 500#128*1024*1024
+        self.size = 256
         self.filenum = 0
         self.offset = 0
         self.checksum = ''
@@ -29,6 +29,12 @@ g = Globals()
 
 
 def callback_stats_request(src, buf):
+    if g.leader and 'self' != g.leader and src in g.followers:
+        g.followers.pop(src)
+        logging.critical(('disconnecting follower{0} as already '
+            'following{1}').format(src, g.leader))
+        raise Exception('kill-follower')
+
     return dict(type='stats_response', buf=json.dumps(dict(
         filenum=g.filenum,
         leader=g.leader,
@@ -74,16 +80,12 @@ def callback_stats_response(src, buf):
                 src, leader[2]))
 
     if g.leader:
-        if g.followers:
-            logging.critical('exiting to reject followers({0})'.format(
-                len(g.follwers)))
-            exit(0)
-
         msgs.append(dict(type='replication_request',
                          buf=json.dumps(dict(filenum=g.filenum,
                                              offset=g.offset))))
 
-        logging.critical(('sent replication-request to {0} file({1}) '
+        logging.critical('LEADER{0} identified'.format(src))
+        logging.critical(('sent replication-request to{0} file({1}) '
             'offset({2})').format(src, g.filenum, g.offset))
 
     return msgs

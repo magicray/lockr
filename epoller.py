@@ -17,7 +17,7 @@ def epoll_loop(module, port, clients):
         if m[0].startswith('callback_'):
             callbacks[hashlib.sha1(m[0][9:]).digest()] = (
                 getattr(module, m[0]), m[0][9:])
-            logging.critical('registered {0}'.format(m[0]))
+            logging.info('registered {0}'.format(m[0]))
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
