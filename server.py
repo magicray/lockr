@@ -35,7 +35,7 @@ def callback_stats_request(src, buf):
             'following{1}').format(src, g.leader))
         raise Exception('kill-follower')
 
-    return dict(type='stats_response', buf=json.dumps(dict(
+    return dict(msg='stats_response', buf=json.dumps(dict(
         filenum=g.filenum,
         leader=g.leader,
         offset=g.offset,
@@ -47,7 +47,7 @@ def callback_stats_response(src, buf):
     assert(src in g.peers)
     g.peers[src] = json.loads(buf)
 
-    msgs = [dict(type='stats_request')]
+    msgs = [dict(msg='stats_request')]
 
     if g.leader:
         return msgs
@@ -80,7 +80,7 @@ def callback_stats_response(src, buf):
                 src, leader[2]))
 
     if g.leader:
-        msgs.append(dict(type='replication_request',
+        msgs.append(dict(msg='replication_request',
                          buf=json.dumps(dict(filenum=g.filenum,
                                              offset=g.offset))))
 
@@ -109,7 +109,7 @@ def callback_replication_request(src, buf):
 
     if len(g.followers) == g.quorum:
         g.leader = 'self'
-        logging.critical('assuming leadership as quorum reached({0})'.format(
+        logging.critical('assuming LEADERSHIP as quorum reached({0})'.format(
             g.quorum))
 
     return
@@ -122,7 +122,7 @@ def callback_replication_request(src, buf):
         logging.critical(('sent replication-response to {0} file({1}) '
             'offset({2}) size({3})').format(src, filenum, offset, len(buf)))
         g.followers[src] = None
-        return dict(type='replication_response', buf=buf)
+        return dict(msg='replication_response', buf=buf)
 
 
 def callback_replication_response(src, buf):
@@ -154,7 +154,7 @@ def callback_replication_response(src, buf):
 
 def on_connect(src):
     logging.critical('connected to {0}'.format(src))
-    return dict(type='stats_request')
+    return dict(msg='stats_request')
 
 
 def on_disconnect(src):

@@ -204,13 +204,13 @@ def epoll_loop(module, port, clients):
 
                     for d in out_msg_list:
                         dst = d.get('dst', conn['peer'])
-                        msg_type = d.get('type', 'default')
+                        msg = d.get('msg', 'default')
                         buf = d.get('buf', '')
 
                         if dst in addr2fd:
                             f = addr2fd[dst]
                             connections[f]['msgs'].append(''.join([
-                                hashlib.sha1(msg_type).digest(),
+                                hashlib.sha1(msg).digest(),
                                 struct.pack('!I', len(buf))]))
                             connections[f]['msgs'].append(buf)
                             epoll.modify(
