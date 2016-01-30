@@ -1,6 +1,7 @@
 import os
 import ssl
 import time
+import copy
 import socket
 import select
 import struct
@@ -11,12 +12,12 @@ import optparse
 import traceback
 
 
-def epoll_loop(module, port, clients):
+def loop(module, port, clients):
     callbacks = dict()
     for m in inspect.getmembers(module, inspect.isfunction):
         if m[0].startswith('callback_'):
-            callbacks[hashlib.sha1(m[0][9:]).digest()] = (
-                getattr(module, m[0]), m[0][9:])
+            callbacks[hashlib.sha1(m[0]).digest()] = (
+                getattr(module, m[0]), m[0])
             logging.info('registered {0}'.format(m[0]))
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -36,6 +37,8 @@ def epoll_loop(module, port, clients):
     connections = dict()
     addr2fd = dict()
     clients = set(clients)
+
+    old_stats = (time.time(), copy.deepcopy(stats))
 
     while True:
         while clients:
@@ -168,9 +171,9 @@ def epoll_loop(module, port, clients):
                     conn['ssl_error'] = select.EPOLLOUT
                     logging.debug('peer{0} ssl(want_write)'.format(peer))
                 else:
-                    logging.error('peer{0} ssl({1})'.format(peer, e.errno))
                     traceback.print_exc()
-                    exit(1)
+                    logging.critical('peer{0} ssl({1})'.format(peer, e.errno))
+                    exit(0)
             except Exception as e:
                 conn['close'] = str(e)
             finally:
@@ -204,7 +207,7 @@ def epoll_loop(module, port, clients):
 
                     for d in out_msg_list:
                         dst = d.get('dst', conn['peer'])
-                        msg = d.get('msg', 'default')
+                        msg = 'callback_' + d.get('msg', '')
                         buf = d.get('buf', '')
 
                         if dst in addr2fd:
@@ -227,7 +230,14 @@ def epoll_loop(module, port, clients):
                     else:
                         epoll.modify(fileno, select.EPOLLIN)
 
-        getattr(module, 'on_stats')(stats)
+        if time.time() > old_stats[0] + 60:
+            divisor = (time.time() - old_stats[0])*10**6
+            logging.info('in-bytes: %0.3f MBps out-bytes: %0.3f MBps' % (
+                (stats['in_bytes'] - old_stats[1]['in_bytes'])/divisor,
+                (stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor))
+            old_stats = (time.time(), copy.deepcopy(stats))
+
+        getattr(module, 'on_stats')(copy.deepcopy(stats))
 
 
 if '__main__' == __name__:
@@ -243,7 +253,7 @@ if '__main__' == __name__:
     parser.add_option('-c', '--conf', dest='conf', type='string',
                       help='configuration option')
     parser.add_option('-l', '--log', dest='log', type='string',
-                      help='logging level', default='warning')
+                      help='logging level', default='info')
     opt, args = parser.parse_args()
 
     time.sleep(1)
@@ -275,4 +285,4 @@ if '__main__' == __name__:
         opt.module,
         fromlist='.'.join(opt.module.split('.')[:-1]))
     module.on_init(port, servers, opt.conf)
-    epoll_loop(module, port, servers)
+    loop(module, port, servers)
