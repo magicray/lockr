@@ -58,27 +58,31 @@ def callback_stats_response(src, buf):
 
                 if l['filenum'] != p['filenum']:
                     if l['filenum'] < p['filenum']:
-                        leader = (k, p, 'filenum')
+                        leader = (k, p, 'filenum({0} > {1})'.format(
+                            p['filenum'], l['filenum']))
                     continue
 
                 if l['eof'] and not p['eof']:
                     continue
 
                 if p['eof'] and not l['eof']:
-                    leader = (k, p, 'eof')
+                    leader = (k, p, 'eof({0}, {1})'.format(
+                        p['offset'], l['offset']))
                     continue
 
                 if l['offset'] != p['offset']:
                     if l['offset'] < p['offset']:
-                        leader = (k, p, 'offset')
+                        leader = (k, p, 'offset({0} > {1})'.format(
+                            p['offset'], l['offset']))
                     continue
 
                 if k > leader[0]:
-                    leader = (k, p, 'address')
+                    leader = (k, p, 'address({0}:{1} > {2}:{3})'.format(
+                        k[0], k[1], leader[0][0], leader[0][1]))
 
         if (src == leader[0]) and (count >= g.quorum):
             g.leader = src
-            logging.critical('leader({0}) selected due to ({1})'.format(
+            logging.critical('leader({0}) selected due to {1}'.format(
                 src, leader[2]))
 
     if g.leader:
