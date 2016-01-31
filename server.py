@@ -18,7 +18,7 @@ class g:
     index = 'index'
     data = 'data'
     max_file_size = 256
-    state = dict(checksum='')
+    state = dict(filenum=0, offset=0, checksum='', eof=False)
     fd = None
 
 
@@ -29,12 +29,11 @@ def callback_stats_request(src, buf):
             'following{1}').format(src, g.leader))
         raise Exception('kill-follower')
 
-    return dict(msg='stats_response', buf=json.dumps(
-        dict(state=g.state,
-             leader=g.leader,
-             stats=g.stats,
-             timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())),
-        default=lambda x: 'cant encode'))
+    return dict(msg='stats_response', buf=json.dumps(dict(
+        state=g.state,
+        leader=g.leader,
+        stats=g.stats,
+        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
 
 
 def callback_stats_response(src, buf):
@@ -188,52 +187,51 @@ def on_stats(stats):
 
 
 def callback_lockr_state_request(src, buf):
-    state = dict(self=dict(
+    state = dict([('{0}:{1}'.format(*k), v) for k, v in g.peers.iteritems()])
+
+    state['self'] = dict(
         state=g.state,
         leader=g.leader,
         stats=g.stats,
-        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
-
-    for ip, port in g.peers:
-        state['{0}:{1}'.format(ip, port)] = g.peers[(ip, port)]
+        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))
 
     return dict(buf=json.dumps(state))
 
 
 def callback_lockr_put_request(src, buf):
-    docs = dict()
-    i = 1
-    while i < len(buf):
-        length = struct.unpack('!Q', buf[i+48:i+56])[0]
-
-        docs[buf[i:i+32]] = (
-            struct.unpack('!Q', buf[i+32:i+40])[0],
-            struct.unpack('!Q', buf[i+40:i+48])[0],
-            buf[i+56:i+56+length])
-
-        i += 56 + length
-
-    assert(i == len(buf)), 'invalid put request'
-
-    if g.state['offset'] > g.max_file_size:
-        if g.fd:
-            append(dict())
-            os.close(g.fd)
-        g.state['filenum'] += 1
-        g.state['offset'] = 0
-        g.fd = None
-
-    if not g.fd:
-        g.fd = os.open(
-            os.path.join(g.data, str(g.state['filenum'])),
-            os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-
-        if 0 == g.state['offset']:
-            append(dict())
-
     try:
+        docs = dict()
+        i = 1
+        while i < len(buf):
+            length = struct.unpack('!Q', buf[i+48:i+56])[0]
+
+            docs[buf[i:i+32]] = (
+                struct.unpack('!Q', buf[i+32:i+40])[0],
+                struct.unpack('!Q', buf[i+40:i+48])[0],
+                buf[i+56:i+56+length])
+
+            i += 56 + length
+
+        assert(i == len(buf)), 'invalid put request'
+
+        if g.state['offset'] > g.max_file_size:
+            if g.fd:
+                append(dict())
+                os.close(g.fd)
+            g.state['filenum'] += 1
+            g.state['offset'] = 0
+            g.fd = None
+
+        if not g.fd:
+            g.fd = os.open(
+                os.path.join(g.data, str(g.state['filenum'])),
+                os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
+            if 0 == g.state['offset']:
+                append(dict())
+
         append(docs)
-        return dict(buf=struct.pack('!B', 0))
+        return dict(buf=struct.pack('!B', 0) + 'ok')
     except Exception as e:
         #traceback.print_exc()
         return dict(buf=struct.pack('!B', 1) + str(e))
@@ -291,8 +289,8 @@ def on_init(port, servers, conf):
                 g.state['offset'] = fd.tell()
                 assert(g.state['offset'] == 28)
 
-        g.state = scan(g.data, g.state['filenum'], g.state['offset'],
-                       g.state['checksum'].decode('hex'), index_put)
+        g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+                            g.state['checksum'], index_put))
         assert(max(files) == g.state['filenum'])
 
         f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
@@ -352,6 +350,7 @@ def append(docs):
 
 def scan(path, filenum, offset, checksum, callback=None):
     result = dict()
+    checksum = checksum.decode('hex')
     while True:
         try:
             with open(os.path.join(path, str(filenum))) as fd:
