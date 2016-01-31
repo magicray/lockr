@@ -215,30 +215,28 @@ def callback_lockr_put_request(src, buf):
 
     assert(i == len(buf)), 'invalid put request'
 
-    if g.offset > g.max_file_size:
+    if g.state['offset'] > g.max_file_size:
         if g.fd:
             append(dict())
             os.close(g.fd)
-        g.filenum += 1
-        g.offset = 0
+        g.state['filenum'] += 1
+        g.state['offset'] = 0
         g.fd = None
 
     if not g.fd:
         g.fd = os.open(
-            os.path.join(g.data, str(g.filenum)),
+            os.path.join(g.data, str(g.state['filenum'])),
             os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-        if 0 == g.offset:
+        if 0 == g.state['offset']:
             append(dict())
 
     try:
         append(docs)
-        result = struct.pack('!B', 0)
-    except:
-        # traceback.print_exc()
-        result = struct.pack('!B', 1)
-
-    return dict(buf=result)
+        return dict(buf=struct.pack('!B', 0))
+    except Exception as e:
+        #traceback.print_exc()
+        return dict(buf=struct.pack('!B', 1) + str(e))
 
 
 def callback_lockr_get_request(src, buf):
@@ -326,7 +324,7 @@ def append(docs):
     buf_len = 0
     buf_list = list()
     for k, v in docs.iteritems():
-        f, o, l = get(k)
+        f, o, l = index_get(k)
         assert((v[0] == f) and (v[1] == o)), 'version mismatch'
 
         buf_list.append(k)
@@ -334,13 +332,13 @@ def append(docs):
         buf_list.append(v[2])
         buf_len += 40 + len(v[2])
 
-    offset = g.offset
+    offset = g.state['offset']
     offset += 8
     for k, v in docs.iteritems():
-        index_put(k, g.filenum, offset+32+8, len(v[2]))
+        index_put(k, g.state['filenum'], offset+32+8, len(v[2]))
         offset += 32 + 8 + len(v[2])
 
-    chksum = hashlib.sha1(g.checksum.decode('hex'))
+    chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
     map(lambda b: chksum.update(b), buf_list)
 
     buf_list.insert(0, struct.pack('!Q', buf_len))
@@ -348,8 +346,8 @@ def append(docs):
 
     os.write(g.fd, ''.join(buf_list))
 
-    g.offset = offset + 20
-    g.checksum = chksum.hexdigest()
+    g.state['offset'] = offset + 20
+    g.state['checksum'] = chksum.hexdigest()
 
 
 def scan(path, filenum, offset, checksum, callback=None):
@@ -389,7 +387,7 @@ def scan(path, filenum, offset, checksum, callback=None):
                         offset=offset,
                         size=total_size,
                         checksum=checksum.encode('hex'),
-                        eof=True if(0 == len(x) and offset > 0) else False))
+                        eof=True if(0 == len(x) and offset > 28) else False))
 
                     logging.critical(('scanned file({filenum}) '
                         'offset({offset}) size({size}) eof({eof})'

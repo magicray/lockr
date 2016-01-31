@@ -87,7 +87,8 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
-        return self.request('lockr_put_request', ''.join(items))
+        result = self.request('lockr_put_request', ''.join(items))
+        return struct.unpack('!B', result[0])[0], result[1:]
 
     def get(self, keys):
         items = [struct.pack('!B', 2)]
@@ -137,7 +138,7 @@ class Client(cmd.Cmd):
             cmd = shlex.split(line)
             tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
             docs = dict([(t[0], (t[1], t[2])) for t in tup])
-            print(struct.unpack('!B', self.cli.put(docs))[0])
+            print(self.cli.put(docs))
         except:
             traceback.print_exc()
 
