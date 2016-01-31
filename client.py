@@ -29,7 +29,8 @@ class Lockr(object):
             return ''.join(pkt)
 
         t = time.time()
-        sock.sendall(hashlib.sha1(req).digest() + struct.pack('!I', len(buf)))
+        sock.sendall(hashlib.sha1('callback_' + req).digest() +
+                     struct.pack('!I', len(buf)))
         if buf:
             sock.sendall(buf)
         result = recv(struct.unpack('!I', recv(24)[20:])[0])

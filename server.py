@@ -8,24 +8,18 @@ import logging
 import traceback
 
 
-class Globals():
-    def __init__(self):
-        self.port = None
-        self.quorum = None
-        self.leader = None
-        self.followers = dict()
-        self.stats = None
-        self.peers = None
-        self.index = 'index'
-        self.data = 'data'
-        self.size = 256
-        self.filenum = 0
-        self.offset = 0
-        self.checksum = ''
-        self.fd = None
-
-
-g = Globals()
+class g:
+    port = None
+    quorum = None
+    leader = None
+    followers = dict()
+    stats = None
+    peers = None
+    index = 'index'
+    data = 'data'
+    max_file_size = 256
+    state = dict(checksum='')
+    fd = None
 
 
 def callback_stats_request(src, buf):
@@ -35,12 +29,12 @@ def callback_stats_request(src, buf):
             'following{1}').format(src, g.leader))
         raise Exception('kill-follower')
 
-    return dict(msg='stats_response', buf=json.dumps(dict(
-        filenum=g.filenum,
-        leader=g.leader,
-        offset=g.offset,
-        netstats=g.stats,
-        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
+    return dict(msg='stats_response', buf=json.dumps(
+        dict(state=g.state,
+             leader=g.leader,
+             stats=g.stats,
+             timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())),
+        default=lambda x: 'cant encode'))
 
 
 def callback_stats_response(src, buf):
@@ -56,23 +50,32 @@ def callback_stats_response(src, buf):
         g.leader = src
         logging.critical('identified current leader{0}'.format(src))
     elif g.peers[src]['leader'] is None:
-        leader = (g.port, dict(filenum=g.filenum, offset=g.offset), 'self')
+        leader = (g.port, g.state, 'self')
         count = 0
         for k, v in g.peers.iteritems():
             if v:
                 count += 1
-                if leader[1]['filenum'] != v['filenum']:
-                    if leader[1]['filenum'] < v['filenum']:
-                        leader = (k, v, 'filenum')
+                l, p = leader[1], v['state']
+
+                if l['filenum'] != p['filenum']:
+                    if l['filenum'] < p['filenum']:
+                        leader = (k, p, 'filenum')
                     continue
 
-                if leader[1]['offset'] != v['offset']:
-                    if leader[1]['offset'] < v['offset']:
-                        leader = (k, v, 'offset')
+                if l['eof'] and not p['eof']:
+                    continue
+
+                if p['eof'] and not l['eof']:
+                    leader = (k, p, 'eof')
+                    continue
+
+                if l['offset'] != p['offset']:
+                    if l['offset'] < p['offset']:
+                        leader = (k, p, 'offset')
                     continue
 
                 if k > leader[0]:
-                    leader = (k, v, 'address')
+                    leader = (k, p, 'address')
 
         if (src == leader[0]) and (count >= g.quorum):
             g.leader = src
@@ -80,13 +83,11 @@ def callback_stats_response(src, buf):
                 src, leader[2]))
 
     if g.leader:
-        msgs.append(dict(msg='replication_request',
-                         buf=json.dumps(dict(filenum=g.filenum,
-                                             offset=g.offset))))
+        msgs.append(dict(msg='replication_request', buf=json.dumps(g.state)))
 
         logging.critical('LEADER{0} identified'.format(src))
         logging.critical(('sent replication-request to{0} file({1}) '
-            'offset({2})').format(src, g.filenum, g.offset))
+            'offset({2})').format(src, g.state['filenum'], g.state['offset']))
 
     return msgs
 
@@ -143,7 +144,7 @@ def callback_replication_response(src, buf):
     if not g.checksum:
         with open(os.path.join(g.data, str(g.filenum))) as fd:
             fd.seek(8)
-            g.checksum = fd.read(20)
+            g.checksum = fd.read(20).encode('hex')
             g.offset = 28
 
     g.filenum, g.offset, g.checksum, _ = scan(
@@ -188,10 +189,9 @@ def on_stats(stats):
 
 def callback_lockr_state_request(src, buf):
     state = dict(self=dict(
-        filenum=g.filenum,
-        offset=g.offset,
+        state=g.state,
         leader=g.leader,
-        netstats=g.stats,
+        stats=g.stats,
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime())))
 
     for ip, port in g.peers:
@@ -215,7 +215,7 @@ def callback_lockr_put_request(src, buf):
 
     assert(i == len(buf)), 'invalid put request'
 
-    if g.offset > g.size:
+    if g.offset > g.max_file_size:
         if g.fd:
             append(dict())
             os.close(g.fd)
@@ -274,35 +274,37 @@ def on_init(port, servers, conf):
 
     result = g.sqlite.execute('''select file, offset, length
         from docs order by file desc, offset desc limit 1''').fetchall()
+
     if result:
-        with open(os.path.join(g.data, str(result[0][0]))) as fd:
-            g.filenum = result[0][0]
-            fd.seek(result[0][1] + result[0][2])
-            g.checksum = fd.read(20)
-            g.offset = fd.tell()
-            assert(g.offset == result[0][1] + result[0][2] + 20)
+        g.state['filenum'], offset, length = result[0]
+        with open(os.path.join(g.data, str(g.state['filenum']))) as fd:
+            fd.seek(offset + length)
+            g.state['checksum'] = fd.read(20).encode('hex')
+            g.state['offset'] = fd.tell()
+            assert(g.state['offset'] == offset + length + 20)
 
     files = sorted([int(f) for f in os.listdir(g.data)])
     if files:
-        if '' == g.checksum:
+        if '' == g.state['checksum']:
             with open(os.path.join(g.data, str(min(files)))) as fd:
                 assert(0 == struct.unpack('!Q', fd.read(8))[0])
-                g.filenum = min(files)
-                g.offset = 28
-                g.checksum = fd.read(20)
+                g.state['filenum'] = min(files)
+                g.state['checksum'] = fd.read(20).encode('hex')
+                g.state['offset'] = fd.tell()
+                assert(g.state['offset'] == 28)
 
-        g.filenum, g.offset, g.checksum = scan(g.data, g.filenum, g.offset,
-                                               g.checksum, index_put)
-        assert(max(files) == g.filenum)
+        g.state = scan(g.data, g.state['filenum'], g.state['offset'],
+                       g.state['checksum'].decode('hex'), index_put)
+        assert(max(files) == g.state['filenum'])
 
-        f = os.open(os.path.join(g.data, str(g.filenum)), os.O_RDWR)
+        f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
         n = os.fstat(f).st_size
-        assert(n >= g.offset)
-        if n > g.offset:
-            os.ftruncate(f, g.offset)
+        if n > g.state['offset']:
+            os.ftruncate(f, g.state['offset'])
             os.fsync(f)
             logging.critical('file({0}) truncated({1}) original({2})'.format(
-                g.filenum, g.offset, n))
+                g.state['filenum'], g.state['offset'], n))
+            g.state['size'] = g.state['offset']
         os.close(f)
         g.sqlite.commit()
 
@@ -338,7 +340,7 @@ def append(docs):
         index_put(k, g.filenum, offset+32+8, len(v[2]))
         offset += 32 + 8 + len(v[2])
 
-    chksum = hashlib.sha1(g.checksum)
+    chksum = hashlib.sha1(g.checksum.decode('hex'))
     map(lambda b: chksum.update(b), buf_list)
 
     buf_list.insert(0, struct.pack('!Q', buf_len))
@@ -347,11 +349,11 @@ def append(docs):
     os.write(g.fd, ''.join(buf_list))
 
     g.offset = offset + 20
-    g.checksum = chksum.digest()
+    g.checksum = chksum.hexdigest()
 
 
-def scan(path, filenum, offset, checksum, callback):
-    result = (filenum, offset, checksum)
+def scan(path, filenum, offset, checksum, callback=None):
+    result = dict()
     while True:
         try:
             with open(os.path.join(path, str(filenum))) as fd:
@@ -375,15 +377,23 @@ def scan(path, filenum, offset, checksum, callback):
                         ofst = offset+8+i+40
                         i += 40 + length
 
-                        callback(key, filenum, ofst, length)
+                        if callback:
+                            callback(key, filenum, ofst, length)
 
                     offset += len(x) + 28
                     assert(offset <= total_size)
                     assert(offset == fd.tell())
 
-                    result = (filenum, offset, checksum)
-                    logging.critical('scanned file({0}) offset({1})'.format(
-                        filenum, offset))
+                    result.update(dict(
+                        filenum=filenum,
+                        offset=offset,
+                        size=total_size,
+                        checksum=checksum.encode('hex'),
+                        eof=True if(0 == len(x) and offset > 0) else False))
+
+                    logging.critical(('scanned file({filenum}) '
+                        'offset({offset}) size({size}) eof({eof})'
+                    ).format(**result))
 
             filenum += 1
             offset = 0
