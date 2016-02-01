@@ -231,10 +231,10 @@ def loop(module, port, clients):
                         epoll.modify(fileno, select.EPOLLIN)
 
         if time.time() > old_stats[0] + 60:
-            divisor = (time.time() - old_stats[0])*10**6
-            logging.info('in-bytes: %0.3f MBps out-bytes: %0.3f MBps' % (
-                (stats['in_bytes'] - old_stats[1]['in_bytes'])/divisor,
-                (stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor))
+            divisor = (time.time() - old_stats[0])*2**20
+            logging.info('in-mbps(%0.3f) out-mbps(%0.3f)' % (
+                8*(stats['in_bytes'] - old_stats[1]['in_bytes'])/divisor,
+                8*(stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor))
             old_stats = (time.time(), copy.deepcopy(stats))
 
         getattr(module, 'on_stats')(copy.deepcopy(stats))

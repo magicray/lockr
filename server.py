@@ -18,7 +18,7 @@ class g:
     index = 'index'
     data = 'data'
     max_file_size = 256
-    state = dict(filenum=0, offset=0, checksum='', eof=False)
+    state = dict(filenum=0, offset=0, checksum='', size=0, eof=False)
     fd = None
 
 
@@ -221,17 +221,19 @@ def callback_lockr_put_request(src, buf):
         if g.state['offset'] > g.max_file_size:
             if g.fd:
                 append(dict())
+                os.fsync(g.fd)
                 os.close(g.fd)
-            g.state['filenum'] += 1
-            g.state['offset'] = 0
             g.fd = None
 
         if not g.fd:
-            g.fd = os.open(
-                os.path.join(g.data, str(g.state['filenum'])),
-                os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+            filenum = g.state['filenum']
+            if g.state['eof']:
+                filenum = g.state['filenum'] + 1
 
-            if 0 == g.state['offset']:
+            g.fd = os.open(os.path.join(g.data, str(filenum)),
+                           os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
+            if g.state['eof']:
                 append(dict())
 
         append(docs)
@@ -281,7 +283,10 @@ def on_init(port, servers, conf):
             fd.seek(offset + length)
             g.state['checksum'] = fd.read(20).encode('hex')
             g.state['offset'] = fd.tell()
+            fd.seek(0, 2)
+            g.state['size'] = fd.tell()
             assert(g.state['offset'] == offset + length + 20)
+            assert(g.state['size'] >= g.state['offset'])
 
     files = sorted([int(f) for f in os.listdir(g.data)])
     if files:
@@ -323,7 +328,6 @@ def index_get(key):
 
 
 def append(docs):
-    buf_len = 0
     buf_list = list()
     for k, v in docs.iteritems():
         f, o, l = index_get(k)
@@ -332,24 +336,16 @@ def append(docs):
         buf_list.append(k)
         buf_list.append(struct.pack('!Q', len(v[2])))
         buf_list.append(v[2])
-        buf_len += 40 + len(v[2])
 
-    offset = g.state['offset']
-    offset += 8
-    for k, v in docs.iteritems():
-        index_put(k, g.state['filenum'], offset+32+8, len(v[2]))
-        offset += 32 + 8 + len(v[2])
+    buf = ''.join(buf_list)
 
     chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
-    map(lambda b: chksum.update(b), buf_list)
+    chksum.update(buf)
 
-    buf_list.insert(0, struct.pack('!Q', buf_len))
-    buf_list.append(chksum.digest())
+    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
-    os.write(g.fd, ''.join(buf_list))
-
-    g.state['offset'] = offset + 20
-    g.state['checksum'] = chksum.hexdigest()
+    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+                            g.state['checksum'], index_put))
 
 
 def scan(path, filenum, offset, checksum, callback=None):
