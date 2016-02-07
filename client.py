@@ -122,7 +122,8 @@ class Client(cmd.Cmd):
             cmd = shlex.split(line)
             tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
             docs = dict([(t[0], (t[1], t[2])) for t in tup])
-            print(self.cli.put(docs))
+            code, msg = self.cli.put(docs)
+            print(msg if code else 'ok')
         except:
             traceback.print_exc()
 

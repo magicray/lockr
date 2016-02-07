@@ -19,7 +19,6 @@ class g:
     data = 'data'
     max_file_size = 256
     state = dict(filenum=0, offset=0, checksum='', size=0, eof=False)
-    fd = None
 
 
 def callback_stats_request(src, buf):
@@ -115,6 +114,10 @@ def callback_replication_request(src, buf):
         g.leader = 'self'
         logging.critical('assuming LEADERSHIP as quorum reached({0})'.format(
             g.quorum))
+
+        g.state['filenum'] += 1
+        g.state['offset'] = 0
+        append(dict())
 
     return
 
@@ -219,22 +222,8 @@ def callback_put(src, buf):
         assert(i == len(buf)), 'invalid put request'
 
         if g.state['offset'] > g.max_file_size:
-            if g.fd:
-                append(dict())
-                os.fsync(g.fd)
-                os.close(g.fd)
-            g.fd = None
-
-        if not g.fd:
-            filenum = g.state['filenum']
-            if g.state['eof']:
-                filenum = g.state['filenum'] + 1
-
-            g.fd = os.open(os.path.join(g.data, str(filenum)),
-                           os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-
-            if g.state['eof']:
-                append(dict())
+            raise Exception('size({0}) > maxsize({1})'.format(
+                g.state['offset'], g.max_file_size))
 
         append(docs)
         return dict(buf=struct.pack('!B', 0) + 'ok')
@@ -253,7 +242,7 @@ def callback_get(src, buf):
         result.append(struct.pack('!Q', o))
         result.append(struct.pack('!Q', l))
         if l > 0:
-            with open(os.path.join(g.data, str(f))) as fd:
+            with open(os.path.join(g.data, str(f)), 'rb') as fd:
                 fd.seek(o)
                 result.append(fd.read(l))
         i += 32
@@ -278,7 +267,7 @@ def on_init(port, servers, conf):
 
     if result:
         g.state['filenum'], offset, length = result[0]
-        with open(os.path.join(g.data, str(g.state['filenum']))) as fd:
+        with open(os.path.join(g.data, str(g.state['filenum'])), 'rb') as fd:
             fd.seek(offset + length)
             g.state['checksum'] = fd.read(20).encode('hex')
             g.state['offset'] = fd.tell()
@@ -290,7 +279,7 @@ def on_init(port, servers, conf):
     files = sorted([int(f) for f in os.listdir(g.data)])
     if files:
         if '' == g.state['checksum']:
-            with open(os.path.join(g.data, str(min(files)))) as fd:
+            with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
                 assert(0 == struct.unpack('!Q', fd.read(8))[0])
                 g.state['filenum'] = min(files)
                 g.state['checksum'] = fd.read(20).encode('hex')
@@ -305,10 +294,11 @@ def on_init(port, servers, conf):
         n = os.fstat(f).st_size
         if n > g.state['offset']:
             os.ftruncate(f, g.state['offset'])
-            os.fsync(f)
             logging.critical('file({0}) truncated({1}) original({2})'.format(
                 g.state['filenum'], g.state['offset'], n))
             g.state['size'] = g.state['offset']
+
+        os.fsync(f)
         os.close(f)
         g.sqlite.commit()
 
@@ -341,7 +331,8 @@ def append(docs):
     chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
     chksum.update(buf)
 
-    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
+    with open(os.path.join(g.data, str(g.state['filenum'])), 'ab', 0) as fd:
+        fd.write(struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
     g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
                             g.state['checksum'], index_put))
@@ -352,7 +343,7 @@ def scan(path, filenum, offset, checksum, callback=None):
     checksum = checksum.decode('hex')
     while True:
         try:
-            with open(os.path.join(path, str(filenum))) as fd:
+            with open(os.path.join(path, str(filenum)), 'rb') as fd:
                 fd.seek(0, 2)
                 total_size = fd.tell()
                 fd.seek(offset)
