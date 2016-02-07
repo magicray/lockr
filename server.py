@@ -190,7 +190,7 @@ def on_stats(stats):
     g.stats = stats
 
 
-def callback_lockr_state_request(src, buf):
+def callback_state(src, buf):
     state = dict([('{0}:{1}'.format(*k), v) for k, v in g.peers.iteritems()])
 
     state['self'] = dict(
@@ -202,7 +202,7 @@ def callback_lockr_state_request(src, buf):
     return dict(buf=json.dumps(state))
 
 
-def callback_lockr_put_request(src, buf):
+def callback_put(src, buf):
     try:
         docs = dict()
         i = 1
@@ -243,7 +243,7 @@ def callback_lockr_put_request(src, buf):
         return dict(buf=struct.pack('!B', 1) + str(e))
 
 
-def callback_lockr_get_request(src, buf):
+def callback_get(src, buf):
     result = list()
     i = 1
     while i < len(buf):

@@ -12,13 +12,41 @@ import optparse
 import traceback
 
 
+def connect(ip, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock = ssl.wrap_socket(sock)
+    sock.connect((ip, port))
+    return sock
+
+
+def send(sock, req, buf=''):
+    sock.sendall(hashlib.sha1('callback_' + req).digest() +
+                 struct.pack('!I', len(buf)))
+    if buf:
+        sock.sendall(buf)
+
+
+def recv(sock):
+    def recvall(length):
+        pkt = list()
+        while length > 0:
+            pkt.append(sock.recv(length))
+            if 0 == len(pkt[-1]):
+                raise Exception('connection closed')
+            length -= len(pkt[-1])
+        return ''.join(pkt)
+
+    return recvall(struct.unpack('!I', recvall(24)[20:])[0])
+
+
 def loop(module, port, clients):
     callbacks = dict()
     for m in inspect.getmembers(module, inspect.isfunction):
         if m[0].startswith('callback_'):
             callbacks[hashlib.sha1(m[0]).digest()] = (
                 getattr(module, m[0]), m[0])
-            logging.info('registered {0}'.format(m[0]))
+            logging.debug('registered {0}'.format(m[0]))
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -1,10 +1,9 @@
 import sys
-import ssl
 import cmd
 import time
 import json
+import msgio
 import shlex
-import socket
 import struct
 import hashlib
 import logging
@@ -19,21 +18,9 @@ class Lockr(object):
         self.timeout = timeout
 
     def sndrcv(self, sock, req, buf=''):
-        def recv(length):
-            pkt = list()
-            while length > 0:
-                pkt.append(sock.recv(length))
-                if 0 == len(pkt[-1]):
-                    raise Exception('connection closed')
-                length -= len(pkt[-1])
-            return ''.join(pkt)
-
         t = time.time()
-        sock.sendall(hashlib.sha1('callback_' + req).digest() +
-                     struct.pack('!I', len(buf)))
-        if buf:
-            sock.sendall(buf)
-        result = recv(struct.unpack('!I', recv(24)[20:])[0])
+        msgio.send(sock, req, buf)
+        result = msgio.recv(sock)
         logging.critical('received response(%s) from %s in %.3f msec' % (
             req, sock.getpeername(), (time.time() - t)*1000))
         return result
@@ -42,14 +29,11 @@ class Lockr(object):
         for ip, port in self.servers:
             try:
                 t = time.time()
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock = ssl.wrap_socket(sock)
-                sock.connect((ip, port))
+                sock = msgio.connect(ip, port)
                 logging.critical(
                     'connection to %s:%d succeeded in %.03f msec' % (
                         ip, port, (time.time()-t)*1000))
-                stats = json.loads(self.sndrcv(sock, 'lockr_state_request'))
+                stats = json.loads(self.sndrcv(sock, 'state'))
                 if 'self' == stats['self']['leader']:
                     logging.critical('connected to leader {0}'.format(
                         sock.getpeername()))
@@ -74,7 +58,7 @@ class Lockr(object):
         raise Exception('timed out')
 
     def get_state(self):
-        return json.loads(self.request('lockr_state_request', ''))
+        return json.loads(self.request('state', ''))
 
     def put(self, docs):
         items = [struct.pack('!B', 1)]
@@ -87,7 +71,7 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
-        result = self.request('lockr_put_request', ''.join(items))
+        result = self.request('put', ''.join(items))
         return struct.unpack('!B', result[0])[0], result[1:]
 
     def get(self, keys):
@@ -98,7 +82,7 @@ class Lockr(object):
             items.append(h)
             hashdict[h] = key
 
-        buf = self.request('lockr_get_request', ''.join(items))
+        buf = self.request('get', ''.join(items))
         i = 0
         docs = dict()
         while i < len(buf):
@@ -146,15 +130,11 @@ class Client(cmd.Cmd):
 if '__main__' == __name__:
     parser = optparse.OptionParser()
     parser.add_option('-s', '--servers', dest='servers', type='string',
-                      help='comma separated list of ip:port')
+                      help='comma separated list of server:port')
     opt, args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.NOTSET,
-        format='%(asctime)s: %(message)s')
+    logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
 
-    servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
-                      map(lambda x: x.split(':'),
-                          opt.servers.split(','))))
-
-    Client(servers).cmdloop()
+    Client(set(map(lambda x: (x[0], int(x[1])),
+                   map(lambda x: x.split(':'),
+                       opt.servers.split(','))))).cmdloop()
