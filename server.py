@@ -238,9 +238,8 @@ def callback_put(src, buf):
 
         append(docs)
         return dict(buf=struct.pack('!B', 0) + 'ok')
-    except Exception as e:
-        #traceback.print_exc()
-        return dict(buf=struct.pack('!B', 1) + str(e))
+    except:
+        return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
 
 
 def callback_get(src, buf):

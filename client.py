@@ -17,7 +17,7 @@ class Lockr(object):
         self.sock = None
         self.timeout = timeout
 
-    def sndrcv(self, sock, req, buf=''):
+    def _sndrcv(self, sock, req, buf=''):
         t = time.time()
         msgio.send(sock, req, buf)
         result = msgio.recv(sock)
@@ -25,7 +25,7 @@ class Lockr(object):
             req, sock.getpeername(), (time.time() - t)*1000))
         return result
 
-    def connect(self):
+    def _connect(self):
         for ip, port in self.servers:
             try:
                 t = time.time()
@@ -33,7 +33,7 @@ class Lockr(object):
                 logging.critical(
                     'connection to %s:%d succeeded in %.03f msec' % (
                         ip, port, (time.time()-t)*1000))
-                stats = json.loads(self.sndrcv(sock, 'state'))
+                stats = json.loads(self._sndrcv(sock, 'state'))
                 if 'self' == stats['self']['leader']:
                     logging.critical('connected to leader {0}'.format(
                         sock.getpeername()))
@@ -44,21 +44,21 @@ class Lockr(object):
                         ip, port, (time.time()-t)*1000))
         raise Exception('could not connect to server')
 
-    def request(self, req, buf):
+    def _request(self, req, buf):
         t = time.time()
         while time.time() < (t + self.timeout):
             try:
                 if not self.sock:
-                    self.sock = self.connect()
-                return self.sndrcv(self.sock, req, buf)
+                    self.sock = self._connect()
+                return self._sndrcv(self.sock, req, buf)
             except:
                 time.sleep(1)
                 self.sock = None
 
         raise Exception('timed out')
 
-    def get_state(self):
-        return json.loads(self.request('state', ''))
+    def state(self):
+        return json.loads(self._request('state', ''))
 
     def put(self, docs):
         items = [struct.pack('!B', 1)]
@@ -71,7 +71,7 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
-        result = self.request('put', ''.join(items))
+        result = self._request('put', ''.join(items))
         return struct.unpack('!B', result[0])[0], result[1:]
 
     def get(self, keys):
@@ -82,7 +82,7 @@ class Lockr(object):
             items.append(h)
             hashdict[h] = key
 
-        buf = self.request('get', ''.join(items))
+        buf = self._request('get', ''.join(items))
         i = 0
         docs = dict()
         while i < len(buf):
@@ -111,7 +111,7 @@ class Client(cmd.Cmd):
         exit(0)
 
     def do_state(self, line):
-        print(json.dumps(self.cli.get_state(), indent=4, sort_keys=True))
+        print(json.dumps(self.cli.state(), indent=4, sort_keys=True))
 
     def do_get(self, line):
         for k, v in self.cli.get(line.split()).iteritems():
