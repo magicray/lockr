@@ -8,7 +8,6 @@ import struct
 import hashlib
 import logging
 import optparse
-import traceback
 
 
 class Lockr(object):
@@ -61,7 +60,7 @@ class Lockr(object):
         return json.loads(self._request('state', ''))
 
     def put(self, docs):
-        items = [struct.pack('!B', 1)]
+        items = list()
         for k, v in docs.iteritems():
             ver = '0-0' if (v[0] is '-' or v[0] is None) else v[0]
 
@@ -75,7 +74,7 @@ class Lockr(object):
         return struct.unpack('!B', result[0])[0], result[1:]
 
     def get(self, keys):
-        items = [struct.pack('!B', 2)]
+        items = list()
         hashdict = dict()
         for key in keys:
             h = hashlib.sha256(key).digest()
@@ -83,6 +82,7 @@ class Lockr(object):
             hashdict[h] = key
 
         buf = self._request('get', ''.join(items))
+
         i = 0
         docs = dict()
         while i < len(buf):
@@ -118,14 +118,11 @@ class Client(cmd.Cmd):
             print('{0} <{1}> {2}'.format(k, v[0], v[1]))
 
     def do_put(self, line):
-        try:
-            cmd = shlex.split(line)
-            tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-            docs = dict([(t[0], (t[1], t[2])) for t in tup])
-            code, msg = self.cli.put(docs)
-            print(msg if code else 'ok')
-        except:
-            traceback.print_exc()
+        cmd = shlex.split(line)
+        tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
+        docs = dict([(t[0], (t[1], t[2])) for t in tup])
+        code, msg = self.cli.put(docs)
+        print(msg if code else 'ok')
 
 
 if '__main__' == __name__:

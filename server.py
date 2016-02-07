@@ -117,7 +117,7 @@ def callback_replication_request(src, buf):
 
         g.state['filenum'] += 1
         g.state['offset'] = 0
-        append(dict())
+        append('')
 
     return
 
@@ -207,15 +207,20 @@ def callback_state(src, buf):
 
 def callback_put(src, buf):
     try:
-        docs = dict()
-        i = 1
+        i = 0
+        buf_list = list()
         while i < len(buf):
+            key = buf[i:i+32]
+            filenum = struct.unpack('!Q', buf[i+32:i+40])[0]
+            offset = struct.unpack('!Q', buf[i+40:i+48])[0]
             length = struct.unpack('!Q', buf[i+48:i+56])[0]
 
-            docs[buf[i:i+32]] = (
-                struct.unpack('!Q', buf[i+32:i+40])[0],
-                struct.unpack('!Q', buf[i+40:i+48])[0],
-                buf[i+56:i+56+length])
+            f, o, l = index_get(key)
+            assert((f == filenum) and (o == offset)), 'version mismatch'
+
+            buf_list.append(key)
+            buf_list.append(struct.pack('!Q', length))
+            buf_list.append(buf[i+56:i+56+length])
 
             i += 56 + length
 
@@ -225,15 +230,27 @@ def callback_put(src, buf):
             raise Exception('size({0}) > maxsize({1})'.format(
                 g.state['offset'], g.max_file_size))
 
-        append(docs)
+
+        append(''.join(buf_list))
         return dict(buf=struct.pack('!B', 0) + 'ok')
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
 
 
+def append(buf):
+    chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
+    chksum.update(buf)
+
+    with open(os.path.join(g.data, str(g.state['filenum'])), 'ab', 0) as fd:
+        fd.write(struct.pack('!Q', len(buf)) + buf + chksum.digest())
+
+    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+                        g.state['checksum'], index_put))
+
+
 def callback_get(src, buf):
+    i = 0
     result = list()
-    i = 1
     while i < len(buf):
         key = buf[i:i+32]
         f, o, l = index_get(key)
@@ -277,30 +294,32 @@ def on_init(port, servers, conf):
             assert(g.state['size'] >= g.state['offset'])
 
     files = sorted([int(f) for f in os.listdir(g.data)])
-    if files:
-        if '' == g.state['checksum']:
-            with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
-                assert(0 == struct.unpack('!Q', fd.read(8))[0])
-                g.state['filenum'] = min(files)
-                g.state['checksum'] = fd.read(20).encode('hex')
-                g.state['offset'] = fd.tell()
-                assert(g.state['offset'] == 28)
+    if not files:
+        return
 
-        g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
-                            g.state['checksum'], index_put))
-        assert(max(files) == g.state['filenum'])
+    if '' == g.state['checksum']:
+        with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
+            assert(0 == struct.unpack('!Q', fd.read(8))[0])
+            g.state['filenum'] = min(files)
+            g.state['checksum'] = fd.read(20).encode('hex')
+            g.state['offset'] = fd.tell()
+            assert(g.state['offset'] == 28)
 
-        f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
-        n = os.fstat(f).st_size
-        if n > g.state['offset']:
-            os.ftruncate(f, g.state['offset'])
-            logging.critical('file({0}) truncated({1}) original({2})'.format(
-                g.state['filenum'], g.state['offset'], n))
-            g.state['size'] = g.state['offset']
+    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+                        g.state['checksum'], index_put))
+    assert(max(files) == g.state['filenum'])
 
-        os.fsync(f)
-        os.close(f)
-        g.sqlite.commit()
+    f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
+    n = os.fstat(f).st_size
+    if n > g.state['offset']:
+        os.ftruncate(f, g.state['offset'])
+        logging.critical('file({0}) truncated({1}) original({2})'.format(
+            g.state['filenum'], g.state['offset'], n))
+        g.state['size'] = g.state['offset']
+
+    os.fsync(f)
+    os.close(f)
+    g.sqlite.commit()
 
 
 def index_put(key, filenum, offset, length):
@@ -314,28 +333,6 @@ def index_get(key):
         'select file, offset, length from docs where key=?',
         (sqlite3.Binary(key),)).fetchall()
     return result[0] if result else (0, 0, 0)
-
-
-def append(docs):
-    buf_list = list()
-    for k, v in docs.iteritems():
-        f, o, l = index_get(k)
-        assert((v[0] == f) and (v[1] == o)), 'version mismatch'
-
-        buf_list.append(k)
-        buf_list.append(struct.pack('!Q', len(v[2])))
-        buf_list.append(v[2])
-
-    buf = ''.join(buf_list)
-
-    chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
-    chksum.update(buf)
-
-    with open(os.path.join(g.data, str(g.state['filenum'])), 'ab', 0) as fd:
-        fd.write(struct.pack('!Q', len(buf)) + buf + chksum.digest())
-
-    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
-                            g.state['checksum'], index_put))
 
 
 def scan(path, filenum, offset, checksum, callback=None):
