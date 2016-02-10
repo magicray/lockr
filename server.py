@@ -89,8 +89,8 @@ def stats_response(src, buf):
 
         logging.critical('LEADER{0} identified'.format(src))
         logging.critical(
-            'sent replication-request to{0} file({1}) offset({2})').format(
-                src, g.state['filenum'], g.state['offset'])
+            'sent replication-request to{0} file({1}) offset({2})'.format(
+                src, g.state['filenum'], g.state['offset']))
 
     return msgs
 
@@ -126,7 +126,7 @@ def replication_request(src, buf):
 
     with open(os.path.join(g.data, str(filenum))) as fd:
         fd.seek(offset)
-        buf=fd.read(100*2**20)
+        buf = fd.read(100*2**20)
         logging.critical(('sent replication-response to {0} file({1}) '
                           'offset({2}) size({3})').format(
                               src, filenum, offset, len(buf)))
