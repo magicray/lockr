@@ -1,4 +1,3 @@
-import sys
 import cmd
 import time
 import json
@@ -13,51 +12,44 @@ import optparse
 class Lockr(object):
     def __init__(self, servers, timeout=30):
         self.servers = servers
-        self.sock = None
+        self.server = None
         self.timeout = timeout
 
-    def _sndrcv(self, sock, req, buf=''):
-        t = time.time()
-        msgio.send(sock, req, buf)
-        result = msgio.recv(sock)
-        logging.critical('received response(%s) from %s in %.3f msec' % (
-            req, sock.getpeername(), (time.time() - t)*1000))
-        return result
-
-    def _connect(self):
-        for ip, port in self.servers:
+    def request(self, req, buf=''):
+        req_begin = time.time()
+        while time.time() < (req_begin + self.timeout):
             try:
-                t = time.time()
-                sock = msgio.connect(ip, port)
-                logging.critical(
-                    'connection to %s:%d succeeded in %.03f msec' % (
-                        ip, port, (time.time()-t)*1000))
-                stats = json.loads(self._sndrcv(sock, 'state'))
-                if 'self' == stats['self']['leader']:
-                    logging.critical('connected to leader {0}'.format(
-                        sock.getpeername()))
-                    return sock
-            except:
-                logging.critical(
-                    'connection to %s:%d failed in %.03f msec' % (
-                        ip, port, (time.time()-t)*1000))
-        raise Exception('could not connect to server')
+                if not self.server:
+                    for srv in self.servers:
+                        try:
+                            t = time.time()
+                            stats = json.loads(msgio.request(srv, 'state'))
+                            logging.critical(
+                                'connection to %s succeeded in %.03f msec' % (
+                                    srv, (time.time()-t)*1000))
+                            if 'self' == stats['self']['leader']:
+                                self.server = srv
+                                logging.critical(
+                                    'connected to leader {0}'.format(srv))
+                                break
+                        except:
+                            logging.critical(
+                                'connection to %s failed in %.03f msec' % (
+                                    srv, (time.time()-t)*1000))
 
-    def _request(self, req, buf):
-        t = time.time()
-        while time.time() < (t + self.timeout):
-            try:
-                if not self.sock:
-                    self.sock = self._connect()
-                return self._sndrcv(self.sock, req, buf)
+                result = msgio.request(self.server, req, buf)
+                logging.critical(
+                    'received response(%s) from %s in %0.3f msec' % (
+                        req, self.server, (time.time() - req_begin)*1000))
+                return result
             except:
                 time.sleep(1)
-                self.sock = None
+                self.server = None
 
         raise Exception('timed out')
 
     def state(self):
-        return json.loads(self._request('state', ''))
+        return json.loads(self.request('state'))
 
     def put(self, docs):
         items = list()
@@ -70,7 +62,7 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
-        result = self._request('put', ''.join(items))
+        result = self.request('put', ''.join(items))
         return struct.unpack('!B', result[0])[0], result[1:]
 
     def get(self, keys):
@@ -81,7 +73,7 @@ class Lockr(object):
             items.append(h)
             hashdict[h] = key
 
-        buf = self._request('get', ''.join(items))
+        buf = self.request('get', ''.join(items))
 
         i = 0
         docs = dict()
@@ -127,7 +119,7 @@ class Client(cmd.Cmd):
 
 if '__main__' == __name__:
     parser = optparse.OptionParser()
-    parser.add_option('-s', '--servers', dest='servers', type='string',
+    parser.add_option('--servers', dest='servers', type='string',
                       help='comma separated list of server:port')
     opt, args = parser.parse_args()
 

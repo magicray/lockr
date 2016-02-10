@@ -6,47 +6,49 @@ import socket
 import select
 import struct
 import hashlib
-import inspect
 import logging
 import optparse
 import traceback
 
 
-def connect(ip, port):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    sock = ssl.wrap_socket(sock)
-    sock.connect((ip, port))
-    return sock
+servers = dict()
 
 
-def send(sock, req, buf=''):
-    sock.sendall(hashlib.sha1('callback_' + req).digest() +
-                 struct.pack('!I', len(buf)))
+def request(srv, req, buf=''):
+    if not req:
+        if srv in servers:
+            sock = servers.pop(srv)
+            sock.close()
+            return
+
+    if srv not in servers:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock = ssl.wrap_socket(sock)
+        sock.connect(srv)
+        servers[srv] = sock
+
+    servers[srv].sendall(hashlib.sha1(req).digest() +
+                         struct.pack('!Q', len(buf)))
     if buf:
-        sock.sendall(buf)
+        servers[srv].sendall(buf)
 
-
-def recv(sock):
     def recvall(length):
         pkt = list()
         while length > 0:
-            pkt.append(sock.recv(length))
+            pkt.append(servers[srv].recv(length))
             if 0 == len(pkt[-1]):
                 raise Exception('connection closed')
             length -= len(pkt[-1])
         return ''.join(pkt)
 
-    return recvall(struct.unpack('!I', recvall(24)[20:])[0])
+    return recvall(struct.unpack('!Q', recvall(28)[20:])[0])
 
 
 def loop(module, port, clients):
     callbacks = dict()
-    for m in inspect.getmembers(module, inspect.isfunction):
-        if m[0].startswith('callback_'):
-            callbacks[hashlib.sha1(m[0]).digest()] = (
-                getattr(module, m[0]), m[0])
-            logging.debug('registered {0}'.format(m[0]))
+    for m in dir(module):
+        callbacks[hashlib.sha1(m).digest()] = (getattr(module, m), m)
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -122,7 +124,7 @@ def loop(module, port, clients):
                         buf = ''.join(conn['in_pkts'])
                         if 'name' not in conn:
                             name = buf[0:20]
-                            size = struct.unpack('!I', buf[20:])[0]
+                            size = struct.unpack('!Q', buf[20:])[0]
                             assert(name in callbacks), 'closed by peer'
 
                             conn['name'] = name
@@ -141,7 +143,7 @@ def loop(module, port, clients):
                         out_msg_list = method(conn['peer'], conn['buf'])
 
                         stats['in_pkt'] += 1
-                        conn['in_size'] = 24
+                        conn['in_size'] = 28
                         conn['in_pkts'] = list()
                         del(conn['name'])
                         del(conn['buf'])
@@ -155,7 +157,7 @@ def loop(module, port, clients):
                     if 'pkt' in conn:
                         if len(conn['pkt']) > conn['sent']:
                             n = conn['sock'].send(conn['pkt'][
-                                    conn['sent']:conn['sent']+8*1024])
+                                conn['sent']:conn['sent']+8*1024])
 
                             conn['sent'] += n
                             stats['out_bytes'] += n
@@ -163,7 +165,7 @@ def loop(module, port, clients):
                         if len(conn['pkt']) == conn['sent']:
                             del(conn['pkt'])
                             del(conn['sent'])
-                            if(0 == len(conn['msgs'])%2):
+                            if(0 == len(conn['msgs']) % 2):
                                 stats['out_pkt'] += 1
 
                 if False == conn['handshake_done']:
@@ -176,14 +178,14 @@ def loop(module, port, clients):
                     conn['sock'].do_handshake()
                     conn['handshake_done'] = True
                     conn['peer'] = conn['sock'].getpeername()
-                    conn['in_size'] = 24
+                    conn['in_size'] = 28
                     conn['in_pkts'] = list()
                     conn['msgs'] = list()
                     addr2fd[conn['peer']] = fileno
                     name = 'on_accept' if conn['is_server'] else 'on_connect'
 
                     logging.info('peer({0}) callback({1})'.format(
-                            conn['peer'], name))
+                        conn['peer'], name))
 
                     out_msg_list = getattr(module, name)(conn['peer'])
 
@@ -235,14 +237,14 @@ def loop(module, port, clients):
 
                     for d in out_msg_list:
                         dst = d.get('dst', conn['peer'])
-                        msg = 'callback_' + d.get('msg', '')
+                        msg = d.get('msg', '')
                         buf = d.get('buf', '')
 
                         if dst in addr2fd:
                             f = addr2fd[dst]
                             connections[f]['msgs'].append(''.join([
                                 hashlib.sha1(msg).digest(),
-                                struct.pack('!I', len(buf))]))
+                                struct.pack('!Q', len(buf))]))
                             connections[f]['msgs'].append(buf)
                             epoll.modify(
                                 f,
@@ -270,17 +272,17 @@ def loop(module, port, clients):
 
 if '__main__' == __name__:
     parser = optparse.OptionParser()
-    parser.add_option('-b', '--bind', dest='port', type='string',
+    parser.add_option('--bind', dest='port', type='string',
                       help='server:port tuple. skip to start the client')
-    parser.add_option('-s', '--servers', dest='servers', type='string',
+    parser.add_option('--servers', dest='servers', type='string',
                       help='comma separated list of ip:port')
-    parser.add_option('-m', '--module_name', dest='module', type='string',
+    parser.add_option('--module', dest='module', type='string',
                       help='module name')
-    parser.add_option('-f', '--file', dest='cert', type='string',
+    parser.add_option('--cert', dest='cert', type='string',
                       help='certificate file path', default='cert.pem')
-    parser.add_option('-c', '--conf', dest='conf', type='string',
+    parser.add_option('--conf', dest='conf', type='string',
                       help='configuration option')
-    parser.add_option('-l', '--log', dest='log', type='string',
+    parser.add_option('--log', dest='log', type='string',
                       help='logging level', default='info')
     opt, args = parser.parse_args()
 
@@ -298,8 +300,9 @@ if '__main__' == __name__:
 
     if not os.path.isfile(opt.cert):
         os.mknod(opt.cert)
-        os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
-              ' -subj "/" -out {0} -keyout {0} 2> /dev/null'.format(opt.cert))
+        os.system(
+            'openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
+            ' -subj "/" -out {0} -keyout {0} 2> /dev/null'.format(opt.cert))
 
     servers = list()
     if opt.servers:

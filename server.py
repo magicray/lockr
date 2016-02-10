@@ -21,11 +21,11 @@ class g:
     state = dict(filenum=0, offset=0, checksum='', size=0, eof=False)
 
 
-def callback_stats_request(src, buf):
+def stats_request(src, buf):
     if g.leader and 'self' != g.leader and src in g.followers:
         g.followers.pop(src)
         logging.critical(('disconnecting follower{0} as already '
-            'following{1}').format(src, g.leader))
+                          'following{1}').format(src, g.leader))
         raise Exception('kill-follower')
 
     return dict(msg='stats_response', buf=json.dumps(dict(
@@ -35,7 +35,7 @@ def callback_stats_request(src, buf):
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
 
 
-def callback_stats_response(src, buf):
+def stats_response(src, buf):
     assert(src in g.peers)
     g.peers[src] = json.loads(buf)
 
@@ -88,13 +88,14 @@ def callback_stats_response(src, buf):
         msgs.append(dict(msg='replication_request', buf=json.dumps(g.state)))
 
         logging.critical('LEADER{0} identified'.format(src))
-        logging.critical(('sent replication-request to{0} file({1}) '
-            'offset({2})').format(src, g.state['filenum'], g.state['offset']))
+        logging.critical(
+            'sent replication-request to{0} file({1}) offset({2})').format(
+                src, g.state['filenum'], g.state['offset'])
 
     return msgs
 
 
-def callback_replication_request(src, buf):
+def replication_request(src, buf):
     req = json.loads(buf)
 
     logging.critical(
@@ -102,8 +103,8 @@ def callback_replication_request(src, buf):
             src, req['filenum'], req['offset']))
 
     if g.leader and 'self' != g.leader:
-        logging.critical(('rejecting replication-request from{0} as '
-            ' already following{1}').format(src, g.leader))
+        logging.critical(('rejecting replication-request from{0} as already '
+                          'following{1}').format(src, g.leader))
         raise Exception('reject-replication-request')
 
     g.followers[src] = json.loads(buf)
@@ -127,18 +128,19 @@ def callback_replication_request(src, buf):
         fd.seek(offset)
         buf=fd.read(100*2**20)
         logging.critical(('sent replication-response to {0} file({1}) '
-            'offset({2}) size({3})').format(src, filenum, offset, len(buf)))
+                          'offset({2}) size({3})').format(
+                              src, filenum, offset, len(buf)))
         g.followers[src] = None
         return dict(msg='replication_response', buf=buf)
 
 
-def callback_replication_response(src, buf):
+def replication_response(src, buf):
     assert(src == g.leader)
     logging.critical('received replication-response from {0} size({1})'.format(
         src, len(buf)))
 
     f = os.open(os.path.join(g.data, str(g.filenum)),
-                os.O_CREAT| os.O_WRONLY | os.O_APPEND)
+                os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
     assert(g.offset == os.fstat(f).st_size)
     assert(len(buf) == os.write(f, buf))
@@ -185,7 +187,8 @@ def on_reject(src):
 
         if len(g.followers) < g.quorum:
             logging.critical(('relinquishing leadership as a followers({0}) < '
-                'quorum({1})').format(len(g.followers), g.quorum))
+                              'quorum({1})').format(
+                                  len(g.followers), g.quorum))
             exit(0)
 
 
@@ -193,7 +196,7 @@ def on_stats(stats):
     g.stats = stats
 
 
-def callback_state(src, buf):
+def state(src, buf):
     state = dict([('{0}:{1}'.format(*k), v) for k, v in g.peers.iteritems()])
 
     state['self'] = dict(
@@ -205,7 +208,7 @@ def callback_state(src, buf):
     return dict(buf=json.dumps(state))
 
 
-def callback_put(src, buf):
+def put(src, buf):
     try:
         i = 0
         buf_list = list()
@@ -230,7 +233,6 @@ def callback_put(src, buf):
             raise Exception('size({0}) > maxsize({1})'.format(
                 g.state['offset'], g.max_file_size))
 
-
         append(''.join(buf_list))
         return dict(buf=struct.pack('!B', 0) + 'ok')
     except:
@@ -248,7 +250,7 @@ def append(buf):
                         g.state['checksum'], index_put))
 
 
-def callback_get(src, buf):
+def get(src, buf):
     i = 0
     result = list()
     while i < len(buf):
@@ -265,61 +267,6 @@ def callback_get(src, buf):
         i += 32
 
     return dict(buf=''.join(result))
-
-
-def on_init(port, servers, conf):
-    if not os.path.isdir(g.data):
-        os.mkdir(g.data)
-
-    g.peers = dict((ip_port, None) for ip_port in servers)
-    g.quorum = int(len(g.peers)/2.0 + 0.6)
-    g.port = port
-
-    g.sqlite = sqlite3.connect(g.index)
-    g.sqlite.execute('''create table if not exists docs
-        (key blob primary key, file int, offset int, length int)''')
-
-    result = g.sqlite.execute('''select file, offset, length
-        from docs order by file desc, offset desc limit 1''').fetchall()
-
-    if result:
-        g.state['filenum'], offset, length = result[0]
-        with open(os.path.join(g.data, str(g.state['filenum'])), 'rb') as fd:
-            fd.seek(offset + length)
-            g.state['checksum'] = fd.read(20).encode('hex')
-            g.state['offset'] = fd.tell()
-            fd.seek(0, 2)
-            g.state['size'] = fd.tell()
-            assert(g.state['offset'] == offset + length + 20)
-            assert(g.state['size'] >= g.state['offset'])
-
-    files = sorted([int(f) for f in os.listdir(g.data)])
-    if not files:
-        return
-
-    if '' == g.state['checksum']:
-        with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
-            assert(0 == struct.unpack('!Q', fd.read(8))[0])
-            g.state['filenum'] = min(files)
-            g.state['checksum'] = fd.read(20).encode('hex')
-            g.state['offset'] = fd.tell()
-            assert(g.state['offset'] == 28)
-
-    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
-                        g.state['checksum'], index_put))
-    assert(max(files) == g.state['filenum'])
-
-    f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
-    n = os.fstat(f).st_size
-    if n > g.state['offset']:
-        os.ftruncate(f, g.state['offset'])
-        logging.critical('file({0}) truncated({1}) original({2})'.format(
-            g.state['filenum'], g.state['offset'], n))
-        g.state['size'] = g.state['offset']
-
-    os.fsync(f)
-    os.close(f)
-    g.sqlite.commit()
 
 
 def index_put(key, filenum, offset, length):
@@ -375,11 +322,66 @@ def scan(path, filenum, offset, checksum, callback=None):
                         checksum=checksum.encode('hex'),
                         eof=True if(0 == len(x) and offset > 28) else False))
 
-                    logging.critical(('scanned file({filenum}) '
-                        'offset({offset}) size({size}) eof({eof})'
-                    ).format(**result))
+                    logging.critical(
+                        ('scanned file({filenum}) offset({offset}) '
+                         'size({size}) eof({eof})').format(**result))
 
             filenum += 1
             offset = 0
         except:
             return result
+
+
+def on_init(port, servers, conf):
+    if not os.path.isdir(g.data):
+        os.mkdir(g.data)
+
+    g.peers = dict((ip_port, None) for ip_port in servers)
+    g.quorum = int(len(g.peers)/2.0 + 0.6)
+    g.port = port
+
+    g.sqlite = sqlite3.connect(g.index)
+    g.sqlite.execute('''create table if not exists docs
+        (key blob primary key, file int, offset int, length int)''')
+
+    result = g.sqlite.execute('''select file, offset, length
+        from docs order by file desc, offset desc limit 1''').fetchall()
+
+    if result:
+        g.state['filenum'], offset, length = result[0]
+        with open(os.path.join(g.data, str(g.state['filenum'])), 'rb') as fd:
+            fd.seek(offset + length)
+            g.state['checksum'] = fd.read(20).encode('hex')
+            g.state['offset'] = fd.tell()
+            fd.seek(0, 2)
+            g.state['size'] = fd.tell()
+            assert(g.state['offset'] == offset + length + 20)
+            assert(g.state['size'] >= g.state['offset'])
+
+    files = sorted([int(f) for f in os.listdir(g.data)])
+    if not files:
+        return
+
+    if '' == g.state['checksum']:
+        with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
+            assert(0 == struct.unpack('!Q', fd.read(8))[0])
+            g.state['filenum'] = min(files)
+            g.state['checksum'] = fd.read(20).encode('hex')
+            g.state['offset'] = fd.tell()
+            assert(g.state['offset'] == 28)
+
+    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+                        g.state['checksum'], index_put))
+    assert(max(files) == g.state['filenum'])
+
+    f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
+    n = os.fstat(f).st_size
+    if n > g.state['offset']:
+        os.ftruncate(f, g.state['offset'])
+        logging.critical('file({0}) truncated({1}) original({2})'.format(
+            g.state['filenum'], g.state['offset'], n))
+        g.state['size'] = g.state['offset']
+
+    os.fsync(f)
+    os.close(f)
+    g.sqlite.commit()
