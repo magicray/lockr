@@ -11,38 +11,40 @@ import optparse
 import traceback
 
 
-servers = dict()
-
-
 def request(srv, req, buf=''):
-    if not req:
+    servers = getattr(request, 'servers', dict())
+
+    try:
+        if not req:
+            raise Exception('closed')
+
+        if srv not in servers:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock = ssl.wrap_socket(sock)
+            sock.connect(srv)
+            servers[srv] = sock
+
+        servers[srv].sendall(hashlib.sha1(req).digest() +
+                             struct.pack('!Q', len(buf)))
+        if buf:
+            servers[srv].sendall(buf)
+
+        def recvall(length):
+            pkt = list()
+            while length > 0:
+                pkt.append(servers[srv].recv(length))
+                if 0 == len(pkt[-1]):
+                    raise Exception('connection closed')
+                length -= len(pkt[-1])
+            return ''.join(pkt)
+
+        return recvall(struct.unpack('!Q', recvall(28)[20:])[0])
+    except:
         if srv in servers:
             sock = servers.pop(srv)
             sock.close()
-            return
-
-    if srv not in servers:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock = ssl.wrap_socket(sock)
-        sock.connect(srv)
-        servers[srv] = sock
-
-    servers[srv].sendall(hashlib.sha1(req).digest() +
-                         struct.pack('!Q', len(buf)))
-    if buf:
-        servers[srv].sendall(buf)
-
-    def recvall(length):
-        pkt = list()
-        while length > 0:
-            pkt.append(servers[srv].recv(length))
-            if 0 == len(pkt[-1]):
-                raise Exception('connection closed')
-            length -= len(pkt[-1])
-        return ''.join(pkt)
-
-    return recvall(struct.unpack('!Q', recvall(28)[20:])[0])
+        raise
 
 
 def loop(module, port, clients):
