@@ -12,7 +12,7 @@ import traceback
 
 
 def request(srv, req, buf=''):
-    servers = getattr(request, 'servers', dict())
+    servers = getattr(request, 'servers')
 
     try:
         if not req:
@@ -23,6 +23,7 @@ def request(srv, req, buf=''):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock = ssl.wrap_socket(sock)
             sock.connect(srv)
+            logging.info('connected{0}'.format(srv))
             servers[srv] = sock
 
         servers[srv].sendall(hashlib.sha1(req).digest() +
@@ -35,22 +36,23 @@ def request(srv, req, buf=''):
             while length > 0:
                 pkt.append(servers[srv].recv(length))
                 if 0 == len(pkt[-1]):
-                    raise Exception('connection closed')
+                    raise Exception('disconnected')
                 length -= len(pkt[-1])
             return ''.join(pkt)
 
         return recvall(struct.unpack('!Q', recvall(28)[20:])[0])
     except:
         if srv in servers:
-            sock = servers.pop(srv)
-            sock.close()
+            servers.pop(srv).close()
+            logging.info('disconnected{0}'.format(srv))
         raise
+
+request.servers = dict()
 
 
 def loop(module, port, clients):
-    callbacks = dict()
-    for m in dir(module):
-        callbacks[hashlib.sha1(m).digest()] = (getattr(module, m), m)
+    callbacks = dict([(hashlib.sha1(m).digest(), (getattr(module, m), m))
+                      for m in dir(module)])
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -186,8 +188,7 @@ def loop(module, port, clients):
                     addr2fd[conn['peer']] = fileno
                     name = 'on_accept' if conn['is_server'] else 'on_connect'
 
-                    logging.info('peer({0}) callback({1})'.format(
-                        conn['peer'], name))
+                    logging.info('{0}{1}'.format(name, conn['peer']))
 
                     out_msg_list = getattr(module, name)(conn['peer'])
 
@@ -195,16 +196,19 @@ def loop(module, port, clients):
                     raise Exception('unhandled event({0})'.format(event))
 
             except ssl.SSLError as e:
-                peer = conn['sock'].getpeername()
-                if ssl.SSL_ERROR_WANT_READ == e.errno:
-                    conn['ssl_error'] = select.EPOLLIN
-                    logging.debug('peer{0} ssl(want_read)'.format(peer))
-                elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
-                    conn['ssl_error'] = select.EPOLLOUT
-                    logging.debug('peer{0} ssl(want_write)'.format(peer))
+                if False == conn['handshake_done']:
+                    peer = conn['sock'].getpeername()
+                    if ssl.SSL_ERROR_WANT_READ == e.errno:
+                        conn['ssl_error'] = select.EPOLLIN
+                        logging.debug('peer{0} ssl(want_read)'.format(peer))
+                    elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                        conn['ssl_error'] = select.EPOLLOUT
+                        logging.debug('peer{0} ssl(want_write)'.format(peer))
+                    else:
+                        traceback.print_exc()
+                        exit(0)
                 else:
                     traceback.print_exc()
-                    logging.critical('peer{0} ssl({1})'.format(peer, e.errno))
                     exit(0)
             except Exception as e:
                 conn['close'] = str(e)
@@ -221,15 +225,15 @@ def loop(module, port, clients):
                         if conn['handshake_done']:
                             out_msg_list = getattr(module, 'on_reject')(
                                 conn['peer'])
-                            logging.info('peer({0}) callback({1})'.format(
-                                conn['peer'], 'on_reject'))
+                            logging.info('on_reject({0})'.format(
+                                conn['peer']))
                         stats['srv_disconnect'] += 1
                     else:
                         if conn['handshake_done']:
                             out_msg_list = getattr(module, 'on_disconnect')(
                                 conn['ip_port'])
-                            logging.info('peer({0}) callback({1})'.format(
-                                conn['ip_port'], 'on_disconnect'))
+                            logging.info('on_disconnect{0}'.format(
+                                conn['ip_port']))
                         stats['cli_disconnect'] += 1
                         clients.add((conn['ip_port'][0], conn['ip_port'][1]))
 
@@ -284,21 +288,11 @@ if '__main__' == __name__:
                       help='certificate file path', default='cert.pem')
     parser.add_option('--conf', dest='conf', type='string',
                       help='configuration option')
-    parser.add_option('--log', dest='log', type='string',
-                      help='logging level', default='info')
+    parser.add_option('--log', dest='log', type=int,
+                      help='logging level', default=logging.INFO)
     opt, args = parser.parse_args()
 
-    time.sleep(1)
-
-    logging.basicConfig(
-        format='%(asctime)s: %(message)s',
-        level={
-            'critical': logging.CRITICAL,
-            'error': logging.ERROR,
-            'warning': logging.WARNING,
-            'info': logging.INFO,
-            'debug': logging.DEBUG,
-            'notset': logging.NOTSET}[opt.log])
+    logging.basicConfig(format='%(asctime)s: %(message)s', level=opt.log)
 
     if not os.path.isfile(opt.cert):
         os.mknod(opt.cert)
