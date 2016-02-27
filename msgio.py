@@ -1,4 +1,5 @@
 import os
+import sys
 import ssl
 import time
 import copy
@@ -7,7 +8,6 @@ import select
 import struct
 import hashlib
 import logging
-import optparse
 import traceback
 
 
@@ -50,7 +50,7 @@ def request(srv, req, buf=''):
 request.servers = dict()
 
 
-def loop(module, port, clients):
+def loop(module, port, clients, certfile):
     callbacks = dict([(hashlib.sha1(m).digest(), (getattr(module, m), m))
                       for m in dir(module)])
 
@@ -101,7 +101,7 @@ def loop(module, port, clients):
                 stats['srv_accept'] += 1
                 s.setblocking(0)
                 s = ssl.wrap_socket(s,
-                                    certfile=opt.cert,
+                                    certfile=certfile,
                                     do_handshake_on_connect=False,
                                     server_side=True)
                 connections[s.fileno()] = dict(
@@ -277,39 +277,20 @@ def loop(module, port, clients):
 
 
 if '__main__' == __name__:
-    parser = optparse.OptionParser()
-    parser.add_option('--bind', dest='port', type='string',
-                      help='server:port tuple. skip to start the client')
-    parser.add_option('--servers', dest='servers', type='string',
-                      help='comma separated list of ip:port')
-    parser.add_option('--module', dest='module', type='string',
-                      help='module name')
-    parser.add_option('--cert', dest='cert', type='string',
-                      help='certificate file path', default='cert.pem')
-    parser.add_option('--conf', dest='conf', type='string',
-                      help='configuration option')
-    parser.add_option('--log', dest='log', type=int,
-                      help='logging level', default=logging.INFO)
-    opt, args = parser.parse_args()
+    module = __import__(
+        sys.argv[1],
+        fromlist='.'.join(sys.argv[1].split('.')[:-1]))
 
-    logging.basicConfig(format='%(asctime)s: %(message)s', level=opt.log)
+    conf = module.on_init()
 
-    if not os.path.isfile(opt.cert):
-        os.mknod(opt.cert)
+    certfile = conf.get('cert', 'cert.pem')
+    if not os.path.isfile(certfile):
+        os.mknod(certfile)
         os.system(
             'openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
-            ' -subj "/" -out {0} -keyout {0} 2> /dev/null'.format(opt.cert))
+            ' -subj "/" -out {0} -keyout {0} 2> /dev/null'.format(certfile))
 
-    servers = list()
-    if opt.servers:
-        servers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
-                          map(lambda x: x.split(':'),
-                              opt.servers.split(','))))
-    port = (socket.gethostbyname(opt.port.split(':')[0]),
-            int(opt.port.split(':')[1]))
-
-    module = __import__(
-        opt.module,
-        fromlist='.'.join(opt.module.split('.')[:-1]))
-    module.on_init(port, servers, opt.conf)
-    loop(module, port, servers)
+    loop(module,
+         conf.get('port', ('0.0.0.0', 1234)),
+         conf.get('peers', list()),
+         certfile)

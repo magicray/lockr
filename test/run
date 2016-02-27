@@ -3,5 +3,5 @@
 PEERS=localhost:$2,localhost:$3,localhost:$4,localhost:$5
 while true; do
     echo
-    python ~/git/lockr/msgio.py --module server --bind localhost:$1 --servers $PEERS
+    python ~/git/lockr/msgio.py server --port localhost:$1 --peers $PEERS
 done

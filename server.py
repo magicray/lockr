@@ -1,10 +1,12 @@
 import os
 import time
 import json
+import socket
 import struct
 import hashlib
 import sqlite3
 import logging
+import optparse
 import traceback
 
 
@@ -332,11 +334,34 @@ def scan(path, filenum, offset, checksum, callback=None):
             return result
 
 
-def on_init(port, servers, conf):
+def on_init():
+    parser = optparse.OptionParser()
+    parser.add_option('--port', dest='port', type='string',
+                      help='server:port tuple. skip to start the client')
+    parser.add_option('--peers', dest='peers', type='string',
+                      help='comma separated list of ip:port')
+    parser.add_option('--cert', dest='cert', type='string',
+                      help='certificate file path', default='cert.pem')
+    parser.add_option('--log', dest='log', type=int,
+                      help='logging level', default=logging.INFO)
+    opt, args = parser.parse_args()
+
+    logging.basicConfig(format='%(asctime)s: %(message)s', level=opt.log)
+
+    peers = list()
+    if opt.peers:
+        peers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
+                          map(lambda x: x.split(':'),
+                              opt.peers.split(','))))
+    port = (socket.gethostbyname(opt.port.split(':')[0]),
+            int(opt.port.split(':')[1]))
+
+    msgio_conf = dict(cert=opt.cert, port=port, peers=peers)
+
     if not os.path.isdir(g.data):
         os.mkdir(g.data)
 
-    g.peers = dict((ip_port, None) for ip_port in servers)
+    g.peers = dict((ip_port, None) for ip_port in peers)
     g.quorum = int(len(g.peers)/2.0 + 0.6)
     g.port = port
 
@@ -359,29 +384,29 @@ def on_init(port, servers, conf):
             assert(g.state['size'] >= g.state['offset'])
 
     files = sorted([int(f) for f in os.listdir(g.data)])
-    if not files:
-        return
+    if files:
+        if '' == g.state['checksum']:
+            with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
+                assert(0 == struct.unpack('!Q', fd.read(8))[0])
+                g.state['filenum'] = min(files)
+                g.state['checksum'] = fd.read(20).encode('hex')
+                g.state['offset'] = fd.tell()
+                assert(g.state['offset'] == 28)
 
-    if '' == g.state['checksum']:
-        with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
-            assert(0 == struct.unpack('!Q', fd.read(8))[0])
-            g.state['filenum'] = min(files)
-            g.state['checksum'] = fd.read(20).encode('hex')
-            g.state['offset'] = fd.tell()
-            assert(g.state['offset'] == 28)
+        g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+                            g.state['checksum'], index_put))
+        assert(max(files) == g.state['filenum'])
 
-    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
-                        g.state['checksum'], index_put))
-    assert(max(files) == g.state['filenum'])
+        f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
+        n = os.fstat(f).st_size
+        if n > g.state['offset']:
+            os.ftruncate(f, g.state['offset'])
+            logging.critical('file({0}) truncated({1}) original({2})'.format(
+                g.state['filenum'], g.state['offset'], n))
+            g.state['size'] = g.state['offset']
 
-    f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
-    n = os.fstat(f).st_size
-    if n > g.state['offset']:
-        os.ftruncate(f, g.state['offset'])
-        logging.critical('file({0}) truncated({1}) original({2})'.format(
-            g.state['filenum'], g.state['offset'], n))
-        g.state['size'] = g.state['offset']
+        os.fsync(f)
+        os.close(f)
+        g.sqlite.commit()
 
-    os.fsync(f)
-    os.close(f)
-    g.sqlite.commit()
+    return msgio_conf
