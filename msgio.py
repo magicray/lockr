@@ -211,6 +211,7 @@ def loop(module, port, clients, certfile):
                     traceback.print_exc()
                     exit(0)
             except Exception as e:
+                traceback.print_exc()
                 conn['close'] = str(e)
             finally:
                 if 'close' in conn:
