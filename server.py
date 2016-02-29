@@ -9,6 +9,8 @@ import logging
 import optparse
 import traceback
 
+from logging import critical as crit
+
 
 class g:
     port = None
@@ -21,14 +23,14 @@ class g:
     index = 'index'
     data = 'data'
     max_file_size = 256
-    state = dict(filenum=0, offset=0, checksum='', size=0)
+    state = dict(filenum=0, offset=0, checksum='', size=0, vclock=dict())
 
 
 def stats_request(src, buf):
     if g.leader and 'self' != g.leader and src in g.followers:
         g.followers.pop(src)
-        logging.critical(('disconnecting follower{0} as already '
-                          'following{1}').format(src, g.leader))
+        crit(('disconnecting follower{0} as already following{1}').format(
+            src, g.leader))
         raise Exception('kill-follower')
 
     return dict(msg='stats_response', buf=json.dumps(dict(
@@ -50,13 +52,13 @@ def stats_response(src, buf):
 
     if 'self' == g.peers[src]['leader']:
         g.leader = src
-        logging.critical('identified current leader{0}'.format(src))
+        crit('identified current leader{0}'.format(src))
     elif g.peers[src]['leader'] is None:
         for k, v in g.state['vclock'].iteritems():
             if g.peers[src]['vclock'].get(k, 0) > v:
                 os.remove(os.path.join(g.data, str(g.state['filenum'])))
-                logger.critical(('exiting after removing file({0}) as '
-                    'clock({1}) is ahead'.format(g.state['filenum'], src)))
+                crit(('exiting after removing file({0}) as clock({1}) '
+                      'is ahead'.format(g.state['filenum'], src)))
                 exit(0)
 
         leader = (g.port, g.state, 'self')
@@ -84,16 +86,14 @@ def stats_response(src, buf):
 
         if (src == leader[0]) and (count >= g.quorum):
             g.leader = src
-            logging.critical('leader({0}) selected due to {1}'.format(
-                src, leader[2]))
+            crit('leader({0}) selected due to {1}'.format(src, leader[2]))
 
     if g.leader:
         msgs.append(dict(msg='replication_request', buf=json.dumps(g.state)))
 
-        logging.critical('LEADER{0} identified'.format(src))
-        logging.critical(
-            'sent replication-request to{0} file({1}) offset({2})'.format(
-                src, g.state['filenum'], g.state['offset']))
+        crit('LEADER{0} identified'.format(src))
+        crit('sent replication-request to{0} file({1}) offset({2})'.format(
+            src, g.state['filenum'], g.state['offset']))
 
     return msgs
 
@@ -101,28 +101,25 @@ def stats_response(src, buf):
 def replication_request(src, buf):
     req = json.loads(buf)
 
-    logging.critical(
-        'received replication-request from{0} file({1}) offset({2})'.format(
-            src, req['filenum'], req['offset']))
+    crit('received replication-request from{0} file({1}) offset({2})'.format(
+        src, req['filenum'], req['offset']))
 
     if g.leader and 'self' != g.leader:
-        logging.critical(('rejecting replication-request from{0} as already '
-                          'following{1}').format(src, g.leader))
+        crit(('rejecting replication-request from{0} as already '
+              'following{1}').format(src, g.leader))
         raise Exception('reject-replication-request')
 
     g.followers[src] = req
-    logging.critical('accepted {0} as follower({1})'.format(
-        src, len(g.followers)))
+    crit('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
     if len(g.followers) == g.quorum:
         g.leader = 'self'
-        logging.critical('assuming LEADERSHIP as quorum reached({0})'.format(
-            g.quorum))
+        crit('assuming LEADERSHIP as quorum reached({0})'.format(g.quorum))
 
         msg = list()
         for src in g.followers:
             msg.append(dict(dst=src, msg='replication_retry'))
-            logging.critical('sent replication-retry to {0}'.format(src))
+            crit('sent replication-retry to {0}'.format(src))
 
         return msg
 
@@ -131,8 +128,8 @@ def replication_request(src, buf):
             fd.seek(0, 2)
 
             if fd.tell() < req['offset']:
-                logging.critical(('sent replication-truncate to {0} '
-                    ' file({1}) offset({2}) truncate({3})').format(
+                crit(('sent replication-truncate to {0} '
+                      ' file({1}) offset({2}) truncate({3})').format(
                     src, req['filenum'], req['offset'], fd.tell()))
 
                 return dict(msg='replication_truncate',
@@ -140,13 +137,13 @@ def replication_request(src, buf):
 
             elif fd.tell() == req['offset']:
                 if g.state['filenum'] > req['filenum']:
-                    logging.critical(('sent replication-nextfile to {0} '
-                        'file({1})').format(src, req['filenum']))
+                    crit(('sent replication-nextfile to {0} '
+                          'file({1})').format(src, req['filenum']))
 
                     return dict(msg='replication_nextfile')
                 else:
-                    logging.critical(('sent replication-retry to {0} '
-                        'file({1}) offset({2})').format(
+                    crit(('sent replication-retry to {0} '
+                          'file({1}) offset({2})').format(
                         src, req['filenum'], req['offset']))
 
                     return dict(msg='replication_retry')
@@ -154,8 +151,8 @@ def replication_request(src, buf):
                 with open(os.path.join(g.data, str(req['filenum']))) as fd:
                     fd.seek(req['offset'])
                     buf = fd.read(100*2**20)
-                    logging.critical(('sent replication-response to {0} '
-                        'file({1}) offset({2}) size({3})').format(
+                    crit(('sent replication-response to {0} '
+                          'file({1}) offset({2}) size({3})').format(
                         src, req['filenum'], req['offset'], len(buf)))
 
                     return dict(msg='replication_response', buf=buf)
@@ -164,7 +161,7 @@ def replication_request(src, buf):
 def replication_truncate(src, buf):
     req = json.loads(buf)
 
-    logging.critical('received replication-truncate from{0} size({1})'.format(
+    crit('received replication-truncate from{0} size({1})'.format(
         src, req['truncate']))
 
     f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
@@ -172,36 +169,34 @@ def replication_truncate(src, buf):
     os.ftruncate(f, req['truncate'])
     os.fsync(f)
 
-    logging.critical('file({0}) truncated({1}) original({2})'.format(
+    crit('file({0}) truncated({1}) original({2})'.format(
         g.state['filenum'], req['truncate'], n))
     exit(0)
 
 
 def replication_nextfile(src, buf):
-    logging.critical('received replication-nextfile from{0}'.format(src))
+    crit('received replication-nextfile from{0}'.format(src))
 
     g.state['filenum'] += 1
     g.state['offset'] = 0
 
-    logging.critical(
-        'sent replication-request to{0} file({1}) offset({2})'.format(
-            src, g.state['filenum'], g.state['offset']))
+    crit('sent replication-request to{0} file({1}) offset({2})'.format(
+        src, g.state['filenum'], g.state['offset']))
     return dict(msg='replication_request', buf=json.dumps(g.state))
 
 
 def replication_retry(src, buf):
-    logging.critical('received replication-retry from{0}'.format(src))
-    logging.critical(
-        'sent replication-request to{0} file({1}) offset({2})'.format(
-            src, g.state['filenum'], g.state['offset']))
+    crit('received replication-retry from{0}'.format(src))
+    crit('sent replication-request to{0} file({1}) offset({2})'.format(
+        src, g.state['filenum'], g.state['offset']))
     return dict(msg='replication_request', buf=json.dumps(g.state))
 
 
 def replication_response(src, buf):
     assert(src == g.leader)
 
-    logging.critical(('received replication-response from {0} '
-        'size({1})').format(src, len(buf)))
+    crit(('received replication-response from {0} size({1})').format(
+        src, len(buf)))
 
     try:
         f = os.open(os.path.join(g.data, str(g.filenum)),
@@ -218,9 +213,8 @@ def replication_response(src, buf):
                             g.state['checksum'], index_put))
         g.sqlite.commit()
 
-        logging.critical(
-            'sent replication-request to{0} file({1}) offset({2})'.format(
-                src, g.state['filenum'], g.state['offset']))
+        crit('sent replication-request to{0} file({1}) offset({2})'.format(
+            src, g.state['filenum'], g.state['offset']))
         return dict(msg='replication_request', buf=json.dumps(g.state))
     except:
         traceback.print_exc()
@@ -228,33 +222,34 @@ def replication_response(src, buf):
 
 
 def on_connect(src):
-    logging.critical('connected to {0}'.format(src))
+    crit('connected to {0}'.format(src))
     return dict(msg='stats_request')
 
 
-def on_disconnect(src):
+def on_disconnect(src, reason):
+    crit(reason)
     g.peers[src] = None
     if src == g.leader:
-        logging.critical('exiting as leader{0} disconnected'.format(src))
+        crit('exiting as leader{0} disconnected'.format(src))
         exit(0)
 
 
 def on_accept(src):
-    logging.critical('accepted connection from {0}'.format(src))
+    crit('accepted connection from {0}'.format(src))
 
 
-def on_reject(src):
-    logging.critical('terminated connection from {0}'.format(src))
+def on_reject(src, reason):
+    crit(reason)
+    crit('terminated connection from {0}'.format(src))
 
     if src in g.followers:
         g.followers.pop(src)
-        logging.critical('removed follower{0} remaining({1})'.format(
+        crit('removed follower{0} remaining({1})'.format(
             src, len(g.followers)))
 
         if len(g.followers) < g.quorum:
-            logging.critical(('relinquishing leadership as a followers({0}) < '
-                              'quorum({1})').format(
-                                  len(g.followers), g.quorum))
+            crit(('relinquishing leadership as a followers({0}) < '
+                  'quorum({1})').format(len(g.followers), g.quorum))
             exit(0)
 
 
@@ -297,7 +292,7 @@ def put(src, buf):
         assert(i == len(buf)), 'invalid put request'
 
         if g.state['offset'] > g.max_file_size:
-            logging.critical('exiting as max size reached({0} > {1})'.format(
+            crit('exiting as max size reached({0} > {1})'.format(
                 g.state['offset'], g.max_file_size))
             exit(0)
 
@@ -392,8 +387,8 @@ def scan(path, filenum, offset, checksum, callback=None):
                         size=total_size,
                         checksum=checksum.encode('hex')))
 
-                    logging.critical(('scanned file({filenum}) '
-                        'offset({offset}) size({size})').format(**result))
+                    crit(('scanned file({filenum}) offset({offset}) '
+                          'size({size})').format(**result))
 
             filenum += 1
             offset = 0
@@ -418,8 +413,8 @@ def on_init():
     peers = list()
     if opt.peers:
         peers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
-                          map(lambda x: x.split(':'),
-                              opt.peers.split(','))))
+                        map(lambda x: x.split(':'),
+                            opt.peers.split(','))))
     port = (socket.gethostbyname(opt.port.split(':')[0]),
             int(opt.port.split(':')[1]))
 
@@ -447,7 +442,8 @@ def on_init():
     g.sqlite.execute('''create table if not exists docs
         (key blob primary key, file int, offset int, length int)''')
 
-    files = sorted(map(int, filter(lambda x: x!='clock', os.listdir(g.data))))
+    files = sorted(map(int,
+                       filter(lambda x: x != 'clock', os.listdir(g.data))))
 
     max_file = 0
     max_offset = 0
@@ -494,7 +490,7 @@ def on_init():
         if n > g.state['offset']:
             os.ftruncate(f, g.state['offset'])
             os.fsync(f)
-            logging.critical('file({0}) truncated({1}) original({2})'.format(
+            crit('file({0}) truncated({1}) original({2})'.format(
                 g.state['filenum'], g.state['offset'], n))
             exit(0)
 
