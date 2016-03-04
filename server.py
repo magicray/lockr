@@ -109,10 +109,11 @@ def replication_request(src, buf):
               'following{1}').format(src, g.leader))
         raise Exception('reject-replication-request')
 
-    g.followers[src] = req
-    crit('accepted {0} as follower({1})'.format(src, len(g.followers)))
+    if src not in g.followers:
+        g.followers[src] = req
+        crit('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
-    if len(g.followers) == g.quorum:
+    if 'self' != g.leader and len(g.followers) == g.quorum:
         g.leader = 'self'
         crit('assuming LEADERSHIP as quorum reached({0})'.format(g.quorum))
 
@@ -124,6 +125,10 @@ def replication_request(src, buf):
         return msg
 
     if 'self' == g.leader:
+        if not os.path.isfile(os.path.join(g.data, str(req['filenum']))):
+            crit('sent replication-retry to {0} as no file'.format(src))
+            return dict(msg='replication_retry')
+
         with open(os.path.join(g.data, str(req['filenum']))) as fd:
             fd.seek(0, 2)
 
@@ -142,10 +147,6 @@ def replication_request(src, buf):
 
                     return dict(msg='replication_nextfile')
                 else:
-                    crit(('sent replication-retry to {0} '
-                          'file({1}) offset({2})').format(
-                        src, req['filenum'], req['offset']))
-
                     return dict(msg='replication_retry')
             else:
                 with open(os.path.join(g.data, str(req['filenum']))) as fd:
@@ -186,9 +187,6 @@ def replication_nextfile(src, buf):
 
 
 def replication_retry(src, buf):
-    crit('received replication-retry from{0}'.format(src))
-    crit('sent replication-request to{0} file({1}) offset({2})'.format(
-        src, g.state['filenum'], g.state['offset']))
     return dict(msg='replication_request', buf=json.dumps(g.state))
 
 
@@ -227,7 +225,7 @@ def on_connect(src):
 
 
 def on_disconnect(src, reason):
-    crit(reason)
+    # crit(reason)
     g.peers[src] = None
     if src == g.leader:
         crit('exiting as leader{0} disconnected'.format(src))
@@ -239,7 +237,7 @@ def on_accept(src):
 
 
 def on_reject(src, reason):
-    crit(reason)
+    # crit(reason)
     crit('terminated connection from {0}'.format(src))
 
     if src in g.followers:
