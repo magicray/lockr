@@ -19,7 +19,8 @@ class g:
     quorum = None
     leader = None
     session = None
-    write = False
+    role = None
+    clock = 0
     followers = dict()
     state = dict(filenum=0, offset=0, checksum='', clock=0, vclock=None)
     docs = dict()
@@ -53,11 +54,14 @@ def sync_response(src, buf):
         log('identified current leader{0}'.format(src))
     elif g.peers[src]['leader'] is None:
         if g.peers[src]['state']['filenum'] == g.state['filenum']:
-            if g.peers[src]['state']['vclock'] > g.state['vclock']:
-                os.remove(os.path.join(g.data, str(g.state['filenum'])))
-                log(('exiting after removing file({0}) as clock({1}) '
-                      'is ahead'.format(g.state['filenum'], src)))
-                exit(0)
+            peer_vclock = g.peers[src]['state']['vclock']
+            my_vclock = g.state['vclock']
+            for key in set(peer_vclock).intersection(set(my_vclock)):
+                if peer_vclock[key] > my_vclock[key]:
+                    os.remove(os.path.join(g.data, str(g.state['filenum'])))
+                    log(('exiting after removing file({0}) as vclock({1}) '
+                         'is ahead'.format(g.state['filenum'], src)))
+                    exit(0)
 
         leader = (g.port, g.state, 'self')
         count = 0
@@ -104,7 +108,7 @@ def replication_request(src, buf):
 
     if g.leader and 'self' != g.leader:
         log(('rejecting replication-request from{0} as already '
-              'following{1}').format(src, g.leader))
+             'following{1}').format(src, g.leader))
         raise Exception('reject-replication-request')
 
     g.followers[src] = req
@@ -136,16 +140,17 @@ def replication_request(src, buf):
             g.state['offset'] = 0
             g.session = g.state['filenum']
 
-            vclk = {g.port: g.state['clock']}
-            for k in g.peers:
-                vclk[k] = g.peers[k]['state']['clock'] if g.peers[k] else 0
-            vclk = json.dumps([vclk[k] for k in sorted(vclk.keys())])
+            vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): g.state['clock']}
+            for k in filter(lambda k: g.peers[k], g.peers):
+                vclk['{0}:{1}'.format(k[0], k[1])] = g.peers[k]['state'][
+                    'clock']
+            vclk = json.dumps(vclk)
 
             append(vclk)
             g.session = g.state['filenum']
             log('new leader SESSION({0}) VCLK{1}'.format(g.session, vclk))
 
-    if g.write is False and g.session:
+    if ('leader' == g.role) and g.session:
         assert(g.session == g.state['filenum'])
 
         count = 0
@@ -161,7 +166,7 @@ def replication_request(src, buf):
         if count >= g.quorum:
             log('quorum({0}) >= {1}) in sync with new session'.format(
                 count, g.quorum))
-            g.write = True
+            g.role = 'leader'
             log('write requests enabled')
 
     return send_replication_responses()
@@ -243,7 +248,7 @@ def replication_nextfile(src, buf):
 
     log('received replication-nextfile from{0}'.format(src))
 
-    g.state['filenum'] += 1
+    g.state['filenum'] = req['filenum']
     g.state['offset'] = 0
 
     log('sent replication-request to{0} file({1}) offset({2})'.format(
@@ -286,8 +291,7 @@ def on_connect(src):
 
 
 def on_disconnect(src, reason):
-    #log(reason)
-    #log(reason.split('\n')[-1])
+    # log(reason)
     g.peers[src] = None
     if src == g.leader:
         g.leader = None
@@ -299,8 +303,7 @@ def on_accept(src):
 
 
 def on_reject(src, reason):
-    #log(reason)
-    #log(reason.split('\n')[-1])
+    # log(reason)
     log('terminated connection from {0}'.format(src))
 
     if src in g.followers:
@@ -323,7 +326,7 @@ def state(src, buf):
     state['self'] = dict(
         state=g.state,
         leader=g.leader,
-        write=g.write,
+        role=g.role,
         stats=g.stats,
         timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))
 
@@ -439,7 +442,7 @@ def scan(path, filenum, offset, checksum, callback=None):
                         checksum=checksum.encode('hex')))
 
                     log(('scanned file({filenum}) offset({offset}) '
-                          'size({size})').format(**result))
+                         'size({size})').format(**result))
 
             filenum += 1
             offset = 0
@@ -478,12 +481,12 @@ def on_init():
 
     try:
         with open(os.path.join(g.data, 'clock')) as fd:
-            g.state['clock'] = int(fd.read()) + 1
+            g.state['clock'] = (int(fd.read()) + 1, g.clock)
     except:
-        g.state['clock'] = 1
+        g.state['clock'] = (1, g.clock)
     finally:
         with open(os.path.join(g.data, 'tmp'), 'w') as fd:
-            fd.write(str(g.state['clock']))
+            fd.write(str(g.state['clock'][0]))
         os.rename(os.path.join(g.data, 'tmp'), os.path.join(g.data, 'clock'))
         log('RESTARTING sequence({0})'.format(g.state['clock']))
 
