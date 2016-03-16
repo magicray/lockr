@@ -151,7 +151,7 @@ def replication_request(src, buf):
             g.session = g.state['filenum']
             log('new leader SESSION({0}) VCLK{1}'.format(g.session, vclk))
 
-    if g.session:
+    if not g.role and g.session:
         assert(g.session == g.state['filenum'])
 
         count = 0
