@@ -8,6 +8,8 @@ import hashlib
 import logging
 import optparse
 
+from logging import critical as log
+
 
 class Lockr(object):
     def __init__(self, servers, timeout=30):
@@ -24,22 +26,18 @@ class Lockr(object):
                         try:
                             t = time.time()
                             stats = json.loads(msgio.request(srv, 'state'))
-                            logging.critical(
-                                'connection to %s succeeded in %.03f msec' % (
+                            log('connection to %s succeeded in %.03f msec' % (
                                     srv, (time.time()-t)*1000))
-                            if 'self' == stats['self']['leader']:
+                            if 'leader' == stats['self']['role']:
                                 self.server = srv
-                                logging.critical(
-                                    'connected to leader {0}'.format(srv))
+                                log('connected to leader {0}'.format(srv))
                                 break
                         except:
-                            logging.critical(
-                                'connection to %s failed in %.03f msec' % (
+                            log('connection to %s failed in %.03f msec' % (
                                     srv, (time.time()-t)*1000))
 
                 result = msgio.request(self.server, req, buf)
-                logging.critical(
-                    'received response(%s) from %s in %0.3f msec' % (
+                log('received response(%s) from %s in %0.3f msec' % (
                         req, self.server, (time.time() - req_begin)*1000))
                 return result
             except:

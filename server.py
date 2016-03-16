@@ -33,6 +33,7 @@ def sync_request(src, buf):
             src, g.leader))
         raise Exception('kill-follower')
 
+    g.state['clock'][1] += 1
     return dict(msg='sync_response', buf=json.dumps(dict(
         state=g.state,
         leader=g.leader,
@@ -150,7 +151,7 @@ def replication_request(src, buf):
             g.session = g.state['filenum']
             log('new leader SESSION({0}) VCLK{1}'.format(g.session, vclk))
 
-    if ('leader' == g.role) and g.session:
+    if g.session:
         assert(g.session == g.state['filenum'])
 
         count = 0
@@ -167,7 +168,7 @@ def replication_request(src, buf):
             log('quorum({0}) >= {1}) in sync with new session'.format(
                 count, g.quorum))
             g.role = 'leader'
-            log('write requests enabled')
+            log('WRITE enabled')
 
     return send_replication_responses()
 
@@ -481,9 +482,9 @@ def on_init():
 
     try:
         with open(os.path.join(g.data, 'clock')) as fd:
-            g.state['clock'] = (int(fd.read()) + 1, g.clock)
+            g.state['clock'] = [int(fd.read()) + 1, g.clock]
     except:
-        g.state['clock'] = (1, g.clock)
+        g.state['clock'] = [1, g.clock]
     finally:
         with open(os.path.join(g.data, 'tmp'), 'w') as fd:
             fd.write(str(g.state['clock'][0]))
