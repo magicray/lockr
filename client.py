@@ -4,7 +4,6 @@ import json
 import msgio
 import shlex
 import struct
-import hashlib
 import logging
 import optparse
 
@@ -27,18 +26,18 @@ class Lockr(object):
                             t = time.time()
                             stats = json.loads(msgio.request(srv, 'state'))
                             log('connection to %s succeeded in %.03f msec' % (
-                                    srv, (time.time()-t)*1000))
+                                srv, (time.time()-t)*1000))
                             if 'leader' == stats['self']['role']:
                                 self.server = srv
                                 log('connected to leader {0}'.format(srv))
                                 break
                         except:
                             log('connection to %s failed in %.03f msec' % (
-                                    srv, (time.time()-t)*1000))
+                                srv, (time.time()-t)*1000))
 
                 result = msgio.request(self.server, req, buf)
                 log('received response(%s) from %s in %0.3f msec' % (
-                        req, self.server, (time.time() - req_begin)*1000))
+                    req, self.server, (time.time() - req_begin)*1000))
                 return result
             except:
                 time.sleep(1)
@@ -54,7 +53,8 @@ class Lockr(object):
         for k, v in docs.iteritems():
             ver = '0-0' if (v[0] is '-' or v[0] is None) else v[0]
 
-            items.append(hashlib.sha256(k).digest())
+            items.append(struct.pack('!Q', len(k)))
+            items.append(k)
             items.append(struct.pack('!Q', int(ver.split('-')[0])))
             items.append(struct.pack('!Q', int(ver.split('-')[1])))
             items.append(struct.pack('!Q', len(v[1])))
@@ -64,25 +64,26 @@ class Lockr(object):
         return struct.unpack('!B', result[0])[0], result[1:]
 
     def get(self, keys):
-        items = list()
-        hashdict = dict()
+        buf = list()
         for key in keys:
-            h = hashlib.sha256(key).digest()
-            items.append(h)
-            hashdict[h] = key
+            buf.append(struct.pack('!Q', len(key)))
+            buf.append(key)
 
-        buf = self.request('get', ''.join(items))
+        buf = self.request('get', ''.join(buf))
 
         i = 0
         docs = dict()
         while i < len(buf):
-            k = hashdict[buf[i:i+32]]
-            f = struct.unpack('!Q', buf[i+32:i+40])[0]
-            o = struct.unpack('!Q', buf[i+40:i+48])[0]
-            l = struct.unpack('!Q', buf[i+48:i+56])[0]
-            docs[k] = ('{0}-{1}'.format(f, o), buf[i+56:i+56+l])
+            key_len = struct.unpack('!Q', buf[i:i+8])[0]
+            key = buf[i+8:i+8+key_len]
+            f = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
+            o = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
+            value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
+            value = buf[i+32+key_len:i+32+key_len+value_len]
 
-            i += 56 + l
+            docs[key] = ('{0}-{1}'.format(f, o), value)
+
+            i += 32 + key_len + value_len
 
         return docs
 

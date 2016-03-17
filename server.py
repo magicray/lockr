@@ -304,7 +304,7 @@ def on_accept(src):
 
 
 def on_reject(src, reason):
-    # log(reason)
+    log(reason)
     log('terminated connection from {0}'.format(src))
 
     if src in g.followers:
@@ -339,19 +339,22 @@ def put(src, buf):
         i = 0
         buf_list = list()
         while i < len(buf):
-            key = buf[i:i+32]
-            filenum = struct.unpack('!Q', buf[i+32:i+40])[0]
-            offset = struct.unpack('!Q', buf[i+40:i+48])[0]
-            length = struct.unpack('!Q', buf[i+48:i+56])[0]
+            key_len = struct.unpack('!Q', buf[i:i+8])[0]
+            key = buf[i+8:i+8+key_len]
+            filenum = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
+            offset = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
+            value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
+            value = buf[i+32+key_len:i+32+key_len+value_len]
 
-            f, o, l = g.docs.get(key, (0, 0, 0))
+            f, o, v = g.docs.get(key, (0, 0, ''))
             assert((f == filenum) and (o == offset)), 'version mismatch'
 
+            buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
-            buf_list.append(struct.pack('!Q', length))
-            buf_list.append(buf[i+56:i+56+length])
+            buf_list.append(struct.pack('!Q', value_len))
+            buf_list.append(value)
 
-            i += 56 + length
+            i += 32 + key_len + value_len
 
         assert(i == len(buf)), 'invalid put request'
 
@@ -361,7 +364,10 @@ def put(src, buf):
             exit(0)
 
         append(''.join(buf_list))
-        return dict(buf=struct.pack('!B', 0) + 'ok')
+
+        responses = send_replication_responses()
+        responses.append(dict(buf=struct.pack('!B', 0) + 'ok'))
+        return responses
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
 
@@ -381,23 +387,24 @@ def get(src, buf):
     i = 0
     result = list()
     while i < len(buf):
-        key = buf[i:i+32]
-        f, o, l = g.docs.get(key, (0, 0, 0))
+        key_len = struct.unpack('!Q', buf[i:i+8])[0]
+        key = buf[i+8:i+8+key_len]
+        f, o, v = g.docs.get(key, (0, 0, ''))
+
+        result.append(struct.pack('!Q', key_len))
         result.append(key)
         result.append(struct.pack('!Q', f))
         result.append(struct.pack('!Q', o))
-        result.append(struct.pack('!Q', l))
-        if l > 0:
-            with open(os.path.join(g.data, str(f)), 'rb') as fd:
-                fd.seek(o)
-                result.append(fd.read(l))
-        i += 32
+        result.append(struct.pack('!Q', len(v)))
+        result.append(v)
+
+        i += 8 + key_len
 
     return dict(buf=''.join(result))
 
 
-def index_put(key, filenum, offset, length):
-    g.docs[key] = (filenum, offset, length)
+def index_put(key, filenum, offset, value):
+    g.docs[key] = (filenum, offset, value)
 
 
 def scan(path, filenum, offset, checksum, callback=None):
@@ -422,13 +429,18 @@ def scan(path, filenum, offset, checksum, callback=None):
                     if offset > 0:
                         i = 0
                         while i < len(x):
-                            key = x[i:i+32]
-                            length = struct.unpack('!Q', x[i+32:i+40])[0]
-                            ofst = offset+8+i+40
-                            i += 40 + length
+                            key_len = struct.unpack('!Q', x[i:i+8])[0]
+                            key = x[i+8:i+8+key_len]
+                            value_len = struct.unpack(
+                                '!Q',
+                                x[i+8+key_len:i+16+key_len])[0]
+                            value = x[i+16+key_len:i+16+key_len+value_len]
+
+                            ofst = offset+i+16+key_len
+                            i += 16 + key_len + value_len
 
                             if callback:
-                                callback(key, filenum, ofst, length)
+                                callback(key, filenum, ofst, value)
                     else:
                         result['vclock'] = json.loads(x)
 
