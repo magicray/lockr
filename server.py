@@ -7,13 +7,13 @@ import hashlib
 import logging
 import optparse
 import traceback
+import collections
 
 from logging import critical as log
 
 
 class g:
-    max_file_size = 256
-    data = 'data'
+    acks = collections.deque()
     port = None
     peers = None
     quorum = None
@@ -59,7 +59,7 @@ def sync_response(src, buf):
             my_vclock = g.state['vclock']
             for key in set(peer_vclock).intersection(set(my_vclock)):
                 if peer_vclock[key] > my_vclock[key]:
-                    os.remove(os.path.join(g.data, str(g.state['filenum'])))
+                    os.remove(os.path.join(opt.data, str(g.state['filenum'])))
                     log(('exiting after removing file({0}) as vclock({1}) '
                          'is ahead'.format(g.state['filenum'], src)))
                     exit(0)
@@ -170,16 +170,32 @@ def replication_request(src, buf):
             g.role = 'leader'
             log('WRITE enabled')
 
-    return send_replication_responses()
+    responses = list()
+    offsets = list()
+    for k, v in g.peers.iteritems():
+        if v and v['state']['filenum'] == g.state['filenum']:
+            offsets.append(v['state']['offset'])
+
+    if len(offsets) >= g.quorum:
+        committed_offset = sorted(offsets, reverse=True)[g.quorum-1]
+
+        while g.acks:
+            if g.acks[0][0] > committed_offset:
+                break
+
+            ack = g.acks.popleft()
+            responses.append(ack[1])
+
+    return responses + get_replication_responses()
 
 
-def send_replication_responses():
+def get_replication_responses():
     msgs = list()
     for src in filter(lambda k: g.followers[k], g.followers.keys()):
         req = g.followers[src]
 
         if 0 == req['filenum']:
-            f = map(int, filter(lambda x: x != 'clock', os.listdir(g.data)))
+            f = map(int, filter(lambda x: x != 'clock', os.listdir(opt.data)))
             if f:
                 log('sent replication-nextfile to {0} file({1})'.format(
                     src, min(f)))
@@ -188,10 +204,10 @@ def send_replication_responses():
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                                  buf=json.dumps(dict(filenum=min(f)))))
 
-        if not os.path.isfile(os.path.join(g.data, str(req['filenum']))):
+        if not os.path.isfile(os.path.join(opt.data, str(req['filenum']))):
             continue
 
-        with open(os.path.join(g.data, str(req['filenum']))) as fd:
+        with open(os.path.join(opt.data, str(req['filenum']))) as fd:
             fd.seek(0, 2)
 
             if fd.tell() < req['offset']:
@@ -233,7 +249,7 @@ def replication_truncate(src, buf):
     log('received replication-truncate from{0} size({1})'.format(
         src, req['truncate']))
 
-    f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
+    f = os.open(os.path.join(opt.data, str(g.state['filenum'])), os.O_RDWR)
     n = os.fstat(f).st_size
     os.ftruncate(f, req['truncate'])
     os.fsync(f)
@@ -265,7 +281,7 @@ def replication_response(src, buf):
     assert(len(buf) > 0)
 
     try:
-        f = os.open(os.path.join(g.data, str(g.state['filenum'])),
+        f = os.open(os.path.join(opt.data, str(g.state['filenum'])),
                     os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
         assert(g.state['offset'] == os.fstat(f).st_size)
@@ -275,7 +291,7 @@ def replication_response(src, buf):
         os.fsync(f)
         os.close(f)
 
-        g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+        g.state.update(scan(opt.data, g.state['filenum'], g.state['offset'],
                             g.state['checksum'], index_put))
 
         log('sent replication-request to{0} file({1}) offset({2})'.format(
@@ -304,7 +320,7 @@ def on_accept(src):
 
 
 def on_reject(src, reason):
-    log(reason)
+    # log(reason)
     log('terminated connection from {0}'.format(src))
 
     if src in g.followers:
@@ -358,16 +374,20 @@ def put(src, buf):
 
         assert(i == len(buf)), 'invalid put request'
 
-        if g.state['offset'] > g.max_file_size:
+        if g.state['offset'] > opt.max:
             log('exiting as max size reached({0} > {1})'.format(
-                g.state['offset'], g.max_file_size))
+                g.state['offset'], opt.max))
             exit(0)
 
         append(''.join(buf_list))
 
-        responses = send_replication_responses()
-        responses.append(dict(buf=struct.pack('!B', 0) + 'ok'))
-        return responses
+        ack = dict(dst=src, buf=struct.pack('!B', 0) + 'ok')
+        responses = get_replication_responses()
+        if responses:
+            g.acks.append((g.state['offset'], ack))
+            return responses
+        else:
+            return ack
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
 
@@ -376,10 +396,10 @@ def append(buf):
     chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
     chksum.update(buf)
 
-    with open(os.path.join(g.data, str(g.state['filenum'])), 'ab', 0) as fd:
+    with open(os.path.join(opt.data, str(g.state['filenum'])), 'ab', 0) as fd:
         fd.write(struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
-    g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+    g.state.update(scan(opt.data, g.state['filenum'], g.state['offset'],
                         g.state['checksum'], index_put))
 
 
@@ -464,11 +484,17 @@ def scan(path, filenum, offset, checksum, callback=None):
 
 
 def on_init():
+    global opt
+
     parser = optparse.OptionParser()
     parser.add_option('--port', dest='port', type='string',
                       help='server:port tuple. skip to start the client')
     parser.add_option('--peers', dest='peers', type='string',
                       help='comma separated list of ip:port')
+    parser.add_option('--data', dest='data', type='string',
+                      help='data directory', default='data')
+    parser.add_option('--max', dest='max', type='int',
+                      help='max file size', default='256')
     parser.add_option('--cert', dest='cert', type='string',
                       help='certificate file path', default='cert.pem')
     parser.add_option('--log', dest='log', type=int,
@@ -489,23 +515,24 @@ def on_init():
     g.quorum = int(len(g.peers)/2.0 + 0.6)
     g.state['vclock'] = [0]*(len(peers)+1)
 
-    if not os.path.isdir(g.data):
-        os.mkdir(g.data)
+    if not os.path.isdir(opt.data):
+        os.mkdir(opt.data)
 
     try:
-        with open(os.path.join(g.data, 'clock')) as fd:
+        with open(os.path.join(opt.data, 'clock')) as fd:
             g.state['clock'] = [int(fd.read()) + 1, g.clock]
     except:
         g.state['clock'] = [1, g.clock]
     finally:
-        with open(os.path.join(g.data, 'tmp'), 'w') as fd:
+        with open(os.path.join(opt.data, 'tmp'), 'w') as fd:
             fd.write(str(g.state['clock'][0]))
-        os.rename(os.path.join(g.data, 'tmp'), os.path.join(g.data, 'clock'))
+        os.rename(os.path.join(opt.data, 'tmp'),
+                  os.path.join(opt.data, 'clock'))
         log('RESTARTING sequence({0})'.format(g.state['clock']))
 
-    files = map(int, filter(lambda x: x != 'clock', os.listdir(g.data)))
+    files = map(int, filter(lambda x: x != 'clock', os.listdir(opt.data)))
     if files:
-        with open(os.path.join(g.data, str(min(files))), 'rb') as fd:
+        with open(os.path.join(opt.data, str(min(files))), 'rb') as fd:
             vclklen = struct.unpack('!Q', fd.read(8))[0]
             g.state['filenum'] = min(files)
             g.state['vclock'] = json.loads(fd.read(vclklen))
@@ -513,11 +540,11 @@ def on_init():
             g.state['offset'] = fd.tell()
             assert(g.state['offset'] == vclklen + 28)
 
-        g.state.update(scan(g.data, g.state['filenum'], g.state['offset'],
+        g.state.update(scan(opt.data, g.state['filenum'], g.state['offset'],
                             g.state['checksum'], index_put))
         assert(g.state['filenum'] == max(files))
 
-        f = os.open(os.path.join(g.data, str(g.state['filenum'])), os.O_RDWR)
+        f = os.open(os.path.join(opt.data, str(g.state['filenum'])), os.O_RDWR)
         n = os.fstat(f).st_size
         if n > g.state['offset']:
             os.ftruncate(f, g.state['offset'])
