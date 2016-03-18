@@ -12,8 +12,13 @@ import collections
 from logging import critical as log
 
 
-class g:
+class d:
+    committed = dict()
+    current = dict()
     acks = collections.deque()
+
+
+class g:
     port = None
     peers = None
     quorum = None
@@ -23,7 +28,6 @@ class g:
     clock = 0
     followers = dict()
     state = dict(filenum=0, offset=0, checksum='', clock=0, vclock=None)
-    docs = dict()
     stats = None
 
 
@@ -113,6 +117,7 @@ def replication_request(src, buf):
         raise Exception('reject-replication-request')
 
     g.followers[src] = req
+    g.peers.setdefault(src, dict())['state'] = req
     log('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
     if 'self' != g.leader and len(g.followers) == g.quorum:
@@ -170,20 +175,20 @@ def replication_request(src, buf):
             g.role = 'leader'
             log('WRITE enabled')
 
-    responses = list()
     offsets = list()
     for k, v in g.peers.iteritems():
         if v and v['state']['filenum'] == g.state['filenum']:
             offsets.append(v['state']['offset'])
 
+    responses = list()
     if len(offsets) >= g.quorum:
         committed_offset = sorted(offsets, reverse=True)[g.quorum-1]
 
-        while g.acks:
-            if g.acks[0][0] > committed_offset:
+        while d.acks:
+            if d.acks[0][0] > committed_offset:
                 break
 
-            ack = g.acks.popleft()
+            ack = d.acks.popleft()
             responses.append(ack[1])
 
     return responses + get_replication_responses()
@@ -312,6 +317,7 @@ def on_disconnect(src, reason):
     g.peers[src] = None
     if src == g.leader:
         g.leader = None
+        g.session = None
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -362,7 +368,7 @@ def put(src, buf):
             value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
             value = buf[i+32+key_len:i+32+key_len+value_len]
 
-            f, o, v = g.docs.get(key, (0, 0, ''))
+            f, o, v = d.committed.get(key, d.current.get(key, (0, 0, '')))
             assert((f == filenum) and (o == offset)), 'version mismatch'
 
             buf_list.append(struct.pack('!Q', key_len))
@@ -384,7 +390,7 @@ def put(src, buf):
         ack = dict(dst=src, buf=struct.pack('!B', 0) + 'ok')
         responses = get_replication_responses()
         if responses:
-            g.acks.append((g.state['offset'], ack))
+            d.acks.append((g.state['offset'], ack))
             return responses
         else:
             return ack
@@ -409,7 +415,7 @@ def get(src, buf):
     while i < len(buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
-        f, o, v = g.docs.get(key, (0, 0, ''))
+        f, o, v = d.committed.get(key, (0, 0, ''))
 
         result.append(struct.pack('!Q', key_len))
         result.append(key)
@@ -424,7 +430,7 @@ def get(src, buf):
 
 
 def index_put(key, filenum, offset, value):
-    g.docs[key] = (filenum, offset, value)
+    d.committed[key] = (filenum, offset, value)
 
 
 def scan(path, filenum, offset, checksum, callback=None):
