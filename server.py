@@ -17,12 +17,10 @@ class g:
     kv_tmp = dict()
     acks = collections.deque()
     port = None
-    peers = None
+    peers = dict()
     followers = dict()
-    quorum = None
-    leader = None
-    session = None
-    role = None
+    quorum = 0
+    state = ''
     reboot = 0
     seq = 0
     filenum = 0
@@ -32,32 +30,27 @@ class g:
     stats = None
 
     @classmethod
-    def state(cls):
+    def json(cls):
         g.seq += 1
         return json.dumps(dict(
-            role=g.role,
+            state=g.state,
             port=g.port,
             filenum=g.filenum,
             offset=g.offset,
-            leader=g.leader,
             reboot=g.reboot,
             seq=g.seq,
             peers=dict([('{0}:{1}'.format(k[0], k[1]), dict(
                 reboot=v['reboot'],
                 seq=v['seq'],
                 filenum=v['filenum'],
-                offset=v['offset']
+                offset=v['offset'],
+                state=v['state']
                 )) for k,v in g.peers.iteritems() if v]),
             vclock=g.vclock))
 
 
 def sync_request(src, buf):
-    if g.leader and 'self' != g.leader and src in g.followers:
-        log(('disconnecting follower{0} as already following{1}').format(
-            src, g.leader))
-        raise Exception('kill-follower')
-
-    return dict(msg='sync_response', buf=g.state())
+    return dict(msg='sync_response', buf=g.json())
 
 
 def sync_response(src, buf):
@@ -66,32 +59,34 @@ def sync_response(src, buf):
 
     msgs = [dict(msg='sync_request')]
 
-    if g.leader:
-        if not g.role and g.session:
-            assert(g.session == g.filenum)
+    if 'new-sync' == g.state:
+        count = 0
+        for k in filter(lambda k: g.peers[k], g.peers.keys()):
+            if g.filenum != g.peers[k]['filenum']:
+                continue
 
-            count = 0
-            for k in filter(lambda k: g.peers[k], g.peers.keys()):
-                if g.filenum != g.peers[k]['filenum']:
-                    continue
+            if g.offset != g.peers[k]['offset']:
+                continue
 
-                if g.offset != g.peers[k]['offset']:
-                    continue
+            count += 1
 
-                count += 1
+        if count >= g.quorum:
+            log('quorum({0}) >= {1}) in sync with new session'.format(
+                count, g.quorum))
 
-            if count >= g.quorum:
-                log('quorum({0}) >= {1}) in sync with new session'.format(
-                    count, g.quorum))
-                g.role = 'leader'
-                log('WRITE enabled')
+            g.state = 'leader'
+            log('WRITE enabled')
 
         return msgs
 
-    if 'self' == g.peers[src]['leader']:
-        g.leader = src
+
+    if type(g.state) is tuple:
+        return msgs
+
+    if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
+        g.state = src
         log('identified current leader{0}'.format(src))
-    elif g.peers[src]['leader'] is None:
+    elif not g.peers[src]['state']:
         if g.peers[src]['filenum'] == g.filenum:
             peer_vclock = g.peers[src]['vclock']
             for key in set(peer_vclock).intersection(set(g.vclock)):
@@ -125,11 +120,11 @@ def sync_response(src, buf):
                         k[0], k[1], leader[0][0], leader[0][1]))
 
         if (src == leader[0]) and (count >= g.quorum):
-            g.leader = src
+            g.state = src
             log('leader({0}) selected due to {1}'.format(src, leader[2]))
 
-    if g.leader:
-        msgs.append(dict(msg='replication_request', buf=g.state()))
+    if type(g.state) is tuple:
+        msgs.append(dict(msg='replication_request', buf=g.json()))
 
         log('LEADER{0} identified'.format(src))
         log('sent replication-request to{0} file({1}) offset({2})'.format(
@@ -144,24 +139,23 @@ def replication_request(src, buf):
     log('received replication-request from{0} file({1}) offset({2})'.format(
         src, req['filenum'], req['offset']))
 
-    if g.leader and 'self' != g.leader:
-        log(('rejecting replication-request from{0} as already '
-             'following{1}').format(src, g.leader))
+    if type(g.state) is tuple:
+        log('rejecting replication-request from{0} as following'.format(
+            src, g.state))
         raise Exception('reject-replication-request')
+
+    if src not in g.followers:
+        log('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
     g.followers[src] = req
     if tuple(req['port']) in g.peers:
         g.peers[tuple(req['port'])] = req
-    log('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
-    if 'self' != g.leader and len(g.followers) == g.quorum:
-        g.leader = 'self'
+    if not g.state and len(g.followers) == g.quorum:
+        g.state = 'old-sync'
         log('assuming LEADERSHIP as quorum reached({0})'.format(g.quorum))
 
-    if 'self' != g.leader:
-        return
-
-    if not g.session:
+    if 'old-sync' == g.state:
         count = 0
         for src in filter(lambda k: g.followers[k], g.followers.keys()):
             if g.filenum != g.followers[src]['filenum']:
@@ -178,7 +172,6 @@ def replication_request(src, buf):
 
             g.filenum += 1
             g.offset = 0
-            g.session = g.filenum
 
             vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): (g.reboot, g.seq)}
             for k in filter(lambda k: g.peers[k], g.peers):
@@ -187,24 +180,25 @@ def replication_request(src, buf):
             vclk = json.dumps(vclk)
 
             append(vclk)
-            g.session = g.filenum
-            log('new leader SESSION({0}) VCLK{1}'.format(g.session, vclk))
-
-    offsets = list()
-    for k, v in g.peers.iteritems():
-        if v and v['filenum'] == g.filenum:
-            offsets.append(v['offset'])
+            g.state = 'new-sync'
+            log('new leader SESSION({0}) VCLK{1}'.format(g.filenum, vclk))
 
     responses = list()
-    if len(offsets) >= g.quorum:
-        committed_offset = sorted(offsets, reverse=True)[g.quorum-1]
+    if 'leader' == g.state:
+        offsets = list()
+        for k, v in g.peers.iteritems():
+            if v and v['filenum'] == g.filenum:
+                offsets.append(v['offset'])
 
-        while g.acks:
-            if g.acks[0][0] > committed_offset:
-                break
+        if len(offsets) >= g.quorum:
+            committed_offset = sorted(offsets, reverse=True)[g.quorum-1]
 
-            ack = g.acks.popleft()
-            responses.append(ack[1])
+            while g.acks:
+                if g.acks[0][0] > committed_offset:
+                    break
+
+                ack = g.acks.popleft()
+                responses.append(ack[1])
 
     return responses + get_replication_responses()
 
@@ -290,14 +284,14 @@ def replication_nextfile(src, buf):
 
     log('sent replication-request to{0} file({1}) offset({2})'.format(
         src, g.filenum, g.offset))
-    return dict(msg='replication_request', buf=g.state())
+    return dict(msg='replication_request', buf=g.json())
 
 
 def replication_response(src, buf):
     log(('received replication-response from {0} size({1})').format(
         src, len(buf)))
 
-    assert(src == g.leader)
+    assert(src == g.state)
     assert(len(buf) > 0)
 
     try:
@@ -316,7 +310,7 @@ def replication_response(src, buf):
 
         log('sent replication-request to{0} file({1}) offset({2})'.format(
             src, g.filenum, g.offset))
-        return dict(msg='replication_request', buf=g.state())
+        return dict(msg='replication_request', buf=g.json())
     except:
         traceback.print_exc()
         os._exit(0)
@@ -332,10 +326,9 @@ def on_disconnect(src, exc, tb):
         log(tb)
 
     g.peers[src] = None
-    if src == g.leader:
-        g.leader = None
-        g.session = None
-        g.role = None
+    if src == g.state:
+        g.state = None
+        g.followers = dict()
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -353,10 +346,11 @@ def on_reject(src, exc, tb):
         g.followers.pop(src)
         log('removed follower{0} remaining({1})'.format(src, len(g.followers)))
 
-    if ('self' == g.leader) and (len(g.followers) < g.quorum):
-        log('relinquishing leadership as followers({0}) < quorum({1})'.format(
-            len(g.followers), g.quorum))
-        os._exit(0)
+    if g.state in ('old-sync', 'new-sync', 'leader'):
+        if len(g.followers) < g.quorum:
+            log('exiting as followers({0}) < quorum({1})'.format(
+                len(g.followers), g.quorum))
+            os._exit(0)
 
 
 def on_stats(stats):
@@ -364,7 +358,7 @@ def on_stats(stats):
 
 
 def state(src, buf):
-    return dict(buf=g.state())
+    return dict(buf=g.json())
 
 
 def put(src, buf):
