@@ -211,9 +211,10 @@ def loop(module, port, clients, certfile):
                     traceback.print_exc()
                     exit(0)
             except Exception as e:
-                conn['close'] = traceback.format_exc()
+                conn['close'] = (e, traceback.format_exc())
             finally:
                 if 'close' in conn:
+                    exc, tb = conn['close']
                     conn = connections.pop(fileno)
 
                     conn['sock'].close()
@@ -224,14 +225,14 @@ def loop(module, port, clients, certfile):
                     if conn['is_server']:
                         if conn['handshake_done']:
                             out_msg_list = getattr(module, 'on_reject')(
-                                conn['peer'], conn['close'])
+                                conn['peer'], exc, tb)
                             logging.info('on_reject({0})'.format(
                                 conn['peer']))
                         stats['srv_disconnect'] += 1
                     else:
                         if conn['handshake_done']:
                             out_msg_list = getattr(module, 'on_disconnect')(
-                                conn['ip_port'], conn['close'])
+                                conn['ip_port'], exc, tb)
                             logging.info('on_disconnect{0}'.format(
                                 conn['ip_port']))
                         stats['cli_disconnect'] += 1

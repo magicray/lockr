@@ -27,7 +27,7 @@ class g:
     role = None
     clock = 0
     followers = dict()
-    state = dict(filenum=0, offset=0, checksum='', clock=0, vclock=None)
+    state = dict(port=None, filenum=0, offset=0, checksum='', clock=0, vclock=None)
     stats = None
 
 
@@ -52,6 +52,25 @@ def sync_response(src, buf):
     msgs = [dict(msg='sync_request')]
 
     if g.leader:
+        if not g.role and g.session:
+            assert(g.session == g.state['filenum'])
+
+            count = 0
+            for k in filter(lambda k: g.peers[k], g.peers.keys()):
+                if g.state['filenum'] != g.peers[k]['state']['filenum']:
+                    continue
+
+                if g.state['offset'] != g.peers[k]['state']['offset']:
+                    continue
+
+                count += 1
+
+            if count >= g.quorum:
+                log('quorum({0}) >= {1}) in sync with new session'.format(
+                    count, g.quorum))
+                g.role = 'leader'
+                log('WRITE enabled')
+
         return msgs
 
     if 'self' == g.peers[src]['leader']:
@@ -66,7 +85,7 @@ def sync_response(src, buf):
                     os.remove(os.path.join(opt.data, str(g.state['filenum'])))
                     log(('exiting after removing file({0}) as vclock({1}) '
                          'is ahead'.format(g.state['filenum'], src)))
-                    exit(0)
+                    os._exit(0)
 
         leader = (g.port, g.state, 'self')
         count = 0
@@ -117,7 +136,8 @@ def replication_request(src, buf):
         raise Exception('reject-replication-request')
 
     g.followers[src] = req
-    g.peers.setdefault(src, dict())['state'] = req
+    if tuple(req['port']) in g.peers:
+        g.peers[tuple(req['port'])]['state'] = req
     log('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
     if 'self' != g.leader and len(g.followers) == g.quorum:
@@ -155,25 +175,6 @@ def replication_request(src, buf):
             append(vclk)
             g.session = g.state['filenum']
             log('new leader SESSION({0}) VCLK{1}'.format(g.session, vclk))
-
-    if not g.role and g.session:
-        assert(g.session == g.state['filenum'])
-
-        count = 0
-        for k in filter(lambda k: g.peers[k], g.peers.keys()):
-            if g.state['filenum'] != g.peers[k]['state']['filenum']:
-                continue
-
-            if g.state['offset'] != g.peers[k]['state']['offset']:
-                continue
-
-            count += 1
-
-        if count >= g.quorum:
-            log('quorum({0}) >= {1}) in sync with new session'.format(
-                count, g.quorum))
-            g.role = 'leader'
-            log('WRITE enabled')
 
     offsets = list()
     for k, v in g.peers.iteritems():
@@ -262,7 +263,7 @@ def replication_truncate(src, buf):
 
     log('file({0}) truncated({1}) original({2})'.format(
         g.state['filenum'], req['truncate'], n))
-    exit(0)
+    os._exit(0)
 
 
 def replication_nextfile(src, buf):
@@ -304,7 +305,7 @@ def replication_response(src, buf):
         return dict(msg='replication_request', buf=json.dumps(g.state))
     except:
         traceback.print_exc()
-        exit(0)
+        os._exit(0)
 
 
 def on_connect(src):
@@ -312,8 +313,9 @@ def on_connect(src):
     return dict(msg='sync_request')
 
 
-def on_disconnect(src, reason):
-    # log(reason)
+def on_disconnect(src, exc, tb):
+    if type(exc) not in (socket.error,):
+        log(tb)
     g.peers[src] = None
     if src == g.leader:
         g.leader = None
@@ -325,8 +327,9 @@ def on_accept(src):
     log('accepted connection from {0}'.format(src))
 
 
-def on_reject(src, reason):
-    # log(reason)
+def on_reject(src, exc, tb):
+    if type(exc) not in (socket.error,):
+        log(tb)
     log('terminated connection from {0}'.format(src))
 
     if src in g.followers:
@@ -336,7 +339,7 @@ def on_reject(src, reason):
     if ('self' == g.leader) and (len(g.followers) < g.quorum):
         log('relinquishing leadership as followers({0}) < quorum({1})'.format(
             len(g.followers), g.quorum))
-        exit(0)
+        os._exit(0)
 
 
 def on_stats(stats):
@@ -383,7 +386,7 @@ def put(src, buf):
         if g.state['offset'] > opt.max:
             log('exiting as max size reached({0} > {1})'.format(
                 g.state['offset'], opt.max))
-            exit(0)
+            os._exit(0)
 
         append(''.join(buf_list))
 
@@ -520,6 +523,7 @@ def on_init():
     g.peers = dict((ip_port, None) for ip_port in peers)
     g.quorum = int(len(g.peers)/2.0 + 0.6)
     g.state['vclock'] = [0]*(len(peers)+1)
+    g.state['port'] = g.port
 
     if not os.path.isdir(opt.data):
         os.mkdir(opt.data)
