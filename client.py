@@ -27,7 +27,7 @@ class Lockr(object):
                             stats = json.loads(msgio.request(srv, 'state'))
                             log('connection to %s succeeded in %.03f msec' % (
                                 srv, (time.time()-t)*1000))
-                            if 'leader' == stats['self']['role']:
+                            if 'leader' == stats['role']:
                                 self.server = srv
                                 log('connected to leader {0}'.format(srv))
                                 break

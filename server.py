@@ -12,23 +12,43 @@ import collections
 from logging import critical as log
 
 
-class d:
-    committed = dict()
-    current = dict()
-    acks = collections.deque()
-
-
 class g:
+    kv = dict()
+    kv_tmp = dict()
+    acks = collections.deque()
     port = None
     peers = None
+    followers = dict()
     quorum = None
     leader = None
     session = None
     role = None
-    clock = 0
-    followers = dict()
-    state = dict(port=None, filenum=0, offset=0, checksum='', clock=0, vclock=None)
+    reboot = 0
+    seq = 0
+    filenum = 0
+    offset = 0
+    checksum = ''
+    vclock = dict()
     stats = None
+
+    @classmethod
+    def state(cls):
+        g.seq += 1
+        return json.dumps(dict(
+            role=g.role,
+            port=g.port,
+            filenum=g.filenum,
+            offset=g.offset,
+            leader=g.leader,
+            reboot=g.reboot,
+            seq=g.seq,
+            peers=dict([('{0}:{1}'.format(k[0], k[1]), dict(
+                reboot=v['reboot'],
+                seq=v['seq'],
+                filenum=v['filenum'],
+                offset=v['offset']
+                )) for k,v in g.peers.iteritems() if v]),
+            vclock=g.vclock))
 
 
 def sync_request(src, buf):
@@ -37,12 +57,7 @@ def sync_request(src, buf):
             src, g.leader))
         raise Exception('kill-follower')
 
-    g.state['clock'][1] += 1
-    return dict(msg='sync_response', buf=json.dumps(dict(
-        state=g.state,
-        leader=g.leader,
-        stats=g.stats,
-        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))))
+    return dict(msg='sync_response', buf=g.state())
 
 
 def sync_response(src, buf):
@@ -53,14 +68,14 @@ def sync_response(src, buf):
 
     if g.leader:
         if not g.role and g.session:
-            assert(g.session == g.state['filenum'])
+            assert(g.session == g.filenum)
 
             count = 0
             for k in filter(lambda k: g.peers[k], g.peers.keys()):
-                if g.state['filenum'] != g.peers[k]['state']['filenum']:
+                if g.filenum != g.peers[k]['filenum']:
                     continue
 
-                if g.state['offset'] != g.peers[k]['state']['offset']:
+                if g.offset != g.peers[k]['offset']:
                     continue
 
                 count += 1
@@ -77,22 +92,21 @@ def sync_response(src, buf):
         g.leader = src
         log('identified current leader{0}'.format(src))
     elif g.peers[src]['leader'] is None:
-        if g.peers[src]['state']['filenum'] == g.state['filenum']:
-            peer_vclock = g.peers[src]['state']['vclock']
-            my_vclock = g.state['vclock']
-            for key in set(peer_vclock).intersection(set(my_vclock)):
-                if peer_vclock[key] > my_vclock[key]:
-                    os.remove(os.path.join(opt.data, str(g.state['filenum'])))
+        if g.peers[src]['filenum'] == g.filenum:
+            peer_vclock = g.peers[src]['vclock']
+            for key in set(peer_vclock).intersection(set(g.vclock)):
+                if peer_vclock[key] > g.vclock[key]:
+                    os.remove(os.path.join(opt.data, str(gfilenum)))
                     log(('exiting after removing file({0}) as vclock({1}) '
-                         'is ahead'.format(g.state['filenum'], src)))
+                         'is ahead'.format(g.filenum, src)))
                     os._exit(0)
 
-        leader = (g.port, g.state, 'self')
+        leader = (g.port, g.__dict__, 'self')
         count = 0
         for k, v in g.peers.iteritems():
             if v:
                 count += 1
-                l, p = leader[1], v['state']
+                l, p = leader[1], v
 
                 if l['filenum'] != p['filenum']:
                     if l['filenum'] < p['filenum']:
@@ -115,11 +129,11 @@ def sync_response(src, buf):
             log('leader({0}) selected due to {1}'.format(src, leader[2]))
 
     if g.leader:
-        msgs.append(dict(msg='replication_request', buf=json.dumps(g.state)))
+        msgs.append(dict(msg='replication_request', buf=g.state()))
 
         log('LEADER{0} identified'.format(src))
         log('sent replication-request to{0} file({1}) offset({2})'.format(
-            src, g.state['filenum'], g.state['offset']))
+            src, g.filenum, g.offset))
 
     return msgs
 
@@ -137,7 +151,7 @@ def replication_request(src, buf):
 
     g.followers[src] = req
     if tuple(req['port']) in g.peers:
-        g.peers[tuple(req['port'])]['state'] = req
+        g.peers[tuple(req['port'])] = req
     log('accepted {0} as follower({1})'.format(src, len(g.followers)))
 
     if 'self' != g.leader and len(g.followers) == g.quorum:
@@ -150,10 +164,10 @@ def replication_request(src, buf):
     if not g.session:
         count = 0
         for src in filter(lambda k: g.followers[k], g.followers.keys()):
-            if g.state['filenum'] != g.followers[src]['filenum']:
+            if g.filenum != g.followers[src]['filenum']:
                 continue
 
-            if g.state['offset'] != g.followers[src]['offset']:
+            if g.offset != g.followers[src]['offset']:
                 continue
 
             count += 1
@@ -162,34 +176,34 @@ def replication_request(src, buf):
             log('quorum({0} >= {1}) in sync with old session'.format(
                 count, g.quorum))
 
-            g.state['filenum'] += 1
-            g.state['offset'] = 0
-            g.session = g.state['filenum']
+            g.filenum += 1
+            g.offset = 0
+            g.session = g.filenum
 
-            vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): g.state['clock']}
+            vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): (g.reboot, g.seq)}
             for k in filter(lambda k: g.peers[k], g.peers):
-                vclk['{0}:{1}'.format(k[0], k[1])] = g.peers[k]['state'][
-                    'clock']
+                vclk['{0}:{1}'.format(k[0], k[1])] = (g.peers[k]['reboot'],
+                                                      g.peers[k]['seq'])
             vclk = json.dumps(vclk)
 
             append(vclk)
-            g.session = g.state['filenum']
+            g.session = g.filenum
             log('new leader SESSION({0}) VCLK{1}'.format(g.session, vclk))
 
     offsets = list()
     for k, v in g.peers.iteritems():
-        if v and v['state']['filenum'] == g.state['filenum']:
-            offsets.append(v['state']['offset'])
+        if v and v['filenum'] == g.filenum:
+            offsets.append(v['offset'])
 
     responses = list()
     if len(offsets) >= g.quorum:
         committed_offset = sorted(offsets, reverse=True)[g.quorum-1]
 
-        while d.acks:
-            if d.acks[0][0] > committed_offset:
+        while g.acks:
+            if g.acks[0][0] > committed_offset:
                 break
 
-            ack = d.acks.popleft()
+            ack = g.acks.popleft()
             responses.append(ack[1])
 
     return responses + get_replication_responses()
@@ -201,7 +215,7 @@ def get_replication_responses():
         req = g.followers[src]
 
         if 0 == req['filenum']:
-            f = map(int, filter(lambda x: x != 'clock', os.listdir(opt.data)))
+            f = map(int, filter(lambda x: x != 'reboot', os.listdir(opt.data)))
             if f:
                 log('sent replication-nextfile to {0} file({1})'.format(
                     src, min(f)))
@@ -226,7 +240,7 @@ def get_replication_responses():
                                  buf=json.dumps(dict(truncate=fd.tell()))))
 
             if fd.tell() == req['offset']:
-                if g.state['filenum'] == req['filenum']:
+                if g.filenum == req['filenum']:
                     continue
 
                 log('sent replication-nextfile to {0} file({1})'.format(
@@ -255,14 +269,14 @@ def replication_truncate(src, buf):
     log('received replication-truncate from{0} size({1})'.format(
         src, req['truncate']))
 
-    f = os.open(os.path.join(opt.data, str(g.state['filenum'])), os.O_RDWR)
+    f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
     n = os.fstat(f).st_size
     os.ftruncate(f, req['truncate'])
     os.fsync(f)
     os.close(f)
 
     log('file({0}) truncated({1}) original({2})'.format(
-        g.state['filenum'], req['truncate'], n))
+        g.filenum, req['truncate'], n))
     os._exit(0)
 
 
@@ -271,12 +285,12 @@ def replication_nextfile(src, buf):
 
     log('received replication-nextfile from{0}'.format(src))
 
-    g.state['filenum'] = req['filenum']
-    g.state['offset'] = 0
+    g.filenum = req['filenum']
+    g.offset = 0
 
     log('sent replication-request to{0} file({1}) offset({2})'.format(
-        src, g.state['filenum'], g.state['offset']))
-    return dict(msg='replication_request', buf=json.dumps(g.state))
+        src, g.filenum, g.offset))
+    return dict(msg='replication_request', buf=g.state())
 
 
 def replication_response(src, buf):
@@ -287,22 +301,22 @@ def replication_response(src, buf):
     assert(len(buf) > 0)
 
     try:
-        f = os.open(os.path.join(opt.data, str(g.state['filenum'])),
+        f = os.open(os.path.join(opt.data, str(g.filenum)),
                     os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-        assert(g.state['offset'] == os.fstat(f).st_size)
+        assert(g.offset == os.fstat(f).st_size)
         assert(len(buf) == os.write(f, buf))
-        assert(g.state['offset']+len(buf) == os.fstat(f).st_size)
+        assert(g.offset+len(buf) == os.fstat(f).st_size)
 
         os.fsync(f)
         os.close(f)
 
-        g.state.update(scan(opt.data, g.state['filenum'], g.state['offset'],
-                            g.state['checksum'], index_put))
+        g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
+                       index_put))
 
         log('sent replication-request to{0} file({1}) offset({2})'.format(
-            src, g.state['filenum'], g.state['offset']))
-        return dict(msg='replication_request', buf=json.dumps(g.state))
+            src, g.filenum, g.offset))
+        return dict(msg='replication_request', buf=g.state())
     except:
         traceback.print_exc()
         os._exit(0)
@@ -316,10 +330,12 @@ def on_connect(src):
 def on_disconnect(src, exc, tb):
     if type(exc) not in (socket.error,):
         log(tb)
+
     g.peers[src] = None
     if src == g.leader:
         g.leader = None
         g.session = None
+        g.role = None
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -330,6 +346,7 @@ def on_accept(src):
 def on_reject(src, exc, tb):
     if type(exc) not in (socket.error,):
         log(tb)
+
     log('terminated connection from {0}'.format(src))
 
     if src in g.followers:
@@ -347,16 +364,7 @@ def on_stats(stats):
 
 
 def state(src, buf):
-    state = dict([('{0}:{1}'.format(*k), v) for k, v in g.peers.iteritems()])
-
-    state['self'] = dict(
-        state=g.state,
-        leader=g.leader,
-        role=g.role,
-        stats=g.stats,
-        timestamp=time.strftime('%y%m%d.%H%M%S', time.gmtime()))
-
-    return dict(buf=json.dumps(state))
+    return dict(buf=g.state())
 
 
 def put(src, buf):
@@ -371,7 +379,7 @@ def put(src, buf):
             value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
             value = buf[i+32+key_len:i+32+key_len+value_len]
 
-            f, o, v = d.committed.get(key, d.current.get(key, (0, 0, '')))
+            f, o, v = g.kv.get(key, g.kv_tmp.get(key, (0, 0, '')))
             assert((f == filenum) and (o == offset)), 'version mismatch'
 
             buf_list.append(struct.pack('!Q', key_len))
@@ -383,9 +391,9 @@ def put(src, buf):
 
         assert(i == len(buf)), 'invalid put request'
 
-        if g.state['offset'] > opt.max:
+        if g.offset > opt.max:
             log('exiting as max size reached({0} > {1})'.format(
-                g.state['offset'], opt.max))
+                g.offset, opt.max))
             os._exit(0)
 
         append(''.join(buf_list))
@@ -393,7 +401,7 @@ def put(src, buf):
         ack = dict(dst=src, buf=struct.pack('!B', 0) + 'ok')
         responses = get_replication_responses()
         if responses:
-            d.acks.append((g.state['offset'], ack))
+            g.acks.append((g.offset, ack))
             return responses
         else:
             return ack
@@ -402,14 +410,14 @@ def put(src, buf):
 
 
 def append(buf):
-    chksum = hashlib.sha1(g.state['checksum'].decode('hex'))
+    chksum = hashlib.sha1(g.checksum.decode('hex'))
     chksum.update(buf)
 
-    with open(os.path.join(opt.data, str(g.state['filenum'])), 'ab', 0) as fd:
+    with open(os.path.join(opt.data, str(g.filenum)), 'ab', 0) as fd:
         fd.write(struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
-    g.state.update(scan(opt.data, g.state['filenum'], g.state['offset'],
-                        g.state['checksum'], index_put))
+    g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
+                      index_put))
 
 
 def get(src, buf):
@@ -418,7 +426,7 @@ def get(src, buf):
     while i < len(buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
-        f, o, v = d.committed.get(key, (0, 0, ''))
+        f, o, v = g.kv.get(key, (0, 0, ''))
 
         result.append(struct.pack('!Q', key_len))
         result.append(key)
@@ -433,7 +441,7 @@ def get(src, buf):
 
 
 def index_put(key, filenum, offset, value):
-    d.committed[key] = (filenum, offset, value)
+    g.kv[key] = (filenum, offset, value)
 
 
 def scan(path, filenum, offset, checksum, callback=None):
@@ -522,45 +530,43 @@ def on_init():
 
     g.peers = dict((ip_port, None) for ip_port in peers)
     g.quorum = int(len(g.peers)/2.0 + 0.6)
-    g.state['vclock'] = [0]*(len(peers)+1)
-    g.state['port'] = g.port
 
     if not os.path.isdir(opt.data):
         os.mkdir(opt.data)
 
     try:
-        with open(os.path.join(opt.data, 'clock')) as fd:
-            g.state['clock'] = [int(fd.read()) + 1, g.clock]
+        with open(os.path.join(opt.data, 'reboot')) as fd:
+            g.reboot = int(fd.read()) + 1
     except:
-        g.state['clock'] = [1, g.clock]
+        g.reboot = 1
     finally:
         with open(os.path.join(opt.data, 'tmp'), 'w') as fd:
-            fd.write(str(g.state['clock'][0]))
+            fd.write(str(g.reboot))
         os.rename(os.path.join(opt.data, 'tmp'),
-                  os.path.join(opt.data, 'clock'))
-        log('RESTARTING sequence({0})'.format(g.state['clock']))
+                  os.path.join(opt.data, 'reboot'))
+        log('RESTARTING sequence({0})'.format(g.reboot))
 
-    files = map(int, filter(lambda x: x != 'clock', os.listdir(opt.data)))
+    files = map(int, filter(lambda x: x != 'reboot', os.listdir(opt.data)))
     if files:
         with open(os.path.join(opt.data, str(min(files))), 'rb') as fd:
             vclklen = struct.unpack('!Q', fd.read(8))[0]
-            g.state['filenum'] = min(files)
-            g.state['vclock'] = json.loads(fd.read(vclklen))
-            g.state['checksum'] = fd.read(20).encode('hex')
-            g.state['offset'] = fd.tell()
-            assert(g.state['offset'] == vclklen + 28)
+            g.filenum = min(files)
+            g.vclock = json.loads(fd.read(vclklen))
+            g.checksum = fd.read(20).encode('hex')
+            g.offset = fd.tell()
+            assert(g.offset == vclklen + 28)
 
-        g.state.update(scan(opt.data, g.state['filenum'], g.state['offset'],
-                            g.state['checksum'], index_put))
-        assert(g.state['filenum'] == max(files))
+        g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
+                               index_put))
+        assert(g.filenum == max(files))
 
-        f = os.open(os.path.join(opt.data, str(g.state['filenum'])), os.O_RDWR)
+        f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
         n = os.fstat(f).st_size
-        if n > g.state['offset']:
-            os.ftruncate(f, g.state['offset'])
+        if n > g.offset:
+            os.ftruncate(f, g.offset)
             os.fsync(f)
             log('file({0}) truncated({1}) original({2})'.format(
-                g.state['filenum'], g.state['offset'], n))
+                g.filenum, g.offset, n))
         os.close(f)
 
     return dict(cert=opt.cert, port=g.port, peers=peers)
