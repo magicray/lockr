@@ -13,6 +13,7 @@ from logging import critical as log
 
 
 class g:
+    fd = None
     kv = dict()
     kv_tmp = dict()
     acks = collections.deque()
@@ -47,6 +48,10 @@ class g:
                 state=v['state']
                 )) for k,v in g.peers.iteritems() if v]),
             vclock=g.vclock))
+
+    @classmethod
+    def update(cls, d):
+        cls.__dict__.update(d)
 
 
 def sync_request(src, buf):
@@ -91,9 +96,9 @@ def sync_response(src, buf):
             peer_vclock = g.peers[src]['vclock']
             for key in set(peer_vclock).intersection(set(g.vclock)):
                 if peer_vclock[key] > g.vclock[key]:
-                    os.remove(os.path.join(opt.data, str(gfilenum)))
-                    log(('exiting after removing file({0}) as vclock({1}) '
-                         'is ahead'.format(g.filenum, src)))
+                    os.remove(os.path.join(opt.data, str(g.filenum)))
+                    log(('REMOVED file({0}) as vclock({1}) is ahead'.format(
+                        g.filenum, src)))
                     os._exit(0)
 
         leader = (g.port, g.__dict__, 'self')
@@ -145,7 +150,7 @@ def replication_request(src, buf):
         raise Exception('reject-replication-request')
 
     if src not in g.followers:
-        log('accepted {0} as follower({1})'.format(src, len(g.followers)))
+        log('accepted {0} as follower({1})'.format(src, len(g.followers)+1))
 
     g.followers[src] = req
     if tuple(req['port']) in g.peers:
@@ -183,7 +188,8 @@ def replication_request(src, buf):
             g.state = 'new-sync'
             log('new leader SESSION({0}) VCLK{1}'.format(g.filenum, vclk))
 
-    responses = list()
+    acks = list()
+    committed_offset = 0
     if 'leader' == g.state:
         offsets = list()
         for k, v in g.peers.iteritems():
@@ -198,9 +204,15 @@ def replication_request(src, buf):
                     break
 
                 ack = g.acks.popleft()
-                responses.append(ack[1])
+                acks.append(ack[1])
 
-    return responses + get_replication_responses()
+    if acks:
+        os.fsync(g.fd)
+    elif committed_offset == g.offset and g.offset > opt.max:
+        log('max file size reached({0} > {1})'.format( g.offset, opt.max))
+        os._exit(0)
+
+    return acks + get_replication_responses()
 
 
 def get_replication_responses():
@@ -225,7 +237,7 @@ def get_replication_responses():
             fd.seek(0, 2)
 
             if fd.tell() < req['offset']:
-                log(('sent replication-truncate to {0} file({1}) offset({2}) '
+                log(('sent replication-truncate to{0} file({1}) offset({2}) '
                      'truncate({3})').format(
                     src, req['filenum'], req['offset'], fd.tell()))
 
@@ -237,7 +249,7 @@ def get_replication_responses():
                 if g.filenum == req['filenum']:
                     continue
 
-                log('sent replication-nextfile to {0} file({1})'.format(
+                log('sent replication-nextfile to{0} file({1})'.format(
                     src, req['filenum']+1))
 
                 g.followers[src] = None
@@ -247,7 +259,7 @@ def get_replication_responses():
             fd.seek(req['offset'])
             buf = fd.read(100*2**20)
             if buf:
-                log(('sent replication-response to {0} file({1}) offset({2}) '
+                log(('sent replication-response to{0} file({1}) offset({2}) '
                      'size({3})').format(
                     src, req['filenum'], req['offset'], len(buf)))
 
@@ -282,6 +294,11 @@ def replication_nextfile(src, buf):
     g.filenum = req['filenum']
     g.offset = 0
 
+    if g.fd:
+        os.fsync(g.fd)
+        os.close(g.fd)
+        g.fd = None
+
     log('sent replication-request to{0} file({1}) offset({2})'.format(
         src, g.filenum, g.offset))
     return dict(msg='replication_request', buf=g.json())
@@ -295,18 +312,17 @@ def replication_response(src, buf):
     assert(len(buf) > 0)
 
     try:
-        f = os.open(os.path.join(opt.data, str(g.filenum)),
-                    os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+        if not g.fd:
+            g.fd = os.open(os.path.join(opt.data, str(g.filenum)),
+                           os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-        assert(g.offset == os.fstat(f).st_size)
-        assert(len(buf) == os.write(f, buf))
-        assert(g.offset+len(buf) == os.fstat(f).st_size)
+        assert(g.offset == os.fstat(g.fd).st_size)
+        assert(len(buf) == os.write(g.fd, buf))
+        assert(g.offset+len(buf) == os.fstat(g.fd).st_size)
 
-        os.fsync(f)
-        os.close(f)
+        os.fsync(g.fd)
 
-        g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
-                       index_put))
+        g.update(scan(opt.data, g.filenum, g.offset, g.checksum, index_put))
 
         log('sent replication-request to{0} file({1}) offset({2})'.format(
             src, g.filenum, g.offset))
@@ -329,6 +345,10 @@ def on_disconnect(src, exc, tb):
     if src == g.state:
         g.state = None
         g.followers = dict()
+        if g.fd:
+            os.fsync(g.fd)
+            os.close(g.fd)
+            g.fd = None
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -362,6 +382,9 @@ def state(src, buf):
 
 
 def put(src, buf):
+    if g.offset > opt.max:
+        return
+
     try:
         i = 0
         buf_list = list()
@@ -385,20 +408,9 @@ def put(src, buf):
 
         assert(i == len(buf)), 'invalid put request'
 
-        if g.offset > opt.max:
-            log('exiting as max size reached({0} > {1})'.format(
-                g.offset, opt.max))
-            os._exit(0)
-
         append(''.join(buf_list))
-
-        ack = dict(dst=src, buf=struct.pack('!B', 0) + 'ok')
-        responses = get_replication_responses()
-        if responses:
-            g.acks.append((g.offset, ack))
-            return responses
-        else:
-            return ack
+        g.acks.append((g.offset, dict(dst=src, buf=struct.pack('!B', 0)+'ok')))
+        return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
 
@@ -407,11 +419,13 @@ def append(buf):
     chksum = hashlib.sha1(g.checksum.decode('hex'))
     chksum.update(buf)
 
-    with open(os.path.join(opt.data, str(g.filenum)), 'ab', 0) as fd:
-        fd.write(struct.pack('!Q', len(buf)) + buf + chksum.digest())
+    if not g.fd:
+        g.fd = os.open(os.path.join(opt.data, str(g.filenum)),
+                       os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-    g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
-                      index_put))
+    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
+
+    g.update(scan(opt.data, g.filenum, g.offset, g.checksum, index_put))
 
 
 def get(src, buf):
@@ -514,11 +528,9 @@ def on_init():
 
     logging.basicConfig(format='%(asctime)s: %(message)s', level=opt.log)
 
-    peers = list()
-    if opt.peers:
-        peers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
-                        map(lambda x: x.split(':'),
-                            opt.peers.split(','))))
+    peers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
+                    map(lambda x: x.split(':'),
+                        opt.peers.split(','))))
     g.port = (socket.gethostbyname(opt.port.split(':')[0]),
               int(opt.port.split(':')[1]))
 
