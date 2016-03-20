@@ -322,7 +322,7 @@ def on_connect(src):
 
 
 def on_disconnect(src, exc, tb):
-    if type(exc) not in (socket.error,):
+    if exc:
         log(tb)
 
     g.peers[src] = None
@@ -337,7 +337,7 @@ def on_accept(src):
 
 
 def on_reject(src, exc, tb):
-    if type(exc) not in (socket.error,):
+    if exc:
         log(tb)
 
     log('terminated connection from {0}'.format(src))

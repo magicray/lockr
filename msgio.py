@@ -50,6 +50,12 @@ def request(srv, req, buf=''):
 request.servers = dict()
 
 
+class msgio_exception(Exception):
+    def __init__(self, exc, tb):
+        self.exc = exc
+        self.tb = tb
+
+
 def loop(module, port, clients, certfile):
     callbacks = dict([(hashlib.sha1(m).digest(), (getattr(module, m), m))
                       for m in dir(module)])
@@ -144,7 +150,11 @@ def loop(module, port, clients, certfile):
                         method, name = callbacks[conn['name']]
                         logging.debug('peer{0} callback({1}) size({2})'.format(
                             conn['peer'], name, len(conn['buf'])))
-                        out_msg_list = method(conn['peer'], conn['buf'])
+
+                        try:
+                            out_msg_list = method(conn['peer'], conn['buf'])
+                        except Exception as e:
+                            raise msgio_exception(e, traceback.format_exc())
 
                         stats['in_pkt'] += 1
                         conn['in_size'] = 28
@@ -190,7 +200,10 @@ def loop(module, port, clients, certfile):
 
                     logging.info('{0}{1}'.format(name, conn['peer']))
 
-                    out_msg_list = getattr(module, name)(conn['peer'])
+                    try:
+                        out_msg_list = getattr(module, name)(conn['peer'])
+                    except Exception as e:
+                        raise msgio_exception(e, traceback.format_exc())
 
                 if event & ~(select.EPOLLIN | select.EPOLLOUT):
                     raise Exception('unhandled event({0})'.format(event))
@@ -210,11 +223,14 @@ def loop(module, port, clients, certfile):
                 else:
                     traceback.print_exc()
                     exit(0)
+            except msgio_exception as e:
+                conn['close'] = (e.exc, e.tb)
             except Exception as e:
-                conn['close'] = (e, traceback.format_exc())
+                conn['close'] = (None, traceback.format_exc())
             finally:
                 if 'close' in conn:
                     exc, tb = conn['close']
+
                     conn = connections.pop(fileno)
 
                     conn['sock'].close()
