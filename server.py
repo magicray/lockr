@@ -3,6 +3,8 @@ import time
 import json
 import socket
 import struct
+import random
+import signal
 import hashlib
 import logging
 import optparse
@@ -11,11 +13,14 @@ import collections
 
 from logging import critical as log
 
+opt = None
+
 
 class g:
     fd = None
     kv = dict()
     kv_tmp = dict()
+    vclocks = dict()
     acks = collections.deque()
     port = None
     peers = dict()
@@ -26,8 +31,8 @@ class g:
     seq = 0
     filenum = 0
     offset = 0
+    size = 0
     checksum = ''
-    vclock = dict()
     stats = None
 
     @classmethod
@@ -38,6 +43,7 @@ class g:
             port=g.port,
             filenum=g.filenum,
             offset=g.offset,
+            size=g.size,
             reboot=g.reboot,
             seq=g.seq,
             peers=dict([('{0}:{1}'.format(k[0], k[1]), dict(
@@ -45,9 +51,8 @@ class g:
                 seq=v['seq'],
                 filenum=v['filenum'],
                 offset=v['offset'],
-                state=v['state']
-                )) for k,v in g.peers.iteritems() if v]),
-            vclock=g.vclock))
+                state=v['state'])) for k, v in g.peers.iteritems() if v]),
+            vclock=g.vclocks.get(g.filenum, dict())))
 
     @classmethod
     def update(cls, d):
@@ -84,51 +89,50 @@ def sync_response(src, buf):
 
         return msgs
 
+    if g.state in ('old-sync', 'new-sync', 'leader'):
+        return msgs
 
     if type(g.state) is tuple:
         return msgs
 
-    if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
+    if g.peers[src]['filenum'] == g.filenum:
+        peer_vclock = g.peers[src]['vclock']
+        for key in set(peer_vclock).intersection(set(g.vclocks.get(g.filenum,
+                                                                   dict()
+                                                                   ))):
+            if peer_vclock[key] > g.vclocks[g.filenum][key]:
+                os.remove(os.path.join(opt.data, str(g.filenum)))
+                log(('REMOVED file({0}) as vclock({1}) is ahead'.format(
+                    g.filenum, src)))
+                os._exit(0)
+
+    leader = (g.port, g.__dict__, 'self')
+    count = 0
+    for k, v in g.peers.iteritems():
+        if v:
+            count += 1
+            l, p = leader[1], v
+
+            if l['filenum'] != p['filenum']:
+                if l['filenum'] < p['filenum']:
+                    leader = (k, p, 'filenum({0} > {1})'.format(
+                        p['filenum'], l['filenum']))
+                continue
+
+            if l['offset'] != p['offset']:
+                if l['offset'] < p['offset']:
+                    leader = (k, p, 'offset({0} > {1})'.format(
+                        p['offset'], l['offset']))
+                continue
+
+            if k > leader[0]:
+                leader = (k, p, 'address({0}:{1} > {2}:{3})'.format(
+                    k[0], k[1], leader[0][0], leader[0][1]))
+
+    if (src == leader[0]) and (count >= g.quorum):
         g.state = src
-        log('identified current leader{0}'.format(src))
-    elif not g.peers[src]['state']:
-        if g.peers[src]['filenum'] == g.filenum:
-            peer_vclock = g.peers[src]['vclock']
-            for key in set(peer_vclock).intersection(set(g.vclock)):
-                if peer_vclock[key] > g.vclock[key]:
-                    os.remove(os.path.join(opt.data, str(g.filenum)))
-                    log(('REMOVED file({0}) as vclock({1}) is ahead'.format(
-                        g.filenum, src)))
-                    os._exit(0)
+        log('leader({0}) selected due to {1}'.format(src, leader[2]))
 
-        leader = (g.port, g.__dict__, 'self')
-        count = 0
-        for k, v in g.peers.iteritems():
-            if v:
-                count += 1
-                l, p = leader[1], v
-
-                if l['filenum'] != p['filenum']:
-                    if l['filenum'] < p['filenum']:
-                        leader = (k, p, 'filenum({0} > {1})'.format(
-                            p['filenum'], l['filenum']))
-                    continue
-
-                if l['offset'] != p['offset']:
-                    if l['offset'] < p['offset']:
-                        leader = (k, p, 'offset({0} > {1})'.format(
-                            p['offset'], l['offset']))
-                    continue
-
-                if k > leader[0]:
-                    leader = (k, p, 'address({0}:{1} > {2}:{3})'.format(
-                        k[0], k[1], leader[0][0], leader[0][1]))
-
-        if (src == leader[0]) and (count >= g.quorum):
-            g.state = src
-            log('leader({0}) selected due to {1}'.format(src, leader[2]))
-
-    if type(g.state) is tuple:
         msgs.append(dict(msg='replication_request', buf=g.json()))
 
         log('LEADER{0} identified'.format(src))
@@ -185,8 +189,12 @@ def replication_request(src, buf):
             vclk = json.dumps(vclk)
 
             append(vclk)
+            os.fsync(g.fd)
             g.state = 'new-sync'
             log('new leader SESSION({0}) VCLK{1}'.format(g.filenum, vclk))
+            if g.seq % 2:
+                log('exiting to force test vclock conflict')
+                os._exit(0)
 
     acks = list()
     committed_offset = 0
@@ -209,7 +217,7 @@ def replication_request(src, buf):
     if acks:
         os.fsync(g.fd)
     elif committed_offset == g.offset and g.offset > opt.max:
-        log('max file size reached({0} > {1})'.format( g.offset, opt.max))
+        log('max file size reached({0} > {1})'.format(g.offset, opt.max))
         os._exit(0)
 
     return acks + get_replication_responses()
@@ -233,19 +241,33 @@ def get_replication_responses():
         if not os.path.isfile(os.path.join(opt.data, str(req['filenum']))):
             continue
 
+        v1 = json.dumps(g.vclocks[req['filenum']], sort_keys=True)
+        v2 = json.dumps(req['vclock'], sort_keys=True)
+        if req['vclock'] and v1 != v2:
+            log('vclock mismatch src{0} file({1})'.format(src, req['filenum']))
+            log('local vclock {0}'.format(v1))
+            log('peer vclock {0}'.format(v2))
+
+            log(('sent replication-truncate to{0} file({1}) offset({2}) '
+                 'truncate(0)').format(src, req['filenum'], req['size']))
+
+            g.followers[src] = None
+            msgs.append(dict(dst=src, msg='replication_truncate',
+                             buf=json.dumps(dict(truncate=0))))
+
         with open(os.path.join(opt.data, str(req['filenum']))) as fd:
             fd.seek(0, 2)
 
-            if fd.tell() < req['offset']:
+            if fd.tell() < req['size']:
                 log(('sent replication-truncate to{0} file({1}) offset({2}) '
                      'truncate({3})').format(
-                    src, req['filenum'], req['offset'], fd.tell()))
+                    src, req['filenum'], req['size'], fd.tell()))
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_truncate',
                                  buf=json.dumps(dict(truncate=fd.tell()))))
 
-            if fd.tell() == req['offset']:
+            if fd.tell() == req['size']:
                 if g.filenum == req['filenum']:
                     continue
 
@@ -256,12 +278,12 @@ def get_replication_responses():
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                             buf=json.dumps(dict(filenum=req['filenum']+1))))
 
-            fd.seek(req['offset'])
+            fd.seek(req['size'])
             buf = fd.read(100*2**20)
             if buf:
                 log(('sent replication-response to{0} file({1}) offset({2}) '
                      'size({3})').format(
-                    src, req['filenum'], req['offset'], len(buf)))
+                    src, req['size'], req['offset'], len(buf)))
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_response', buf=buf))
@@ -293,6 +315,7 @@ def replication_nextfile(src, buf):
 
     g.filenum = req['filenum']
     g.offset = 0
+    g.size = 0
 
     if g.fd:
         os.fsync(g.fd)
@@ -316,16 +339,16 @@ def replication_response(src, buf):
             g.fd = os.open(os.path.join(opt.data, str(g.filenum)),
                            os.O_CREAT | os.O_WRONLY | os.O_APPEND)
 
-        assert(g.offset == os.fstat(g.fd).st_size)
+        assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
+        os.fsync(g.fd)
         assert(g.offset+len(buf) == os.fstat(g.fd).st_size)
 
-        os.fsync(g.fd)
-
-        g.update(scan(opt.data, g.filenum, g.offset, g.checksum, index_put))
+        g.update(scan(opt.data, g.filenum, g.offset, g.checksum,
+                      index_put, vclock_put))
 
         log('sent replication-request to{0} file({1}) offset({2})'.format(
-            src, g.filenum, g.offset))
+            src, g.filenum, g.size))
         return dict(msg='replication_request', buf=g.json())
     except:
         traceback.print_exc()
@@ -349,6 +372,7 @@ def on_disconnect(src, exc, tb):
             os.fsync(g.fd)
             os.close(g.fd)
             g.fd = None
+            reset()
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -425,7 +449,8 @@ def append(buf):
 
     os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
-    g.update(scan(opt.data, g.filenum, g.offset, g.checksum, index_put))
+    g.update(scan(opt.data, g.filenum, g.offset, g.checksum,
+                  index_put, vclock_put))
 
 
 def get(src, buf):
@@ -452,7 +477,11 @@ def index_put(key, filenum, offset, value):
     g.kv[key] = (filenum, offset, value)
 
 
-def scan(path, filenum, offset, checksum, callback=None):
+def vclock_put(filenum, vclock):
+    g.vclocks[filenum] = vclock
+
+
+def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
     result = dict()
     checksum = checksum.decode('hex')
     while True:
@@ -484,10 +513,9 @@ def scan(path, filenum, offset, checksum, callback=None):
                             ofst = offset+i+16+key_len
                             i += 16 + key_len + value_len
 
-                            if callback:
-                                callback(key, filenum, ofst, value)
+                            callback_kv(key, filenum, ofst, value)
                     else:
-                        result['vclock'] = json.loads(x)
+                        callback_vclock(filenum, json.loads(x))
 
                     offset += len(x) + 28
                     assert(offset <= total_size)
@@ -508,6 +536,25 @@ def scan(path, filenum, offset, checksum, callback=None):
             return result
 
 
+def reset():
+    f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
+    n = os.fstat(f).st_size
+    if n > g.offset:
+        os.ftruncate(f, g.offset)
+        os.fsync(f)
+        log('file({0}) truncated({1}) original({2})'.format(
+            g.filenum, g.offset, n))
+        os.close(f)
+
+    filenum = g.filenum + 1
+    while True:
+        try:
+            os.remove(os.path.join(opt.data, str(filenum)))
+            log('removed file({0})'.format(filenum))
+            filenum += 1
+        except:
+            break
+
 def on_init():
     global opt
 
@@ -520,6 +567,8 @@ def on_init():
                       help='data directory', default='data')
     parser.add_option('--max', dest='max', type='int',
                       help='max file size', default='256')
+    parser.add_option('--timeout', dest='timeout', type='int',
+                      help='timeout in seconds', default='30')
     parser.add_option('--cert', dest='cert', type='string',
                       help='certificate file path', default='cert.pem')
     parser.add_option('--log', dest='log', type=int,
@@ -554,25 +603,11 @@ def on_init():
 
     files = map(int, filter(lambda x: x != 'reboot', os.listdir(opt.data)))
     if files:
-        with open(os.path.join(opt.data, str(min(files))), 'rb') as fd:
-            vclklen = struct.unpack('!Q', fd.read(8))[0]
-            g.filenum = min(files)
-            g.vclock = json.loads(fd.read(vclklen))
-            g.checksum = fd.read(20).encode('hex')
-            g.offset = fd.tell()
-            assert(g.offset == vclklen + 28)
-
+        g.filenum = min(files)
         g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
-                               index_put))
-        assert(g.filenum == max(files))
+                               index_put, vclock_put))
+        reset()
 
-        f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
-        n = os.fstat(f).st_size
-        if n > g.offset:
-            os.ftruncate(f, g.offset)
-            os.fsync(f)
-            log('file({0}) truncated({1}) original({2})'.format(
-                g.filenum, g.offset, n))
-        os.close(f)
+    signal.alarm(random.randint(opt.timeout, 2*opt.timeout))
 
     return dict(cert=opt.cert, port=g.port, peers=peers)
