@@ -37,7 +37,6 @@ class g:
 
     @classmethod
     def json(cls):
-        g.seq += 1
         return json.dumps(dict(
             state=g.state,
             port=g.port,
@@ -60,6 +59,7 @@ class g:
 
 
 def sync_request(src, buf):
+    g.seq += 1
     return dict(msg='sync_response', buf=g.json())
 
 
@@ -97,10 +97,9 @@ def sync_response(src, buf):
 
     if g.peers[src]['filenum'] == g.filenum:
         peer_vclock = g.peers[src]['vclock']
-        for key in set(peer_vclock).intersection(set(g.vclocks.get(g.filenum,
-                                                                   dict()
-                                                                   ))):
-            if peer_vclock[key] > g.vclocks[g.filenum][key]:
+        my_vclock = g.vclocks.get(g.filenum, dict())
+        for key in set(peer_vclock).intersection(set(my_vclock)):
+            if peer_vclock[key] > my_vclock[key]:
                 os.remove(os.path.join(opt.data, str(g.filenum)))
                 log(('REMOVED file({0}) as vclock({1}) is ahead'.format(
                     g.filenum, src)))
@@ -372,7 +371,6 @@ def on_disconnect(src, exc, tb):
             os.fsync(g.fd)
             os.close(g.fd)
             g.fd = None
-            reset()
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -536,25 +534,6 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
             return result
 
 
-def reset():
-    f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
-    n = os.fstat(f).st_size
-    if n > g.offset:
-        os.ftruncate(f, g.offset)
-        os.fsync(f)
-        log('file({0}) truncated({1}) original({2})'.format(
-            g.filenum, g.offset, n))
-        os.close(f)
-
-    filenum = g.filenum + 1
-    while True:
-        try:
-            os.remove(os.path.join(opt.data, str(filenum)))
-            log('removed file({0})'.format(filenum))
-            filenum += 1
-        except:
-            break
-
 def on_init():
     global opt
 
@@ -606,7 +585,24 @@ def on_init():
         g.filenum = min(files)
         g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
                                index_put, vclock_put))
-        reset()
+
+        f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
+        n = os.fstat(f).st_size
+        if n > g.offset:
+            os.ftruncate(f, g.offset)
+            os.fsync(f)
+            log('file({0}) truncated({1}) original({2})'.format(
+                g.filenum, g.offset, n))
+            os.close(f)
+
+        filenum = g.filenum + 1
+        while True:
+            try:
+                os.remove(os.path.join(opt.data, str(filenum)))
+                log('removed file({0})'.format(filenum))
+                filenum += 1
+            except:
+                break
 
     signal.alarm(random.randint(opt.timeout, 2*opt.timeout))
 
