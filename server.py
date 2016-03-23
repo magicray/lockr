@@ -371,6 +371,7 @@ def on_disconnect(src, exc, tb):
             os.fsync(g.fd)
             os.close(g.fd)
             g.fd = None
+        log('')
         log('NO LEADER as {0} disconnected'.format(src))
 
 
@@ -410,9 +411,11 @@ def put(src, buf):
     try:
         i = 0
         buf_list = list()
+        keys = list()
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
+            keys.append(key)
             filenum = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
             offset = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
             value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
@@ -431,7 +434,16 @@ def put(src, buf):
         assert(i == len(buf)), 'invalid put request'
 
         append(''.join(buf_list))
-        g.acks.append((g.offset, dict(dst=src, buf=struct.pack('!B', 0)+'ok')))
+
+        buf_list = [struct.pack('!B', 0)]
+        for key in keys:
+            filenum, offset, _ = g.kv[key]
+            buf_list.append(struct.pack('!Q', len(key)))
+            buf_list.append(key)
+            buf_list.append(struct.pack('!Q', filenum))
+            buf_list.append(struct.pack('!Q', offset))
+
+        g.acks.append((g.offset, dict(dst=src, buf=''.join(buf_list))))
         return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
