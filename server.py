@@ -7,6 +7,7 @@ import random
 import signal
 import hashlib
 import logging
+import hashlib
 import optparse
 import traceback
 import collections
@@ -97,34 +98,40 @@ def sync_response(src, buf):
                     g.filenum, src)))
                 os._exit(0)
 
-    leader = (g.port, g.__dict__, 'self')
-    count = 0
-    for k, v in g.peers.iteritems():
-        if v:
-            count += 1
-            l, p = leader[1], v
-
-            if l['filenum'] != p['filenum']:
-                if l['filenum'] < p['filenum']:
-                    leader = (k, p, 'filenum({0} > {1})'.format(
-                        p['filenum'], l['filenum']))
-                continue
-
-            if l['offset'] != p['offset']:
-                if l['offset'] < p['offset']:
-                    leader = (k, p, 'offset({0} > {1})'.format(
-                        p['offset'], l['offset']))
-                continue
-
-            if k > leader[0]:
-                leader = (k, p, 'address({0}:{1} > {2}:{3})'.format(
-                    k[0], k[1], leader[0][0], leader[0][1]))
-
-    if (src == leader[0]) and (count >= g.quorum):
+    if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
         g.state = src
+        log('LEADER({0}) identified'.format(src))
+    else:
+        leader = (g.port, g.__dict__, 'self')
+        count = 0
+        for k, v in g.peers.iteritems():
+            if v:
+                count += 1
+                l, p = leader[1], v
+
+                if l['filenum'] != p['filenum']:
+                    if l['filenum'] < p['filenum']:
+                        leader = (k, p, 'filenum({0} > {1})'.format(
+                            p['filenum'], l['filenum']))
+                    continue
+
+                if l['offset'] != p['offset']:
+                    if l['offset'] < p['offset']:
+                        leader = (k, p, 'offset({0} > {1})'.format(
+                            p['offset'], l['offset']))
+                    continue
+
+                h = hashlib.md5(str(k)+str(g.filenum)).hexdigest()
+                if h > hashlib.md5(str(leader[0])+str(g.filenum)).hexdigest():
+                    leader = (k, p, 'round robin selection')
+
+        if (src == leader[0]) and (count >= g.quorum):
+            g.state = src
+            log('LEADER({0}) selected due to {1}'.format(src, leader[2]))
+
+    if type(g.state) is tuple:
         msgs.append(dict(msg='replication_request', buf=g.json()))
 
-        log('LEADER({0}) selected due to {1}'.format(src, leader[2]))
         log('sent replication-request to{0} file({1}) offset({2})'.format(
             src, g.filenum, g.size))
 
@@ -138,7 +145,7 @@ def replication_request(src, buf):
         src, req['filenum'], req['offset']))
 
     if type(g.state) is tuple:
-        log('rejecting replication-request from{0} as following'.format(
+        log('rejecting replication-request from{0} as following{1}'.format(
             src, g.state))
         raise Exception('reject-replication-request')
 
