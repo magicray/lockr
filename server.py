@@ -436,7 +436,8 @@ def append(buf):
 
     if not g.fd:
         g.fd = os.open(os.path.join(opt.data, str(g.filenum)),
-                       os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+                       os.O_CREAT | os.O_WRONLY | os.O_APPEND,
+                       0644)
 
     os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
