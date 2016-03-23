@@ -69,35 +69,27 @@ def sync_response(src, buf):
 
     msgs = [dict(msg='sync_request')]
 
+    if type(g.state) is tuple or g.state in ('old-sync', 'leader'):
+        return msgs
+
     if 'new-sync' == g.state:
-        count = 0
-        for k in filter(lambda k: g.peers[k], g.peers.keys()):
-            if g.filenum != g.peers[k]['filenum']:
-                continue
+        in_sync = filter(lambda k: g.filenum == g.peers[k]['filenum'],
+                         filter(lambda k: g.offset == g.peers[k]['offset'],
+                                filter(lambda k: g.peers[k], g.peers.keys())))
 
-            if g.offset != g.peers[k]['offset']:
-                continue
-
-            count += 1
-
-        if count >= g.quorum:
+        if len(in_sync) >= g.quorum:
             log('quorum({0}) >= {1}) in sync with new session'.format(
-                count, g.quorum))
+                len(in_sync), g.quorum))
 
             g.state = 'leader'
             log('WRITE enabled')
 
         return msgs
 
-    if g.state in ('old-sync', 'new-sync', 'leader'):
-        return msgs
-
-    if type(g.state) is tuple:
-        return msgs
-
     if g.peers[src]['filenum'] == g.filenum:
         peer_vclock = g.peers[src]['vclock']
         my_vclock = g.vclocks.get(g.filenum, dict())
+
         for key in set(peer_vclock).intersection(set(my_vclock)):
             if peer_vclock[key] > my_vclock[key]:
                 os.remove(os.path.join(opt.data, str(g.filenum)))
@@ -130,13 +122,11 @@ def sync_response(src, buf):
 
     if (src == leader[0]) and (count >= g.quorum):
         g.state = src
-        log('leader({0}) selected due to {1}'.format(src, leader[2]))
-
         msgs.append(dict(msg='replication_request', buf=g.json()))
 
-        log('LEADER{0} identified'.format(src))
+        log('LEADER({0}) selected due to {1}'.format(src, leader[2]))
         log('sent replication-request to{0} file({1}) offset({2})'.format(
-            src, g.filenum, g.offset))
+            src, g.filenum, g.size))
 
     return msgs
 
@@ -310,7 +300,8 @@ def replication_truncate(src, buf):
 def replication_nextfile(src, buf):
     req = json.loads(buf)
 
-    log('received replication-nextfile from{0}'.format(src))
+    log('received replication-nextfile from{0} filenum({1})'.format(
+        src, req['filenum']))
 
     g.filenum = req['filenum']
     g.offset = 0
@@ -322,7 +313,7 @@ def replication_nextfile(src, buf):
         g.fd = None
 
     log('sent replication-request to{0} file({1}) offset({2})'.format(
-        src, g.filenum, g.offset))
+        src, g.filenum, g.size))
     return dict(msg='replication_request', buf=g.json())
 
 
@@ -330,13 +321,14 @@ def replication_response(src, buf):
     log(('received replication-response from {0} size({1})').format(
         src, len(buf)))
 
-    assert(src == g.state)
-    assert(len(buf) > 0)
-
     try:
+        assert(src == g.state)
+        assert(len(buf) > 0)
+
         if not g.fd:
             g.fd = os.open(os.path.join(opt.data, str(g.filenum)),
-                           os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+                           os.O_CREAT | os.O_WRONLY | os.O_APPEND,
+                           0644)
 
         assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
@@ -365,8 +357,9 @@ def on_disconnect(src, exc, tb):
 
     g.peers[src] = None
     if src == g.state:
+        assert(not g.followers)
+
         g.state = None
-        g.followers = dict()
         if g.fd:
             os.fsync(g.fd)
             os.close(g.fd)
@@ -480,6 +473,7 @@ def vclock_put(filenum, vclock):
 
 
 def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
+    start_time = time.time()
     result = dict()
     checksum = checksum.decode('hex')
     while True:
@@ -525,12 +519,16 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                         size=total_size,
                         checksum=checksum.encode('hex')))
 
-                    log(('scanned file({filenum}) offset({offset}) '
-                         'size({size})').format(**result))
+                    if time.time() > start_time + 10:
+                        log(('scanned file({filenum}) offset({offset}) '
+                            'size({size})').format(**result))
+                        start_time = time.time()
 
             filenum += 1
             offset = 0
         except:
+            log('scanned file({filenum}) offset({offset}) size({size})'.format(
+                **result))
             return result
 
 
