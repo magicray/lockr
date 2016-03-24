@@ -546,14 +546,15 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
 
                     if time.time() > start_time + 10:
                         log(('scanned file({filenum}) offset({offset}) '
-                            'size({size})').format(**result))
+                             'size({size})').format(**result))
                         start_time = time.time()
 
             filenum += 1
             offset = 0
         except:
-            log('scanned file({filenum}) offset({offset}) size({size})'.format(
-                **result))
+            if 'filenum' in result:
+                log(('scanned file({filenum}) offset({offset}) '
+                     'size({size})').format(**result))
             return result
 
 
@@ -606,8 +607,22 @@ def on_init():
     files = map(int, filter(lambda x: x != 'reboot', os.listdir(opt.data)))
     if files:
         g.filenum = min(files)
+        with open(os.path.join(opt.data, str(g.filenum)), 'rb') as fd:
+            vclklen = struct.unpack('!Q', fd.read(8))[0]
+            g.vclocks[g.filenum] = json.loads(fd.read(vclklen))
+            g.checksum = fd.read(20).encode('hex')
+            g.offset = fd.tell()
+            fd.seek(0, 2)
+            g.size = fd.tell()
+            assert(g.offset == vclklen + 28)
+
         g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
                                kv_put, vclock_put))
+
+        if g.kv:
+            for n in range(min(files), min([g.kv[k][0] for k in g.kv])):
+                os.remove(os.path.join(opt.data, str(n)))
+                log('removed file({0})'.format(n))
 
         f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
         n = os.fstat(f).st_size
