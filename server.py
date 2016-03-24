@@ -79,7 +79,7 @@ def sync_response(src, buf):
                                 filter(lambda k: g.peers[k], g.peers.keys())))
 
         if len(in_sync) >= g.quorum:
-            log('quorum({0}) >= {1}) in sync with new session'.format(
+            log('quorum({0} >= {1}) in sync with new session'.format(
                 len(in_sync), g.quorum))
 
             g.state = 'leader'
@@ -208,6 +208,8 @@ def replication_request(src, buf):
                     break
 
                 ack = g.acks.popleft()
+                for key in ack[2]:
+                   g.kv[key] = g.kv_tmp.pop(key)
                 acks.append(ack[1])
 
     if acks:
@@ -343,7 +345,7 @@ def replication_response(src, buf):
         assert(g.offset+len(buf) == os.fstat(g.fd).st_size)
 
         g.update(scan(opt.data, g.filenum, g.offset, g.checksum,
-                      index_put, vclock_put))
+                      kv_put, vclock_put))
 
         log('sent replication-request to{0} file({1}) offset({2})'.format(
             src, g.filenum, g.size))
@@ -354,7 +356,6 @@ def replication_response(src, buf):
 
 
 def on_connect(src):
-    log('connected to {0}'.format(src))
     return dict(msg='sync_request')
 
 
@@ -376,7 +377,7 @@ def on_disconnect(src, exc, tb):
 
 
 def on_accept(src):
-    log('accepted connection from {0}'.format(src))
+    pass
 
 
 def on_reject(src, exc, tb):
@@ -437,13 +438,13 @@ def put(src, buf):
 
         buf_list = [struct.pack('!B', 0)]
         for key in keys:
-            filenum, offset, _ = g.kv[key]
+            filenum, offset, _ = g.kv_tmp[key]
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', filenum))
             buf_list.append(struct.pack('!Q', offset))
 
-        g.acks.append((g.offset, dict(dst=src, buf=''.join(buf_list))))
+        g.acks.append((g.offset, dict(dst=src, buf=''.join(buf_list)), keys))
         return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
@@ -461,7 +462,7 @@ def append(buf):
     os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
     g.update(scan(opt.data, g.filenum, g.offset, g.checksum,
-                  index_put, vclock_put))
+                  kv_tmp_put, vclock_put))
 
 
 def get(src, buf):
@@ -484,8 +485,12 @@ def get(src, buf):
     return dict(buf=''.join(result))
 
 
-def index_put(key, filenum, offset, value):
+def kv_put(key, filenum, offset, value):
     g.kv[key] = (filenum, offset, value)
+
+
+def kv_tmp_put(key, filenum, offset, value):
+    g.kv_tmp[key] = (filenum, offset, value)
 
 
 def vclock_put(filenum, vclock):
@@ -602,7 +607,7 @@ def on_init():
     if files:
         g.filenum = min(files)
         g.__dict__.update(scan(opt.data, g.filenum, g.offset, g.checksum,
-                               index_put, vclock_put))
+                               kv_put, vclock_put))
 
         f = os.open(os.path.join(opt.data, str(g.filenum)), os.O_RDWR)
         n = os.fstat(f).st_size

@@ -198,8 +198,6 @@ def loop(module, port, clients, certfile):
                     addr2fd[conn['peer']] = fileno
                     name = 'on_accept' if conn['is_server'] else 'on_connect'
 
-                    logging.info('{0}{1}'.format(name, conn['peer']))
-
                     try:
                         out_msg_list = getattr(module, name)(conn['peer'])
                     except Exception as e:
@@ -242,15 +240,11 @@ def loop(module, port, clients, certfile):
                         if conn['handshake_done']:
                             out_msg_list = getattr(module, 'on_reject')(
                                 conn['peer'], exc, tb)
-                            logging.info('on_reject({0})'.format(
-                                conn['peer']))
                         stats['srv_disconnect'] += 1
                     else:
                         if conn['handshake_done']:
                             out_msg_list = getattr(module, 'on_disconnect')(
                                 conn['ip_port'], exc, tb)
-                            logging.info('on_disconnect{0}'.format(
-                                conn['ip_port']))
                         stats['cli_disconnect'] += 1
                         clients.add((conn['ip_port'][0], conn['ip_port'][1]))
 

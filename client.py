@@ -128,7 +128,7 @@ class Client(cmd.Cmd):
         code, value = self.cli.put(docs)
         if 0 == code:
             for k, v in value.iteritems():
-                print('{0} : {1}-{2}'.format(k, v[0], v[1]))
+                print('{0} <{1}-{2}>'.format(k, v[0], v[1]))
         else:
             print(value)
 
