@@ -4,6 +4,7 @@ import json
 import msgio
 import shlex
 import struct
+import pprint
 import logging
 import optparse
 
@@ -115,7 +116,7 @@ class Client(cmd.Cmd):
         exit(0)
 
     def do_state(self, line):
-        print(json.dumps(self.cli.state(), indent=4, sort_keys=True))
+        print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
     def do_get(self, line):
         for k, v in self.cli.get(line.split()).iteritems():
