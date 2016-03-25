@@ -416,7 +416,7 @@ def put(src, buf):
         i = 0
         buf_list = list()
         keys = list()
-        update_count = 0
+        size = 0
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
@@ -429,7 +429,7 @@ def put(src, buf):
             f, o, v = g.kv.get(key, g.kv_tmp.get(key, (0, 0, '')))
             assert((f == filenum) and (o == offset)), 'version mismatch'
             if f > 0:
-                update_count += 1
+                size += key_len + value_len
 
             buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
@@ -441,7 +441,7 @@ def put(src, buf):
         assert(i == len(buf)), 'invalid put request'
 
         updated_keys = list()
-        while update_count > 0:
+        while size > 0:
             if g.key_list[0][1] == g.filenum:
                 break
 
@@ -453,7 +453,7 @@ def put(src, buf):
                     buf_list.append(struct.pack('!Q', len(g.kv[k][2])))
                     buf_list.append(g.kv[k][2])
                     updated_keys.append(k)
-                    update_count -= 1
+                    size -= len(k) + len(g.kv[k][2])
 
         append(''.join(buf_list))
 
