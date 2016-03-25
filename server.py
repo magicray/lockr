@@ -226,8 +226,8 @@ def replication_request(src, buf):
 
                 ack = g.acks.popleft()
                 for key in ack[2]:
-                   f, o, v = g.kv_tmp.pop(key)
-                   kv_put(key, f, o, v)
+                   f, t, v = g.kv_tmp.pop(key)
+                   kv_put(dict(key=key, filenum=f, txn=t, value=v))
                 acks.append(ack[1])
 
     if acks:
@@ -252,7 +252,7 @@ def get_replication_responses():
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_nextfile',
-                                 buf=json.dumps(dict(maxfile=min(f)))))
+                                 buf=json.dumps(dict(filenum=min(f)))))
 
         if not os.path.isfile(os.path.join(opt.data, str(req['maxfile']))):
             continue
@@ -441,12 +441,14 @@ def put(src, buf):
             value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
             value = buf[i+32+key_len:i+32+key_len+value_len]
 
-            f, o, v = g.kv.get(key, g.kv_tmp.get(key, (0, 0, '')))
-            assert((f == filenum) and (o == offset)), 'version mismatch'
+            f, t, v = g.kv.get(key, g.kv_tmp.get(key, (0, (0, 0), '')))
+            assert((t[0] == filenum) and (t[1] == offset)), 'version mismatch'
             size += key_len + value_len
 
             buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
+            buf_list.append(struct.pack('!Q', g.maxfile))
+            buf_list.append(struct.pack('!Q', g.offset))
             buf_list.append(struct.pack('!Q', value_len))
             buf_list.append(value)
 
@@ -459,11 +461,13 @@ def put(src, buf):
             if not g.key_list or g.key_list[0][1] == g.maxfile:
                 break
 
-            k, f, o = g.key_list.popleft()
+            k, f, t = g.key_list.popleft()
             if k in g.kv and k not in keys:
-                if f == g.kv[k][0] and o == g.kv[k][1]:
+                if t == g.kv[k][1]:
                     buf_list.append(struct.pack('!Q', len(k)))
                     buf_list.append(k)
+                    buf_list.append(struct.pack('!Q', t[0]))
+                    buf_list.append(struct.pack('!Q', t[1]))
                     buf_list.append(struct.pack('!Q', len(g.kv[k][2])))
                     buf_list.append(g.kv[k][2])
                     updated_keys.append(k)
@@ -473,11 +477,11 @@ def put(src, buf):
 
         buf_list = [struct.pack('!B', 0)]
         for key in keys:
-            filenum, offset, _ = g.kv_tmp[key]
+            filenum, txn, _ = g.kv_tmp[key]
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
-            buf_list.append(struct.pack('!Q', filenum))
-            buf_list.append(struct.pack('!Q', offset))
+            buf_list.append(struct.pack('!Q', txn[0]))
+            buf_list.append(struct.pack('!Q', txn[1]))
 
         keys.extend(updated_keys)
         g.acks.append((g.offset, dict(dst=src, buf=''.join(buf_list)), keys))
@@ -507,12 +511,12 @@ def get(src, buf):
     while i < len(buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
-        f, o, v = g.kv.get(key, (0, 0, ''))
+        f, t, v = g.kv.get(key, (0, (0, 0), ''))
 
         result.append(struct.pack('!Q', key_len))
         result.append(key)
-        result.append(struct.pack('!Q', f))
-        result.append(struct.pack('!Q', o))
+        result.append(struct.pack('!Q', t[0]))
+        result.append(struct.pack('!Q', t[1]))
         result.append(struct.pack('!Q', len(v)))
         result.append(v)
 
@@ -521,16 +525,17 @@ def get(src, buf):
     return dict(buf=''.join(result))
 
 
-def kv_put(key, filenum, offset, value):
-    if len(value):
-        g.kv[key] = (filenum, offset, value)
-        g.key_list.append((key, filenum, offset))
+def kv_put(d):
+    key = d['key']
+    if len(d['value']):
+        g.kv[key] = (d['filenum'], d['txn'], d['value'])
+        g.key_list.append((key, d['filenum'], d['txn']))
     elif key in g.kv:
         del(g.kv[key])
 
 
-def kv_tmp_put(key, filenum, offset, value):
-    g.kv_tmp[key] = (filenum, offset, value)
+def kv_tmp_put(d):
+    g.kv_tmp[d['key']] = (d['filenum'], d['txn'], d['value'])
 
 
 def vclock_put(filenum, vclock):
@@ -562,15 +567,23 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                         while i < len(x):
                             key_len = struct.unpack('!Q', x[i:i+8])[0]
                             key = x[i+8:i+8+key_len]
-                            value_len = struct.unpack(
-                                '!Q',
+
+                            f = struct.unpack('!Q',
                                 x[i+8+key_len:i+16+key_len])[0]
-                            value = x[i+16+key_len:i+16+key_len+value_len]
+                            o = struct.unpack('!Q',
+                                x[i+16+key_len:i+24+key_len])[0]
 
-                            ofst = offset+i+16+key_len
-                            i += 16 + key_len + value_len
+                            value_len = struct.unpack('!Q',
+                                x[i+24+key_len:i+32+key_len])[0]
+                            value = x[i+32+key_len:i+32+key_len+value_len]
 
-                            callback_kv(key, filenum, ofst, value)
+                            i += 32 + key_len + value_len
+
+                            callback_kv(dict(key=key,
+                                             filenum=filenum,
+                                             offset=offset+i-value_len,
+                                             txn=(f, o),
+                                             value=value))
                     else:
                         callback_vclock(filenum, json.loads(x))
 
@@ -647,8 +660,8 @@ def on_init():
     files = map(int, filter(lambda x: x != 'reboot', os.listdir(opt.data)))
     if files:
         g.minfile = min(files)
-        g.maxfile = g.minfile
-        with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
+        g.maxfile = min(files)
+        with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
             vclklen = struct.unpack('!Q', fd.read(8))[0]
             g.vclocks[g.maxfile] = json.loads(fd.read(vclklen))
             g.checksum = fd.read(20).encode('hex')
@@ -668,6 +681,8 @@ def on_init():
         for n in range(g.minfile, remove_max):
             os.remove(os.path.join(opt.data, str(n)))
             log('removed file({0})'.format(n))
+
+        g.minfile = remove_max
 
         f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
         n = os.fstat(f).st_size
