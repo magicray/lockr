@@ -125,7 +125,7 @@ class Client(cmd.Cmd):
     def do_put(self, line):
         cmd = shlex.split(line)
         tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-        docs = dict([(t[0], (t[1], t[2])) for t in tup])
+        docs = dict([(t[0], (t[1].strip('<>'), t[2])) for t in tup])
         code, value = self.cli.put(docs)
         if 0 == code:
             for k, v in value.iteritems():
