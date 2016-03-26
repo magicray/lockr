@@ -23,7 +23,6 @@ def request(srv, req, buf=''):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock = ssl.wrap_socket(sock)
             sock.connect(srv)
-            logging.info('connected{0}'.format(srv))
             servers[srv] = sock
 
         servers[srv].sendall(hashlib.sha1(req).digest() +
@@ -44,7 +43,6 @@ def request(srv, req, buf=''):
     except:
         if srv in servers:
             servers.pop(srv).close()
-            logging.info('disconnected{0}'.format(srv))
         raise
 
 request.servers = dict()

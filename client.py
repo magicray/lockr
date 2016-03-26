@@ -41,7 +41,6 @@ class Lockr(object):
                     req, self.server, (time.time() - req_begin)*1000))
                 return result
             except:
-                time.sleep(1)
                 self.server = None
 
         raise Exception('timed out')
