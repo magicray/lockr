@@ -54,7 +54,7 @@ class msgio_exception(Exception):
         self.tb = tb
 
 
-def loop(module, port, clients, certfile):
+def loop(module, port, peers, certfile):
     callbacks = dict([(hashlib.sha1(m).digest(), (getattr(module, m), m))
                       for m in dir(module)])
 
@@ -74,7 +74,7 @@ def loop(module, port, clients, certfile):
 
     connections = dict()
     addr2fd = dict()
-    clients = set(clients)
+    clients = set(filter(lambda x: x > port, peers))
 
     old_stats = (time.time(), copy.deepcopy(stats))
 
@@ -133,7 +133,6 @@ def loop(module, port, clients, certfile):
                         if 'name' not in conn:
                             name = buf[0:20]
                             size = struct.unpack('!Q', buf[20:])[0]
-                            assert(name in callbacks), 'closed by peer'
 
                             conn['name'] = name
                             if 0 == size:
@@ -145,14 +144,20 @@ def loop(module, port, clients, certfile):
                             conn['buf'] = buf
 
                     if 'buf' in conn:
-                        method, name = callbacks[conn['name']]
-                        logging.debug('peer{0} callback({1}) size({2})'.format(
-                            conn['peer'], name, len(conn['buf'])))
-
-                        try:
-                            out_msg_list = method(conn['peer'], conn['buf'])
-                        except Exception as e:
-                            raise msgio_exception(e, traceback.format_exc())
+                        if conn['name'] == hashlib.sha1('').digest():
+                            conn['src'] = (conn['peer'][0], int(conn['buf']))
+                            addr2fd[conn['src']] = fileno
+                            assert(conn['src'] in peers)
+                            try:
+                                out_msg_list = module.on_connect(conn['src'])
+                            except Exception as e:
+                                raise msgio_exception(e, traceback.format_exc())
+                        else:
+                            method, name = callbacks[conn['name']]
+                            try:
+                                out_msg_list = method(conn['src'], conn['buf'])
+                            except Exception as e:
+                                raise msgio_exception(e, traceback.format_exc())
 
                         stats['in_pkt'] += 1
                         conn['in_size'] = 28
@@ -193,11 +198,19 @@ def loop(module, port, clients, certfile):
                     conn['in_size'] = 28
                     conn['in_pkts'] = list()
                     conn['msgs'] = list()
-                    addr2fd[conn['peer']] = fileno
-                    name = 'on_accept' if conn['is_server'] else 'on_connect'
 
                     try:
-                        out_msg_list = getattr(module, name)(conn['peer'])
+                        conn['src'] = conn['peer']
+                        addr2fd[conn['src']] = fileno
+                        if not conn['is_server']:
+                            out_msg_list = [dict(buf=str(port[1]))]
+
+                            out_msg = module.on_connect(conn['src'])
+                            if out_msg:
+                                if type(out_msg) is dict:
+                                    out_msg_list.append(out_msg)
+                                else:
+                                    out_msg_list.extend(out_msg)
                     except Exception as e:
                         raise msgio_exception(e, traceback.format_exc())
 
@@ -218,7 +231,7 @@ def loop(module, port, clients, certfile):
                         exit(0)
                 else:
                     traceback.print_exc()
-                    exit(0)
+                    os._exit(0)
             except msgio_exception as e:
                 conn['close'] = (e.exc, e.tb)
             except Exception as e:
@@ -232,17 +245,15 @@ def loop(module, port, clients, certfile):
                     conn['sock'].close()
                     epoll.unregister(fileno)
 
-                    addr2fd.pop(conn.get('peer'), None)
+                    addr2fd.pop(conn.get('src'), None)
+
+                    if conn['handshake_done']:
+                        out_msg_list = module.on_disconnect(
+                                conn['src'], exc, tb)
 
                     if conn['is_server']:
-                        if conn['handshake_done']:
-                            out_msg_list = getattr(module, 'on_reject')(
-                                conn['peer'], exc, tb)
                         stats['srv_disconnect'] += 1
                     else:
-                        if conn['handshake_done']:
-                            out_msg_list = getattr(module, 'on_disconnect')(
-                                conn['ip_port'], exc, tb)
                         stats['cli_disconnect'] += 1
                         clients.add((conn['ip_port'][0], conn['ip_port'][1]))
 
@@ -251,7 +262,7 @@ def loop(module, port, clients, certfile):
                         out_msg_list = [out_msg_list]
 
                     for d in out_msg_list:
-                        dst = d.get('dst', conn['peer'])
+                        dst = d.get('dst', conn['src'])
                         msg = d.get('msg', '')
                         buf = d.get('buf', '')
 

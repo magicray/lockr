@@ -70,7 +70,6 @@ def sync_request(src, buf):
 
 
 def sync_response(src, buf):
-    assert(src in g.peers)
     g.peers[src] = json.loads(buf)
 
     msgs = [dict(msg='sync_request')]
@@ -380,10 +379,12 @@ def on_connect(src):
 
 def on_disconnect(src, exc, tb):
     log('disconnected from {0} reason({1})'.format(src, str(exc)))
-    if exc:
+    if exc and str(exc) != 'reject-replication-request':
         log(tb)
 
-    g.peers[src] = None
+    if src in g.peers:
+        g.peers[src] = None
+
     if src == g.state:
         assert(not g.followers)
 
@@ -394,16 +395,6 @@ def on_disconnect(src, exc, tb):
             g.fd = None
         log('')
         log('NO LEADER as {0} disconnected'.format(src))
-
-
-def on_accept(src):
-    pass
-
-
-def on_reject(src, exc, tb):
-    log('terminated connection from {0} reason({1})'.format(src, str(exc)))
-    if exc and str(exc) != 'reject-replication-request':
-        log(tb)
 
     if src in g.followers:
         g.followers.pop(src)
