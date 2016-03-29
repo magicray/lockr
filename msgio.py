@@ -63,7 +63,8 @@ def loop(module, port, peers, certfile):
     listener_sock.bind(port)
     listener_sock.listen(5)
     listener_sock.setblocking(0)
-    logging.critical('listening on {0}'.format(port))
+    logging.critical('service {0} callbacks on {1}'.format(
+        len(callbacks), port))
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
@@ -92,7 +93,6 @@ def loop(module, port, peers, certfile):
             epoll.register(s.fileno(), select.EPOLLOUT)
             try:
                 stats['cli_connect'] += 1
-                logging.debug('connect initiated to {0}'.format(ip_port))
                 s.connect(ip_port)
             except Exception as e:
                 if 115 != e.errno:
@@ -117,8 +117,7 @@ def loop(module, port, peers, certfile):
 
             try:
                 conn = connections[fileno]
-                conn['ssl_error'] = None
-                out_msg_list = None
+                out_msg_list = list()
 
                 if conn['handshake_done'] and event & select.EPOLLIN:
                     buf = conn['sock'].recv(conn['in_size'])
@@ -149,15 +148,17 @@ def loop(module, port, peers, certfile):
                             addr2fd[conn['src']] = fileno
                             assert(conn['src'] in peers)
                             try:
-                                out_msg_list = module.on_connect(conn['src'])
+                                out_msg = module.on_connect(conn['src'])
                             except Exception as e:
                                 raise msgio_exception(e, traceback.format_exc())
                         else:
                             method, name = callbacks[conn['name']]
                             try:
-                                out_msg_list = method(conn['src'], conn['buf'])
+                                out_msg = method(conn['src'], conn['buf'])
                             except Exception as e:
                                 raise msgio_exception(e, traceback.format_exc())
+
+                        out_msg_list.append(out_msg)
 
                         stats['in_pkt'] += 1
                         conn['in_size'] = 28
@@ -198,19 +199,14 @@ def loop(module, port, peers, certfile):
                     conn['in_size'] = 28
                     conn['in_pkts'] = list()
                     conn['msgs'] = list()
+                    conn['src'] = conn['peer']
+                    addr2fd[conn['src']] = fileno
 
                     try:
-                        conn['src'] = conn['peer']
-                        addr2fd[conn['src']] = fileno
                         if not conn['is_server']:
-                            out_msg_list = [dict(buf=str(port[1]))]
-
-                            out_msg = module.on_connect(conn['src'])
-                            if out_msg:
-                                if type(out_msg) is dict:
-                                    out_msg_list.append(out_msg)
-                                else:
-                                    out_msg_list.extend(out_msg)
+                            out_msg_list.extend([
+                                dict(buf=str(port[1])),
+                                module.on_connect(conn['src'])])
                     except Exception as e:
                         raise msgio_exception(e, traceback.format_exc())
 
@@ -218,19 +214,11 @@ def loop(module, port, peers, certfile):
                     raise Exception('unhandled event({0})'.format(event))
 
             except ssl.SSLError as e:
-                if False == conn['handshake_done']:
-                    peer = conn['sock'].getpeername()
-                    if ssl.SSL_ERROR_WANT_READ == e.errno:
-                        conn['ssl_error'] = select.EPOLLIN
-                        logging.debug('peer{0} ssl(want_read)'.format(peer))
-                    elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
-                        conn['ssl_error'] = select.EPOLLOUT
-                        logging.debug('peer{0} ssl(want_write)'.format(peer))
-                    else:
-                        traceback.print_exc()
-                        exit(0)
+                if ssl.SSL_ERROR_WANT_READ == e.errno:
+                    epoll.modify(fileno, select.EPOLLIN)
+                elif ssl.SSL_ERROR_WANT_WRITE == e.errno:
+                    epoll.modify(fileno, select.EPOLLOUT)
                 else:
-                    traceback.print_exc()
                     os._exit(0)
             except msgio_exception as e:
                 conn['close'] = (e.exc, e.tb)
@@ -261,27 +249,24 @@ def loop(module, port, peers, certfile):
                     if type(out_msg_list) is dict:
                         out_msg_list = [out_msg_list]
 
-                    for d in out_msg_list:
-                        dst = d.get('dst', conn['src'])
-                        msg = d.get('msg', '')
-                        buf = d.get('buf', '')
+                    for l in out_msg_list:
+                        for d in l if type(l) is list else [l]:
+                          dst = d.get('dst', conn['src'])
+                          msg = d.get('msg', '')
+                          buf = d.get('buf', '')
 
-                        if dst in addr2fd:
-                            f = addr2fd[dst]
-                            connections[f]['msgs'].append(''.join([
-                                hashlib.sha1(msg).digest(),
-                                struct.pack('!Q', len(buf))]))
-                            connections[f]['msgs'].append(buf)
-                            epoll.modify(
-                                f,
-                                select.EPOLLIN | select.EPOLLOUT)
-                        else:
-                            logging.critical('{0} not found'.format(dst))
+                          if dst in addr2fd:
+                              f = addr2fd[dst]
+                              connections[f]['msgs'].append(''.join([
+                                  hashlib.sha1(msg).digest(),
+                                  struct.pack('!Q', len(buf))]))
+                              connections[f]['msgs'].append(buf)
+                              epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
+                          else:
+                              logging.critical('{0} not found'.format(dst))
 
-                if 'close' not in conn:
-                    if conn['ssl_error']:
-                        epoll.modify(fileno, conn['ssl_error'])
-                    elif conn['msgs'] or ('pkt' in conn):
+                if conn['handshake_done'] is True and 'close' not in conn:
+                    if conn['msgs'] or ('pkt' in conn):
                         epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
                     else:
                         epoll.modify(fileno, select.EPOLLIN)

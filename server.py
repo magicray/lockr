@@ -64,15 +64,11 @@ class g:
         cls.__dict__.update(d)
 
 
-def sync_request(src, buf):
-    g.seq += 1
-    return dict(msg='sync_response', buf=g.json())
-
-
-def sync_response(src, buf):
+def sync(src, buf):
     g.peers[src] = json.loads(buf)
 
-    msgs = [dict(msg='sync_request')]
+    g.seq += 1
+    msgs = [dict(msg='sync', buf=g.json())]
 
     if type(g.state) is tuple or g.state in ('old-sync', 'leader'):
         return msgs
@@ -374,10 +370,19 @@ def replication_response(src, buf):
 
 
 def on_connect(src):
-    return dict(msg='sync_request')
+    log('connection from {0}'.format(src))
+    if src not in g.peers:
+        return
+
+    g.seq += 1
+    return dict(msg='sync', buf=g.json())
 
 
 def on_disconnect(src, exc, tb):
+    log('disconnected from {0}'.format(src))
+    if src not in g.peers:
+        return
+
     log('disconnected from {0} reason({1})'.format(src, str(exc)))
     if exc and str(exc) != 'reject-replication-request':
         log(tb)
@@ -604,8 +609,6 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
 
 
 def on_init():
-    global opt
-
     parser = optparse.OptionParser()
     parser.add_option('--port', dest='port', type='string',
                       help='server:port tuple. skip to start the client')
