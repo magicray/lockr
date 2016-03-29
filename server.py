@@ -470,18 +470,15 @@ def put(src, buf):
                     updated_keys.append(k)
                     size -= len(k) + len(g.kv[k][2])
 
+        res_list = [
+            struct.pack('!B', 0),
+            struct.pack('!Q', g.maxfile),
+            struct.pack('!Q', g.offset)]
+
         append(''.join(buf_list))
 
-        buf_list = [struct.pack('!B', 0)]
-        for key in keys:
-            filenum, txn, _ = g.kv_tmp[key]
-            buf_list.append(struct.pack('!Q', len(key)))
-            buf_list.append(key)
-            buf_list.append(struct.pack('!Q', txn[0]))
-            buf_list.append(struct.pack('!Q', txn[1]))
-
         keys.extend(updated_keys)
-        g.acks.append((g.offset, dict(dst=src, buf=''.join(buf_list)), keys))
+        g.acks.append((g.offset, dict(dst=src, buf=''.join(res_list)), keys))
         return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())

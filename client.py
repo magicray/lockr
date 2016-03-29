@@ -62,17 +62,10 @@ class Lockr(object):
 
         buf = self.request('put', ''.join(items))
         if 0 == struct.unpack('!B', buf[0])[0]:
-            docs = dict()
-            i = 1
-            while i < len(buf):
-                key_len = struct.unpack('!Q', buf[i:i+8])[0]
-                key = buf[i+8:i+8+key_len]
-                filenum = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
-                offset = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
-                docs[key] = (filenum, offset)
-                i += key_len + 24
+            f = struct.unpack('!Q', buf[1:9])[0]
+            o = struct.unpack('!Q', buf[9:17])[0]
 
-            return 0, docs
+            return 0, (f, o)
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
@@ -127,10 +120,9 @@ class Client(cmd.Cmd):
         docs = dict([(t[0], (t[1].strip('<>'), t[2])) for t in tup])
         code, value = self.cli.put(docs)
         if 0 == code:
-            for k, v in value.iteritems():
-                print('{0} <{1}-{2}>'.format(k, v[0], v[1]))
+            print('{0} <{1}-{2}>'.format(code, value[0], value[1]))
         else:
-            print(value)
+            print('{0} {1}'.format(code, value))
 
 
 if '__main__' == __name__:
