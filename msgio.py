@@ -150,13 +150,15 @@ def loop(module, port, peers, certfile):
                             try:
                                 out_msg = module.on_connect(conn['src'])
                             except Exception as e:
-                                raise msgio_exception(e, traceback.format_exc())
+                                raise msgio_exception(e,
+                                                      traceback.format_exc())
                         else:
                             method, name = callbacks[conn['name']]
                             try:
                                 out_msg = method(conn['src'], conn['buf'])
                             except Exception as e:
-                                raise msgio_exception(e, traceback.format_exc())
+                                raise msgio_exception(e,
+                                                      traceback.format_exc())
 
                         out_msg_list.append(out_msg)
 
@@ -237,7 +239,7 @@ def loop(module, port, peers, certfile):
 
                     if conn['handshake_done']:
                         out_msg_list = module.on_disconnect(
-                                conn['src'], exc, tb)
+                            conn['src'], exc, tb)
 
                     if conn['is_server']:
                         stats['srv_disconnect'] += 1
@@ -251,19 +253,20 @@ def loop(module, port, peers, certfile):
 
                     for l in out_msg_list:
                         for d in l if type(l) is list else [l]:
-                          dst = d.get('dst', conn['src'])
-                          msg = d.get('msg', '')
-                          buf = d.get('buf', '')
+                            dst = d.get('dst', conn['src'])
+                            msg = d.get('msg', '')
+                            buf = d.get('buf', '')
 
-                          if dst in addr2fd:
-                              f = addr2fd[dst]
-                              connections[f]['msgs'].append(''.join([
-                                  hashlib.sha1(msg).digest(),
-                                  struct.pack('!Q', len(buf))]))
-                              connections[f]['msgs'].append(buf)
-                              epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
-                          else:
-                              logging.critical('{0} not found'.format(dst))
+                            if dst in addr2fd:
+                                f = addr2fd[dst]
+                                connections[f]['msgs'].append(''.join([
+                                    hashlib.sha1(msg).digest(),
+                                    struct.pack('!Q', len(buf))]))
+                                connections[f]['msgs'].append(buf)
+                                epoll.modify(f,
+                                             select.EPOLLIN | select.EPOLLOUT)
+                            else:
+                                logging.critical('{0} not found'.format(dst))
 
                 if conn['handshake_done'] is True and 'close' not in conn:
                     if conn['msgs'] or ('pkt' in conn):

@@ -5,7 +5,6 @@ import socket
 import struct
 import random
 import signal
-import hashlib
 import logging
 import hashlib
 import optparse
@@ -221,8 +220,8 @@ def replication_request(src, buf):
 
                 ack = g.acks.popleft()
                 for key in ack[2]:
-                   f, t, v = g.kv_tmp.pop(key)
-                   kv_put(dict(key=key, filenum=f, txn=t, value=v))
+                    f, t, v = g.kv_tmp.pop(key)
+                    kv_put(dict(key=key, filenum=f, txn=t, value=v))
                 acks.append(ack[1])
 
     if acks:
@@ -562,12 +561,15 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                             key_len = struct.unpack('!Q', x[i:i+8])[0]
                             key = x[i+8:i+8+key_len]
 
-                            f = struct.unpack('!Q',
+                            f = struct.unpack(
+                                '!Q',
                                 x[i+8+key_len:i+16+key_len])[0]
-                            o = struct.unpack('!Q',
+                            o = struct.unpack(
+                                '!Q',
                                 x[i+16+key_len:i+24+key_len])[0]
 
-                            value_len = struct.unpack('!Q',
+                            value_len = struct.unpack(
+                                '!Q',
                                 x[i+24+key_len:i+32+key_len])[0]
                             value = x[i+32+key_len:i+32+key_len+value_len]
 
