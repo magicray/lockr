@@ -366,7 +366,6 @@ def replication_response(src, buf):
 
 
 def on_connect(src):
-    log('connection from {0}'.format(src))
     if src not in g.peers:
         return
 
@@ -375,7 +374,6 @@ def on_connect(src):
 
 
 def on_disconnect(src, exc, tb):
-    log('disconnected from {0}'.format(src))
     if src not in g.peers:
         return
 
@@ -414,6 +412,29 @@ def on_stats(stats):
 
 def state(src, buf):
     return dict(buf=g.json())
+
+
+def watch(src, buf):
+    try:
+        i = 0
+        while i < len(buf):
+            key_len = struct.unpack('!Q', buf[i:i+8])[0]
+            key = buf[i+8:i+8+key_len]
+            txn = (struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0],
+                   struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0])
+
+            i += 24 + key_len
+
+        return dict(buf=''.join([
+            struct.pack('!B', 0),
+            struct.pack('!Q', len('key')),
+            'key',
+            struct.pack('!Q', 1),
+            struct.pack('!Q', 2),
+            struct.pack('!Q', len('Hello')),
+            'Hello']))
+    except:
+        return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
 
 
 def put(src, buf):
@@ -455,7 +476,7 @@ def put(src, buf):
                 break
 
             k, f, t = g.key_list.popleft()
-            if k in g.kv and k not in keys:
+            if k in g.kv and k not in keys and f != g.maxfile:
                 if t == g.kv[k][1]:
                     buf_list.append(struct.pack('!Q', len(k)))
                     buf_list.append(k)
