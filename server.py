@@ -27,8 +27,7 @@ class g:
     followers = dict()
     quorum = 0
     state = ''
-    reboot = 0
-    seq = 0
+    clock = (0, 0)
     minfile = 0
     maxfile = 0
     offset = 0
@@ -45,13 +44,11 @@ class g:
             maxfile=g.maxfile,
             offset=g.offset,
             size=g.size,
-            reboot=g.reboot,
-            seq=g.seq,
+            clock=g.clock,
             keys=[len(g.key_list), len(g.kv), len(g.kv_tmp), len(g.acks)],
             peers=dict([('{0}:{1}'.format(k[0], k[1]), dict(
                 keys=v['keys'],
-                reboot=v['reboot'],
-                seq=v['seq'],
+                clock=v['clock'],
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
                 offset=v['offset'],
@@ -66,7 +63,7 @@ class g:
 def sync(src, buf):
     g.peers[src] = json.loads(buf)
 
-    g.seq += 1
+    g.clock = (g.clock[0], g.clock[1]+1)
     msgs = [dict(msg='sync', buf=g.json())]
 
     if type(g.state) is tuple or g.state in ('old-sync', 'leader'):
@@ -189,17 +186,17 @@ def replication_request(src, buf):
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): (g.reboot, g.seq)}
+            vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): g.clock}
             for k in filter(lambda k: g.peers[k], g.peers):
-                vclk['{0}:{1}'.format(k[0], k[1])] = (g.peers[k]['reboot'],
-                                                      g.peers[k]['seq'])
+                vclk['{0}:{1}'.format(k[0], k[1])] = g.peers[k]['clock']
+
             vclk = json.dumps(vclk)
 
             append(vclk)
             os.fsync(g.fd)
             g.state = 'new-sync'
             log('new leader SESSION({0}) VCLK{1}'.format(g.maxfile, vclk))
-            if g.seq % 2:
+            if g.clock[1] % 2:
                 log('exiting to force test vclock conflict')
                 os._exit(0)
 
@@ -373,7 +370,7 @@ def on_connect(src):
     if src not in g.peers:
         return
 
-    g.seq += 1
+    g.clock = (g.clock[0], g.clock[1]+1)
     return dict(msg='sync', buf=g.json())
 
 
@@ -561,16 +558,14 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                             key_len = struct.unpack('!Q', x[i:i+8])[0]
                             key = x[i+8:i+8+key_len]
 
-                            f = struct.unpack(
-                                '!Q',
-                                x[i+8+key_len:i+16+key_len])[0]
-                            o = struct.unpack(
-                                '!Q',
-                                x[i+16+key_len:i+24+key_len])[0]
+                            txn = (
+                                struct.unpack(
+                                    '!Q', x[i+8+key_len:i+16+key_len])[0],
+                                struct.unpack(
+                                    '!Q', x[i+16+key_len:i+24+key_len])[0])
 
                             value_len = struct.unpack(
-                                '!Q',
-                                x[i+24+key_len:i+32+key_len])[0]
+                                '!Q', x[i+24+key_len:i+32+key_len])[0]
                             value = x[i+32+key_len:i+32+key_len+value_len]
 
                             i += 32 + key_len + value_len
@@ -578,7 +573,7 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                             callback_kv(dict(key=key,
                                              filenum=filenum,
                                              offset=offset+i-value_len,
-                                             txn=(f, o),
+                                             txn=txn,
                                              value=value))
                     else:
                         callback_vclock(filenum, json.loads(x))
@@ -641,15 +636,16 @@ def on_init():
 
     try:
         with open(os.path.join(g.opt.data, 'reboot')) as fd:
-            g.reboot = int(fd.read()) + 1
+            reboot = int(fd.read()) + 1
     except:
-        g.reboot = 1
+        reboot = 1
     finally:
         with open(os.path.join(g.opt.data, 'tmp'), 'w') as fd:
-            fd.write(str(g.reboot))
+            fd.write(str(reboot))
         os.rename(os.path.join(g.opt.data, 'tmp'),
                   os.path.join(g.opt.data, 'reboot'))
-        log('RESTARTING sequence({0})'.format(g.reboot))
+        log('RESTARTING sequence({0})'.format(reboot))
+        g.clock = (reboot, 0)
 
     files = map(int, filter(lambda x: x != 'reboot', os.listdir(g.opt.data)))
     if files:
