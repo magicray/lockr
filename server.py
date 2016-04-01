@@ -365,15 +365,11 @@ def replication_response(src, buf):
         os._exit(0)
 
 
-def on_connect(src):
-    if src not in g.peers:
-        return
-
-    g.clock = (g.clock[0], g.clock[1]+1)
-    return dict(msg='sync', buf=g.json())
+def on_message(src, msg, buf):
+    return globals()[msg](src, buf)
 
 
-def on_disconnect(src, exc, tb):
+def on_error(src, exc, tb):
     if src not in g.peers:
         return
 
@@ -715,4 +711,7 @@ def on_init():
 
     signal.alarm(random.randint(g.opt.timeout, 2*g.opt.timeout))
 
-    return dict(cert=g.opt.cert, port=g.port, peers=peers)
+    return dict(
+        cert=g.opt.cert,
+        port=g.port,
+        msgs=dict([(p, dict(msg='sync', buf=g.json())) for p in peers]))

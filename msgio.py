@@ -6,7 +6,6 @@ import copy
 import socket
 import select
 import struct
-import hashlib
 import logging
 import traceback
 
@@ -25,10 +24,11 @@ def request(srv, req, buf=''):
             sock.connect(srv)
             servers[srv] = sock
 
-        servers[srv].sendall(hashlib.sha1(req).digest() +
-                             struct.pack('!Q', len(buf)))
-        if buf:
-            servers[srv].sendall(buf)
+        servers[srv].sendall(''.join([
+            struct.pack('!Q', len(req) + len(buf)),
+            struct.pack('!H', len(req)),
+            req,
+            buf]))
 
         def recvall(length):
             pkt = list()
@@ -39,7 +39,7 @@ def request(srv, req, buf=''):
                 length -= len(pkt[-1])
             return ''.join(pkt)
 
-        return recvall(struct.unpack('!Q', recvall(28)[20:])[0])
+        return recvall(struct.unpack('!Q', recvall(8))[0] + 2)[2:]
     except:
         if srv in servers:
             servers.pop(srv).close()
@@ -54,17 +54,13 @@ class msgio_exception(Exception):
         self.tb = tb
 
 
-def loop(module, port, peers, certfile):
-    callbacks = dict([(hashlib.sha1(m).digest(), (getattr(module, m), m))
-                      for m in dir(module)])
-
+def loop(module, port, msgs, certfile):
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener_sock.bind(port)
     listener_sock.listen(5)
     listener_sock.setblocking(0)
-    logging.critical('service {0} callbacks on {1}'.format(
-        len(callbacks), port))
+    logging.critical('listening on {0}'.format(port))
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
@@ -75,7 +71,7 @@ def loop(module, port, peers, certfile):
 
     connections = dict()
     addr2fd = dict()
-    clients = set(filter(lambda x: x > port, peers))
+    clients = set(filter(lambda x: x > port, msgs))
 
     old_stats = (time.time(), copy.deepcopy(stats))
 
@@ -120,49 +116,36 @@ def loop(module, port, peers, certfile):
                 out_msg_list = list()
 
                 if conn['handshake_done'] and event & select.EPOLLIN:
-                    buf = conn['sock'].recv(conn['in_size'])
-                    stats['in_bytes'] += len(buf)
-                    assert(len(buf) > 0)
+                    conn['in_pkts'].append(conn['sock'].recv(32*1024))
+                    stats['in_bytes'] += len(conn['in_pkts'][-1])
+                    assert(len(conn['in_pkts'][-1]) > 0)
 
-                    conn['in_pkts'].append(buf)
-                    conn['in_size'] -= len(buf)
+                    size = struct.unpack('!Q', conn['in_pkts'][0][0:8])[0] + 10
 
-                    if 0 == conn['in_size']:
+                    total_size = sum(map(len, conn['in_pkts']))
+                    assert(total_size <= size)
+
+                    if size == total_size:
+                        msg_len = struct.unpack(
+                            '!H', conn['in_pkts'][0][8:10])[0]
+                        msg = conn['in_pkts'][0][10:10+msg_len]
+
+                        conn['in_pkts'][0] = conn['in_pkts'][0][10+msg_len:]
                         buf = ''.join(conn['in_pkts'])
-                        if 'name' not in conn:
-                            name = buf[0:20]
-                            size = struct.unpack('!Q', buf[20:])[0]
-
-                            conn['name'] = name
-                            if 0 == size:
-                                conn['buf'] = ''
-                            else:
-                                conn['in_size'] = size
-                                conn['in_pkts'] = list()
-                        else:
-                            conn['buf'] = buf
-
-                    if 'buf' in conn:
                         try:
-                            if conn['name'] == hashlib.sha1('').digest():
-                                conn['src'] = (conn['peer'][0],
-                                               int(conn['buf']))
+                            if '' == msg:
+                                conn['src'] = (conn['peer'][0], int(buf))
                                 addr2fd[conn['src']] = fileno
-                                assert(conn['src'] in peers)
-                                out_msg_list.append(
-                                    module.on_connect(conn['src']))
+                                assert(conn['src'] in msgs)
+                                out_msg_list.append(msgs[conn['src']])
                             else:
-                                method, name = callbacks[conn['name']]
-                                out_msg_list.append(
-                                    method(conn['src'], conn['buf']))
+                                out_msg_list.append(module.on_message(
+                                    conn['src'], msg, buf))
                         except Exception as e:
                             raise msgio_exception(e, traceback.format_exc())
 
                         stats['in_pkt'] += 1
-                        conn['in_size'] = 28
                         conn['in_pkts'] = list()
-                        del(conn['name'])
-                        del(conn['buf'])
 
                 if conn['handshake_done'] and event & select.EPOLLOUT:
                     if 'pkt' not in conn:
@@ -173,7 +156,7 @@ def loop(module, port, peers, certfile):
                     if 'pkt' in conn:
                         if len(conn['pkt']) > conn['sent']:
                             n = conn['sock'].send(conn['pkt'][
-                                conn['sent']:conn['sent']+8*1024])
+                                conn['sent']:conn['sent']+32*1024])
 
                             conn['sent'] += n
                             stats['out_bytes'] += n
@@ -181,8 +164,7 @@ def loop(module, port, peers, certfile):
                         if len(conn['pkt']) == conn['sent']:
                             del(conn['pkt'])
                             del(conn['sent'])
-                            if(0 == len(conn['msgs']) % 2):
-                                stats['out_pkt'] += 1
+                            stats['out_pkt'] += 1
 
                 if False == conn['handshake_done']:
                     if getattr(conn['sock'], 'do_handshake', None) is None:
@@ -194,7 +176,6 @@ def loop(module, port, peers, certfile):
                     conn['sock'].do_handshake()
                     conn['handshake_done'] = True
                     conn['peer'] = conn['sock'].getpeername()
-                    conn['in_size'] = 28
                     conn['in_pkts'] = list()
                     conn['msgs'] = list()
                     conn['src'] = conn['peer']
@@ -204,7 +185,7 @@ def loop(module, port, peers, certfile):
                         if not conn['is_server']:
                             out_msg_list.extend([
                                 dict(buf=str(port[1])),
-                                module.on_connect(conn['src'])])
+                                msgs[conn['src']]])
                     except Exception as e:
                         raise msgio_exception(e, traceback.format_exc())
 
@@ -234,7 +215,7 @@ def loop(module, port, peers, certfile):
                     addr2fd.pop(conn.get('src'), None)
 
                     if conn['handshake_done']:
-                        out_msg_list.append(module.on_disconnect(
+                        out_msg_list.append(module.on_error(
                             conn['src'], exc, tb))
 
                     if conn['is_server']:
@@ -256,9 +237,10 @@ def loop(module, port, peers, certfile):
 
                             f = addr2fd[dst]
                             connections[f]['msgs'].append(''.join([
-                                hashlib.sha1(msg).digest(),
-                                struct.pack('!Q', len(buf))]))
-                            connections[f]['msgs'].append(buf)
+                                struct.pack('!Q', len(msg) + len(buf)),
+                                struct.pack('!H', len(msg)),
+                                msg,
+                                buf]))
                             epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
 
                 if conn['handshake_done'] is True and 'close' not in conn:
@@ -293,5 +275,5 @@ if '__main__' == __name__:
 
     loop(module,
          conf.get('port', ('0.0.0.0', 1234)),
-         conf.get('peers', list()),
+         conf.get('msgs', list()),
          certfile)
