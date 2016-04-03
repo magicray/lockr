@@ -1,65 +1,40 @@
 import os
-import sys
 import ssl
 import time
 import copy
 import socket
 import select
 import struct
+import marshal
 import logging
 import traceback
 
 
-def request(srv, req, buf=''):
-    servers = getattr(request, 'servers')
-
+def loop(module, node, port, peers, certfile):
+    tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tmp_sock.setblocking(0)
     try:
-        if not req:
-            raise Exception('closed')
-
-        if srv not in servers:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock = ssl.wrap_socket(sock)
-            sock.connect(srv)
-            servers[srv] = sock
-
-        servers[srv].sendall(''.join([
-            struct.pack('!Q', len(req) + len(buf)),
-            struct.pack('!H', len(req)),
-            req,
-            buf]))
-
-        def recvall(length):
-            pkt = list()
-            while length > 0:
-                pkt.append(servers[srv].recv(length))
-                if 0 == len(pkt[-1]):
-                    raise Exception('disconnected')
-                length -= len(pkt[-1])
-            return ''.join(pkt)
-
-        return recvall(struct.unpack('!Q', recvall(8))[0] + 2)[2:]
+        tmp_sock.connect(('0.0.0.0', port))
     except:
-        if srv in servers:
-            servers.pop(srv).close()
-        raise
+        local_ip = tmp_sock.getsockname()[0]
 
-request.servers = dict()
+    if node is None:
+        node = (local_ip, port)
 
+    clients = set()
+    for p in peers:
+        if type(p) is not tuple:
+            x = p.split(':')[0], p.split(':')[1]
+        addr = (socket.gethostbyname(x[0]), int(x[1]))
 
-class msgio_exception(Exception):
-    def __init__(self, exc, tb):
-        self.exc = exc
-        self.tb = tb
+        if addr > (local_ip, port):
+            clients.add((socket.gethostbyname(x[0]), int(x[1])))
 
-
-def loop(module, port, msgs, certfile):
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener_sock.bind(port)
-    listener_sock.listen(5)
     listener_sock.setblocking(0)
+    listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener_sock.bind((local_ip, port))
+    listener_sock.listen(5)
     logging.critical('listening on {0}'.format(port))
 
     epoll = select.epoll()
@@ -71,7 +46,7 @@ def loop(module, port, msgs, certfile):
 
     connections = dict()
     addr2fd = dict()
-    clients = set(filter(lambda x: x > port, msgs))
+    key = os.getenv('MSGIO_KEY', '')
 
     old_stats = (time.time(), copy.deepcopy(stats))
 
@@ -132,17 +107,28 @@ def loop(module, port, msgs, certfile):
 
                         conn['in_pkts'][0] = conn['in_pkts'][0][10+msg_len:]
                         buf = ''.join(conn['in_pkts'])
+
+                        if '' == msg:
+                            cred = marshal.loads(buf)
+                            assert(key == cred['key'])
+                            conn['src'] = cred['node']
+                            addr2fd[conn['src']] = fileno
+
+                            if conn['is_server'] is True:
+                                out_msg_list.append(dict(msg='',
+                                    buf=marshal.dumps(dict(
+                                        node=node, key=key))))
                         try:
                             if '' == msg:
-                                conn['src'] = (conn['peer'][0], int(buf))
-                                addr2fd[conn['src']] = fileno
-                                assert(conn['src'] in msgs)
-                                out_msg_list.append(msgs[conn['src']])
+                                out_msg_list.append(module.on_connect(
+                                    conn['src']))
                             else:
+                                src = conn.get('src', conn['peer'])
                                 out_msg_list.append(module.on_message(
-                                    conn['src'], msg, buf))
+                                    src, msg, buf))
                         except Exception as e:
-                            raise msgio_exception(e, traceback.format_exc())
+                            conn['close'] = (e, traceback.format_exc())
+                            raise
 
                         stats['in_pkt'] += 1
                         conn['in_pkts'] = list()
@@ -178,16 +164,11 @@ def loop(module, port, msgs, certfile):
                     conn['peer'] = conn['sock'].getpeername()
                     conn['in_pkts'] = list()
                     conn['msgs'] = list()
-                    conn['src'] = conn['peer']
-                    addr2fd[conn['src']] = fileno
+                    addr2fd[conn['peer']] = fileno
 
-                    try:
-                        if not conn['is_server']:
-                            out_msg_list.extend([
-                                dict(buf=str(port[1])),
-                                msgs[conn['src']]])
-                    except Exception as e:
-                        raise msgio_exception(e, traceback.format_exc())
+                    if conn['is_server'] is False:
+                        out_msg_list.append(dict(msg='', buf=marshal.dumps(
+                            dict(node=node, key=key))))
 
                 if event & ~(select.EPOLLIN | select.EPOLLOUT):
                     raise Exception('unhandled event({0})'.format(event))
@@ -199,10 +180,9 @@ def loop(module, port, msgs, certfile):
                     epoll.modify(fileno, select.EPOLLOUT)
                 else:
                     conn['close'] = (None, traceback.format_exc())
-            except msgio_exception as e:
-                conn['close'] = (e.exc, e.tb)
             except Exception as e:
-                conn['close'] = (None, traceback.format_exc())
+                if 'close' not in conn:
+                    conn['close'] = (None, traceback.format_exc())
             finally:
                 if 'close' in conn:
                     exc, tb = conn['close']
@@ -212,22 +192,23 @@ def loop(module, port, msgs, certfile):
                     conn['sock'].close()
                     epoll.unregister(fileno)
 
+                    addr2fd.pop(conn.get('peer'), None)
                     addr2fd.pop(conn.get('src'), None)
 
-                    if conn['handshake_done']:
-                        out_msg_list.append(module.on_error(
+                    if conn['handshake_done'] is True and 'src' in conn:
+                        out_msg_list.append(module.on_disconnect(
                             conn['src'], exc, tb))
 
                     if conn['is_server']:
                         stats['srv_disconnect'] += 1
                     else:
                         stats['cli_disconnect'] += 1
-                        clients.add((conn['ip_port'][0], conn['ip_port'][1]))
+                        clients.add(conn['ip_port'])
 
                 if out_msg_list:
                     for l in filter(lambda x: x is not None, out_msg_list):
                         for d in l if type(l) is list else [l]:
-                            dst = d.get('dst', conn['src'])
+                            dst = d.get('dst', conn['peer'])
                             msg = d.get('msg', '')
                             buf = d.get('buf', '')
 
@@ -256,24 +237,4 @@ def loop(module, port, msgs, certfile):
                 8*(stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor))
             old_stats = (time.time(), copy.deepcopy(stats))
 
-        getattr(module, 'on_stats')(copy.deepcopy(stats))
-
-
-if '__main__' == __name__:
-    module = __import__(
-        sys.argv[1],
-        fromlist='.'.join(sys.argv[1].split('.')[:-1]))
-
-    conf = module.on_init()
-
-    certfile = conf.get('cert', 'cert.pem')
-    if not os.path.isfile(certfile):
-        os.mknod(certfile)
-        os.system(
-            'openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
-            ' -subj "/" -out {0} -keyout {0} 2> /dev/null'.format(certfile))
-
-    loop(module,
-         conf.get('port', ('0.0.0.0', 1234)),
-         conf.get('msgs', list()),
-         certfile)
+        getattr(module, 'on_stats', lambda x: None)(copy.deepcopy(stats))

@@ -22,7 +22,6 @@ class g:
     key_list = collections.deque()
     vclocks = dict()
     acks = collections.deque()
-    port = None
     peers = dict()
     followers = dict()
     quorum = 0
@@ -39,14 +38,15 @@ class g:
     def json(cls):
         return json.dumps(dict(
             state=g.state,
-            port=g.port,
+            node=g.opt.node,
+            port=g.opt.port,
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
             size=g.size,
             clock=g.clock,
             keys=[len(g.key_list), len(g.kv), len(g.kv_tmp), len(g.acks)],
-            peers=dict([('{0}:{1}'.format(k[0], k[1]), dict(
+            peers=dict([(k, dict(
                 keys=v['keys'],
                 clock=v['clock'],
                 minfile=v['minfile'],
@@ -66,13 +66,16 @@ def sync(src, buf):
     g.clock = (g.clock[0], g.clock[1]+1)
     msgs = [dict(msg='sync', buf=g.json())]
 
-    if type(g.state) is tuple or g.state in ('old-sync', 'leader'):
+    if g.state.startswith('following-'):
+        return msgs
+
+    if g.state in ('old-sync', 'leader'):
         return msgs
 
     if 'new-sync' == g.state:
         in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
                          filter(lambda k: g.offset == g.peers[k]['offset'],
-                                filter(lambda k: g.peers[k], g.peers.keys())))
+                                g.peers))
 
         if len(in_sync) >= g.quorum:
             log('quorum({0} >= {1}) in sync with new session'.format(
@@ -107,40 +110,39 @@ def sync(src, buf):
                 break
 
     if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
-        g.state = src
+        g.state = 'following-' + src
         log('LEADER({0}) identified'.format(src))
     else:
-        leader = (g.port, g.__dict__, 'self')
+        leader = (g.opt.node, g.__dict__, 'self')
         count = 0
         for k, v in g.peers.iteritems():
-            if v:
-                count += 1
-                l, p = leader[1], v
+            count += 1
+            l, p = leader[1], v
 
-                if l['maxfile'] != p['maxfile']:
-                    if l['maxfile'] < p['maxfile']:
-                        leader = (k, p, 'maxfile({0} > {1})'.format(
-                            p['maxfile'], l['maxfile']))
-                    continue
+            if l['maxfile'] != p['maxfile']:
+                if l['maxfile'] < p['maxfile']:
+                    leader = (k, p, 'maxfile({0} > {1})'.format(
+                        p['maxfile'], l['maxfile']))
+                continue
 
-                if l['offset'] != p['offset']:
-                    if l['offset'] < p['offset']:
-                        leader = (k, p, 'offset({0} > {1})'.format(
-                            p['offset'], l['offset']))
-                    continue
+            if l['offset'] != p['offset']:
+                if l['offset'] < p['offset']:
+                    leader = (k, p, 'offset({0} > {1})'.format(
+                        p['offset'], l['offset']))
+                continue
 
-                h = hashlib.md5(str(k)+str(g.maxfile)).hexdigest()
-                if h > hashlib.md5(str(leader[0])+str(g.maxfile)).hexdigest():
-                    leader = (k, p, 'round robin selection')
+            h = hashlib.md5(k+str(p['maxfile'])).hexdigest()
+            if h > hashlib.md5(leader[0]+str(p['maxfile'])).hexdigest():
+                leader = (k, p, 'round robin selection')
 
         if (src == leader[0]) and (count >= g.quorum):
-            g.state = src
+            g.state = 'following-' + src
             log('LEADER({0}) selected due to {1}'.format(src, leader[2]))
 
-    if type(g.state) is tuple:
+    if g.state.startswith('following-'):
         msgs.append(dict(msg='replication_request', buf=g.json()))
 
-        log('sent replication-request to{0} file({1}) offset({2})'.format(
+        log('sent replication-request to({0}) file({1}) offset({2})'.format(
             src, g.maxfile, g.size))
 
     return msgs
@@ -149,11 +151,11 @@ def sync(src, buf):
 def replication_request(src, buf):
     req = json.loads(buf)
 
-    log('received replication-request from{0} file({1}) offset({2})'.format(
+    log('received replication-request from({0}) file({1}) offset({2})'.format(
         src, req['maxfile'], req['offset']))
 
-    if type(g.state) is tuple:
-        log('rejecting replication-request from{0} as following{1}'.format(
+    if g.state.startswith('following-'):
+        log('rejecting replication-request from({0}) as ({1})'.format(
             src, g.state))
         raise Exception('reject-replication-request')
 
@@ -161,8 +163,8 @@ def replication_request(src, buf):
         log('accepted {0} as follower({1})'.format(src, len(g.followers)+1))
 
     g.followers[src] = req
-    if tuple(req['port']) in g.peers:
-        g.peers[tuple(req['port'])] = req
+    if req['port'] in g.peers:
+        g.peers[req['port']] = req
 
     if not g.state and len(g.followers) == g.quorum:
         g.state = 'old-sync'
@@ -186,10 +188,11 @@ def replication_request(src, buf):
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {'{0}:{1}'.format(g.port[0], g.port[1]): g.clock}
+            vclk = {g.opt.node : g.clock}
             for k in filter(lambda k: g.peers[k], g.peers):
-                vclk['{0}:{1}'.format(k[0], k[1])] = g.peers[k]['clock']
+                vclk[k] = g.peers[k]['clock']
 
+            print(vclk)
             vclk = json.dumps(vclk)
 
             append(vclk)
@@ -319,7 +322,7 @@ def replication_truncate(src, buf):
 def replication_nextfile(src, buf):
     req = json.loads(buf)
 
-    log('received replication-nextfile from{0} filenum({1})'.format(
+    log('received replication-nextfile from({0}) filenum({1})'.format(
         src, req['filenum']))
 
     g.maxfile = req['filenum']
@@ -331,17 +334,17 @@ def replication_nextfile(src, buf):
         os.close(g.fd)
         g.fd = None
 
-    log('sent replication-request to{0} file({1}) offset({2})'.format(
+    log('sent replication-request to({0}) file({1}) offset({2})'.format(
         src, g.maxfile, g.size))
     return dict(msg='replication_request', buf=g.json())
 
 
 def replication_response(src, buf):
-    log(('received replication-response from {0} size({1})').format(
+    log(('received replication-response from({0}) size({1})').format(
         src, len(buf)))
 
     try:
-        assert(src == g.state)
+        assert(src == g.state.split('-')[1])
         assert(len(buf) > 0)
 
         if not g.fd:
@@ -354,10 +357,12 @@ def replication_response(src, buf):
         os.fsync(g.fd)
         assert(g.offset+len(buf) == os.fstat(g.fd).st_size)
 
+        size = g.size
         g.update(scan(g.opt.data, g.maxfile, g.offset, g.checksum,
                       kv_put, vclock_put))
+        assert(g.size == size + len(buf))
 
-        log('sent replication-request to{0} file({1}) offset({2})'.format(
+        log('sent replication-request to({0}) file({1}) offset({2})'.format(
             src, g.maxfile, g.size))
         return dict(msg='replication_request', buf=g.json())
     except:
@@ -369,21 +374,21 @@ def on_message(src, msg, buf):
     return globals()[msg](src, buf)
 
 
-def on_error(src, exc, tb):
-    if src not in g.peers:
-        return
+def on_connect(src):
+    return dict(msg='sync', buf=g.json())
 
-    log('disconnected from {0} reason({1})'.format(src, str(exc)))
+
+def on_disconnect(src, exc, tb):
     if exc and str(exc) != 'reject-replication-request':
         log(tb)
 
     if src in g.peers:
-        g.peers[src] = None
+        del(g.peers[src])
 
-    if src == g.state:
+    if 'following-' + src == g.state:
         assert(not g.followers)
 
-        g.state = None
+        g.state = ''
         if g.fd:
             os.fsync(g.fd)
             os.close(g.fd)
@@ -393,7 +398,8 @@ def on_error(src, exc, tb):
 
     if src in g.followers:
         g.followers.pop(src)
-        log('removed follower{0} remaining({1})'.format(src, len(g.followers)))
+        log('removed follower({0}) remaining({1})'.format(
+            src, len(g.followers)))
 
     if g.state in ('old-sync', 'new-sync', 'leader'):
         if len(g.followers) < g.quorum:
@@ -621,8 +627,10 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
 
 def on_init():
     parser = optparse.OptionParser()
-    parser.add_option('--port', dest='port', type='string',
-                      help='server:port tuple. skip to start the client')
+    parser.add_option('--node', dest='node', type='string',
+                      help='node name')
+    parser.add_option('--port', dest='port', type='int',
+                      help='port number')
     parser.add_option('--peers', dest='peers', type='string',
                       help='comma separated list of ip:port')
     parser.add_option('--data', dest='data', type='string',
@@ -639,14 +647,7 @@ def on_init():
 
     logging.basicConfig(format='%(asctime)s: %(message)s', level=g.opt.log)
 
-    peers = set(map(lambda x: (socket.gethostbyname(x[0]), int(x[1])),
-                    map(lambda x: x.split(':'),
-                        g.opt.peers.split(','))))
-    g.port = (socket.gethostbyname(g.opt.port.split(':')[0]),
-              int(g.opt.port.split(':')[1]))
-
-    g.peers = dict((ip_port, None) for ip_port in peers)
-    g.quorum = int(len(g.peers)/2.0 + 0.6)
+    g.quorum = int(len(g.opt.peers.split(','))/2.0 + 0.6)
 
     if not os.path.isdir(g.opt.data):
         os.mkdir(g.opt.data)
@@ -668,14 +669,18 @@ def on_init():
     if files:
         g.minfile = min(files)
         g.maxfile = min(files)
-        with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
-            vclklen = struct.unpack('!Q', fd.read(8))[0]
-            g.vclocks[g.maxfile] = json.loads(fd.read(vclklen))
-            g.checksum = fd.read(20).encode('hex')
-            g.offset = fd.tell()
-            fd.seek(0, 2)
-            g.size = fd.tell()
-            assert(g.offset == vclklen + 28)
+        try:
+            with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
+                vclklen = struct.unpack('!Q', fd.read(8))[0]
+                g.vclocks[g.maxfile] = json.loads(fd.read(vclklen))
+                g.checksum = fd.read(20).encode('hex')
+                g.offset = fd.tell()
+                fd.seek(0, 2)
+                g.size = fd.tell()
+                assert(g.offset == vclklen + 28)
+        except:
+            if g.minfile == g.maxfile:
+                os.remove(os.path.join(g.opt.data, str(g.minfile)))
 
         g.__dict__.update(scan(g.opt.data, g.maxfile, g.offset, g.checksum,
                                kv_put, vclock_put))
@@ -711,7 +716,7 @@ def on_init():
 
     signal.alarm(random.randint(g.opt.timeout, 2*g.opt.timeout))
 
-    return dict(
-        cert=g.opt.cert,
-        port=g.port,
-        msgs=dict([(p, dict(msg='sync', buf=g.json())) for p in peers]))
+    return dict(node=g.opt.node,
+                port=g.opt.port,
+                peers=g.opt.peers.split(','),
+                cert=g.opt.cert)

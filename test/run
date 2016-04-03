@@ -1,7 +1,9 @@
 #!/bin/bash
 
-PEERS=localhost:$2,localhost:$3,localhost:$4,localhost:$5
+export PYTHONPATH=~/git/lockr
+PEERS=localhost:$3,localhost:$4,localhost:$5,localhost:$6
+
 while true; do
     echo
-    python ~/git/lockr/msgio.py server --port localhost:$1 --peers $PEERS
+    python -mmsgio lockr --node $1 --port $2 --peers $PEERS
 done
