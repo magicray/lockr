@@ -1,53 +1,8 @@
-import cmd
-import shlex
 import lockr
 import msgio
-import pprint
+import client
 import logging
 import optparse
-
-class Client(cmd.Cmd):
-    prompt = '>'
-
-    def __init__(self, servers):
-        cmd.Cmd.__init__(self)
-        self.cli = lockr.Lockr(servers)
-
-    def do_EOF(self, line):
-        self.do_quit(line)
-
-    def do_quit(self, line):
-        exit(0)
-
-    def do_state(self, line):
-        print(pprint.pformat(self.cli.state()).replace("u'", " '"))
-
-    def do_get(self, line):
-        for k, v in self.cli.get(line.split()).iteritems():
-            print('{0} <{1}> {2}'.format(k, v[0], v[1]))
-
-    def do_put(self, line):
-        cmd = shlex.split(line)
-        tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-        docs = dict([(t[0], (t[1].strip('<>'), t[2])) for t in tup])
-        code, value = self.cli.put(docs)
-        if 0 == code:
-            print('<{0}-{1}>'.format(value[0], value[1]))
-        else:
-            print('{0}'.format(value))
-
-    def do_watch(self, line):
-        cmd = shlex.split(line)
-
-        code, result = self.cli.watch(
-            dict(map(lambda x: (x[0], tuple(map(int,
-                                                x[1].strip('<>').split('-')))),
-                     zip(cmd[0::2], cmd[1::2]))))
-        if 0 == code:
-            key, txn, value = result
-            print('{0} <{1}-{2}> {3}'.format(key, txn[0], txn[1], value))
-        else:
-            print(result)
 
 
 parser = optparse.OptionParser()
@@ -76,6 +31,6 @@ if opt.port:
     lockr.g.opt = opt
     msgio.loop(lockr)
 else:
-    Client(set(map(lambda x: (x[0], int(x[1])),
-                   map(lambda x: x.split(':'),
-                       opt.servers.split(','))))).cmdloop()
+    client.Client(set(map(lambda x: (x[0], int(x[1])),
+                      map(lambda x: x.split(':'),
+                          opt.servers.split(','))))).cmdloop()
