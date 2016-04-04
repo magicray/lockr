@@ -37,7 +37,7 @@ class g:
     def json(cls):
         return json.dumps(dict(
             state=g.state,
-            node=g.opt.node,
+            node=node,
             port=g.opt.port,
             minfile=g.minfile,
             maxfile=g.maxfile,
@@ -112,7 +112,7 @@ def sync(src, buf):
         g.state = 'following-' + src
         log('LEADER({0}) identified'.format(src))
     else:
-        leader = (g.opt.node, g.__dict__, 'self')
+        leader = (node, g.__dict__, 'self')
         count = 0
         for k, v in g.peers.iteritems():
             count += 1
@@ -187,7 +187,7 @@ def replication_request(src, buf):
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {g.opt.node: g.clock}
+            vclk = {node: g.clock}
             for k in filter(lambda k: g.peers[k], g.peers):
                 vclk[k] = g.peers[k]['clock']
 
@@ -625,27 +625,6 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
 
 
 def on_init():
-    parser = optparse.OptionParser()
-    parser.add_option('--node', dest='node', type='string',
-                      help='node name')
-    parser.add_option('--port', dest='port', type='int',
-                      help='port number')
-    parser.add_option('--peers', dest='peers', type='string',
-                      help='comma separated list of ip:port')
-    parser.add_option('--data', dest='data', type='string',
-                      help='data directory', default='data')
-    parser.add_option('--max', dest='max', type='int',
-                      help='max file size', default='256')
-    parser.add_option('--timeout', dest='timeout', type='int',
-                      help='timeout in seconds', default='30')
-    parser.add_option('--cert', dest='cert', type='string',
-                      help='certificate file path', default='cert.pem')
-    parser.add_option('--log', dest='log', type=int,
-                      help='logging level', default=logging.INFO)
-    g.opt, args = parser.parse_args()
-
-    logging.basicConfig(format='%(asctime)s: %(message)s', level=g.opt.log)
-
     g.quorum = int(len(g.opt.peers.split(','))/2.0 + 0.6)
 
     if not os.path.isdir(g.opt.data):
@@ -715,7 +694,6 @@ def on_init():
 
     signal.alarm(random.randint(g.opt.timeout, 2*g.opt.timeout))
 
-    return dict(node=g.opt.node,
-                port=g.opt.port,
+    return dict(port=g.opt.port,
                 peers=g.opt.peers.split(','),
                 cert=g.opt.cert)
