@@ -10,7 +10,17 @@ import logging
 import traceback
 
 
-def loop(module, node, port, peers, certfile):
+def loop(module):
+    conf = module.on_init()
+
+    cert = conf.get('cert', 'cert.pem')
+    if not os.path.isfile(cert):
+        os.mknod(cert)
+        os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
+                  '-subj "/" -out {0} -keyout {0} 2> /dev/null'.format(cert))
+
+    port = conf.get('port', 1234)
+
     tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tmp_sock.setblocking(0)
     try:
@@ -18,11 +28,10 @@ def loop(module, node, port, peers, certfile):
     except:
         local_ip = tmp_sock.getsockname()[0]
 
-    if node is None:
-        node = (local_ip, port)
+    node = conf.get('node', (local_ip, port))
 
     clients = set()
-    for p in peers:
+    for p in conf.get('peers', list()):
         if type(p) is not tuple:
             x = p.split(':')[0], p.split(':')[1]
         addr = (socket.gethostbyname(x[0]), int(x[1]))
@@ -76,7 +85,7 @@ def loop(module, node, port, peers, certfile):
                 stats['srv_accept'] += 1
                 s.setblocking(0)
                 s = ssl.wrap_socket(s,
-                                    certfile=certfile,
+                                    certfile=cert,
                                     do_handshake_on_connect=False,
                                     server_side=True)
                 connections[s.fileno()] = dict(
