@@ -115,7 +115,8 @@ def loop(module, node, port, peers, certfile):
                             addr2fd[conn['src']] = fileno
 
                             if conn['is_server'] is True:
-                                out_msg_list.append(dict(msg='',
+                                out_msg_list.append(dict(
+                                    msg='',
                                     buf=marshal.dumps(dict(
                                         node=node, key=key))))
                         try:

@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import socket
 import struct
 import random
 import signal
@@ -188,7 +187,7 @@ def replication_request(src, buf):
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {g.opt.node : g.clock}
+            vclk = {g.opt.node: g.clock}
             for k in filter(lambda k: g.peers[k], g.peers):
                 vclk[k] = g.peers[k]['clock']
 

@@ -5,5 +5,5 @@ PEERS=localhost:$3,localhost:$4,localhost:$5,localhost:$6
 
 while true; do
     echo
-    python -mmsgio lockr --node $1 --port $2 --peers $PEERS
+    python ~/git/lockr/msgio lockr --node $1 --port $2 --peers $PEERS
 done

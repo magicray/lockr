@@ -1,16 +1,11 @@
 from __future__ import absolute_import
-import cmd
 import time
 import json
-import shlex
-import msgio.client as msgio
+import msgio
 import struct
-import pprint
-import logging
-import optparse
-import traceback
 
 from logging import critical as log
+
 
 class Lockr(object):
     def __init__(self, servers, timeout=30):
