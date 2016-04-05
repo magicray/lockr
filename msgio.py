@@ -10,16 +10,12 @@ import logging
 import traceback
 
 
-def loop(module):
-    conf = module.on_init()
-
-    cert = conf.get('cert', 'cert.pem')
+def loop(module, port, peers):
+    cert = os.getenv('MSGIO_CERT', 'cert.pem')
     if not os.path.isfile(cert):
         os.mknod(cert)
         os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
                   '-subj "/" -out {0} -keyout {0} 2> /dev/null'.format(cert))
-
-    port = conf.get('port', 1234)
 
     tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tmp_sock.setblocking(0)
@@ -28,17 +24,13 @@ def loop(module):
     except:
         local_ip = tmp_sock.getsockname()[0]
 
-    node = conf.get('node', '{0}:{1}'.format(local_ip, port))
-    module.node = node
+    if 'MSGIO_NODE' not in os.environ:
+        os.environ['MSGIO_NODE'] = '{0}:{1}'.format(local_ip, port)
+    node = os.getenv('MSGIO_NODE')
 
-    clients = set()
-    for p in conf.get('peers', list()):
-        if type(p) is not tuple:
-            x = p.split(':')[0], p.split(':')[1]
-        addr = (socket.gethostbyname(x[0]), int(x[1]))
-
-        if addr > (local_ip, port):
-            clients.add((socket.gethostbyname(x[0]), int(x[1])))
+    clients = set(filter(lambda x: x > (local_ip, port),
+                         map(lambda x: (socket.gethostbyname(x[0]), x[1]),
+                             peers)))
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setblocking(0)

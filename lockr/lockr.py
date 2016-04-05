@@ -2,8 +2,6 @@ import os
 import time
 import json
 import struct
-import random
-import signal
 import logging
 import hashlib
 import optparse
@@ -14,7 +12,8 @@ from logging import critical as log
 
 
 class g:
-    opt = None
+    data = None
+    max_size = None
     fd = None
     kv = dict()
     kv_tmp = dict()
@@ -37,8 +36,7 @@ class g:
     def json(cls):
         return json.dumps(dict(
             state=g.state,
-            node=node,
-            port=g.opt.port,
+            node=os.getenv('MSGIO_NODE'),
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
@@ -91,7 +89,7 @@ def sync(src, buf):
 
         for key in set(peer_vclock).intersection(set(my_vclock)):
             if peer_vclock[key] > my_vclock[key]:
-                os.remove(os.path.join(g.opt.data, str(g.maxfile)))
+                os.remove(os.path.join(g.data, str(g.maxfile)))
                 log(('REMOVED file({0}) as vclock({1}) is ahead'.format(
                     g.maxfile, src)))
                 os._exit(0)
@@ -101,7 +99,7 @@ def sync(src, buf):
             src, g.peers[src]['minfile'], g.maxfile))
         while True:
             try:
-                os.remove(os.path.join(g.opt.data, str(g.maxfile)))
+                os.remove(os.path.join(g.data, str(g.maxfile)))
                 log('removed file({0})'.format(g.maxfile))
                 g.maxfile -= 1
             except:
@@ -112,7 +110,7 @@ def sync(src, buf):
         g.state = 'following-' + src
         log('LEADER({0}) identified'.format(src))
     else:
-        leader = (node, g.__dict__, 'self')
+        leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
         count = 0
         for k, v in g.peers.iteritems():
             count += 1
@@ -162,8 +160,6 @@ def replication_request(src, buf):
         log('accepted {0} as follower({1})'.format(src, len(g.followers)+1))
 
     g.followers[src] = req
-    if req['port'] in g.peers:
-        g.peers[req['port']] = req
 
     if not g.state and len(g.followers) == g.quorum:
         g.state = 'old-sync'
@@ -187,7 +183,7 @@ def replication_request(src, buf):
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {node: g.clock}
+            vclk = {os.getenv('MSGIO_NODE'): g.clock}
             for k in filter(lambda k: g.peers[k], g.peers):
                 vclk[k] = g.peers[k]['clock']
 
@@ -225,8 +221,8 @@ def replication_request(src, buf):
 
     if acks:
         os.fsync(g.fd)
-    elif committed_offset == g.offset and g.offset > g.opt.max:
-        log('max file size reached({0} > {1})'.format(g.offset, g.opt.max))
+    elif committed_offset == g.offset and g.offset > g.max_size:
+        log('max file size reached({0} > {1})'.format(g.offset, g.max_size))
         os._exit(0)
 
     return acks + get_replication_responses()
@@ -239,7 +235,7 @@ def get_replication_responses():
 
         if 0 == req['maxfile']:
             f = map(int, filter(lambda x: x != 'reboot',
-                                os.listdir(g.opt.data)))
+                                os.listdir(g.data)))
             if f:
                 log('sent replication-nextfile to {0} file({1})'.format(
                     src, min(f)))
@@ -248,7 +244,7 @@ def get_replication_responses():
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                                  buf=json.dumps(dict(filenum=min(f)))))
 
-        if not os.path.isfile(os.path.join(g.opt.data, str(req['maxfile']))):
+        if not os.path.isfile(os.path.join(g.data, str(req['maxfile']))):
             continue
 
         v1 = json.dumps(g.vclocks[req['maxfile']], sort_keys=True)
@@ -265,7 +261,7 @@ def get_replication_responses():
             msgs.append(dict(dst=src, msg='replication_truncate',
                              buf=json.dumps(dict(truncate=0))))
 
-        with open(os.path.join(g.opt.data, str(req['maxfile']))) as fd:
+        with open(os.path.join(g.data, str(req['maxfile']))) as fd:
             fd.seek(0, 2)
 
             if fd.tell() < req['size']:
@@ -307,7 +303,7 @@ def replication_truncate(src, buf):
     log('received replication-truncate from{0} size({1})'.format(
         src, req['truncate']))
 
-    f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
+    f = os.open(os.path.join(g.data, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
     os.ftruncate(f, req['truncate'])
     os.fsync(f)
@@ -347,7 +343,7 @@ def replication_response(src, buf):
         assert(len(buf) > 0)
 
         if not g.fd:
-            g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
+            g.fd = os.open(os.path.join(g.data, str(g.maxfile)),
                            os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                            0644)
 
@@ -357,7 +353,7 @@ def replication_response(src, buf):
         assert(g.offset+len(buf) == os.fstat(g.fd).st_size)
 
         size = g.size
-        g.update(scan(g.opt.data, g.maxfile, g.offset, g.checksum,
+        g.update(scan(g.data, g.maxfile, g.offset, g.checksum,
                       kv_put, vclock_put))
         assert(g.size == size + len(buf))
 
@@ -439,7 +435,7 @@ def watch(src, buf):
 
 
 def put(src, buf):
-    if g.offset > g.opt.max:
+    if g.offset > g.max_size:
         return
 
     try:
@@ -507,13 +503,13 @@ def append(buf):
     chksum.update(buf)
 
     if not g.fd:
-        g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
+        g.fd = os.open(os.path.join(g.data, str(g.maxfile)),
                        os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                        0644)
 
     os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
 
-    g.update(scan(g.opt.data, g.maxfile, g.offset, g.checksum,
+    g.update(scan(g.data, g.maxfile, g.offset, g.checksum,
                   kv_tmp_put, vclock_put))
 
 
@@ -624,31 +620,33 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
             return result
 
 
-def on_init():
-    g.quorum = int(len(g.opt.peers.split(','))/2.0 + 0.6)
+def init(peers, data_dir, max_size):
+    g.data = data_dir
+    g.max_size = max_size
+    g.quorum = int(len(peers)/2.0 + 0.6)
 
-    if not os.path.isdir(g.opt.data):
-        os.mkdir(g.opt.data)
+    if not os.path.isdir(g.data):
+        os.mkdir(g.data)
 
     try:
-        with open(os.path.join(g.opt.data, 'reboot')) as fd:
+        with open(os.path.join(g.data, 'reboot')) as fd:
             reboot = int(fd.read()) + 1
     except:
         reboot = 1
     finally:
-        with open(os.path.join(g.opt.data, 'tmp'), 'w') as fd:
+        with open(os.path.join(g.data, 'tmp'), 'w') as fd:
             fd.write(str(reboot))
-        os.rename(os.path.join(g.opt.data, 'tmp'),
-                  os.path.join(g.opt.data, 'reboot'))
+        os.rename(os.path.join(g.data, 'tmp'),
+                  os.path.join(g.data, 'reboot'))
         log('RESTARTING sequence({0})'.format(reboot))
         g.clock = (reboot, 0)
 
-    files = map(int, filter(lambda x: x != 'reboot', os.listdir(g.opt.data)))
+    files = map(int, filter(lambda x: x != 'reboot', os.listdir(g.data)))
     if files:
         g.minfile = min(files)
         g.maxfile = min(files)
         try:
-            with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
+            with open(os.path.join(g.data, str(g.minfile)), 'rb') as fd:
                 vclklen = struct.unpack('!Q', fd.read(8))[0]
                 g.vclocks[g.maxfile] = json.loads(fd.read(vclklen))
                 g.checksum = fd.read(20).encode('hex')
@@ -658,9 +656,9 @@ def on_init():
                 assert(g.offset == vclklen + 28)
         except:
             if g.minfile == g.maxfile:
-                os.remove(os.path.join(g.opt.data, str(g.minfile)))
+                os.remove(os.path.join(g.data, str(g.minfile)))
 
-        g.__dict__.update(scan(g.opt.data, g.maxfile, g.offset, g.checksum,
+        g.__dict__.update(scan(g.data, g.maxfile, g.offset, g.checksum,
                                kv_put, vclock_put))
 
         if g.kv:
@@ -669,12 +667,12 @@ def on_init():
             remove_max = g.maxfile
 
         for n in range(g.minfile, remove_max):
-            os.remove(os.path.join(g.opt.data, str(n)))
+            os.remove(os.path.join(g.data, str(n)))
             log('removed file({0})'.format(n))
 
         g.minfile = remove_max
 
-        f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
+        f = os.open(os.path.join(g.data, str(g.maxfile)), os.O_RDWR)
         n = os.fstat(f).st_size
         if n > g.offset:
             os.ftruncate(f, g.offset)
@@ -686,14 +684,8 @@ def on_init():
         filenum = g.maxfile + 1
         while True:
             try:
-                os.remove(os.path.join(g.opt.data, str(filenum)))
+                os.remove(os.path.join(g.data, str(filenum)))
                 log('removed file({0})'.format(filenum))
                 filenum += 1
             except:
                 break
-
-    signal.alarm(random.randint(g.opt.timeout, 2*g.opt.timeout))
-
-    return dict(port=g.opt.port,
-                peers=g.opt.peers.split(','),
-                cert=g.opt.cert)
