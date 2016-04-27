@@ -11,6 +11,9 @@ import traceback
 import collections
 
 
+logger = logging.getLogger('msgio')
+
+
 def loop(module, port, peers):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -33,6 +36,7 @@ def loop(module, port, peers):
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener_sock.bind(port)
     listener_sock.listen(5)
+    logger.critical('listening on %s', port)
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
@@ -44,7 +48,7 @@ def loop(module, port, peers):
     connections = dict()
     addr2fd = dict()
 
-    old_stats = (0, copy.deepcopy(stats))
+    old_stats = (time.time(), copy.deepcopy(stats))
     last_connect_time = 0
 
     if not os.path.isfile(cert):
@@ -69,6 +73,7 @@ def loop(module, port, peers):
                 epoll.register(s.fileno(), select.EPOLLOUT)
                 try:
                     stats['cli_connect'] += 1
+                    logger.debug('connecting to %s', ip_port)
                     s.connect(ip_port)
                 except Exception as e:
                     if 115 != e.errno:
@@ -89,6 +94,7 @@ def loop(module, port, peers):
                     is_server=True,
                     handshake_done=False)
                 epoll.register(s.fileno(), select.EPOLLIN)
+                logger.debug('accepted connection from %s', addr)
                 continue
 
             try:
@@ -118,6 +124,8 @@ def loop(module, port, peers):
                             assert(key == cred['key'])
                             conn['src'] = cred['node']
                             addr2fd[conn['src']] = fileno
+                            logger.debug('from%s node(%s) msg(%s) len(%d)',
+                                conn['peer'], conn['src'], msg, len(buf))
 
                             if conn['is_server'] is True:
                                 out_msg_list.append(dict(
@@ -130,6 +138,8 @@ def loop(module, port, peers):
                                     conn['src']))
                             else:
                                 src = conn.get('src', conn['peer'])
+                                logger.info('from%s node(%s) msg(%s) len(%d)',
+                                    conn['peer'], src, msg, len(buf))
                                 out_msg_list.append(module.on_message(
                                     src, msg, buf))
                         except Exception as e:
@@ -141,12 +151,15 @@ def loop(module, port, peers):
 
                 if conn['handshake_done'] and event & select.EPOLLOUT:
                     if conn['out'][0]:
-                        n = conn['sock'].send(conn['out'][0][:32*1024])
-                        conn['out'][0] = conn['out'][0][n:]
+                        n = conn['sock'].send(conn['out'][0][1][:32*1024])
+                        conn['out'][0][1] = conn['out'][0][1][n:]
                         stats['out_bytes'] += n
 
-                    if not conn['out'][0]:
-                        conn['out'].popleft()
+                    if not conn['out'][0][1]:
+                        src = conn.get('src', conn['peer'])
+                        meta, _ = conn['out'].popleft()
+                        logger.info('to%s node(%s) msg(%s) len(%d)',
+                            conn['peer'], src, meta[0], meta[1])
                         stats['out_pkt'] += 1
 
                 if False == conn['handshake_done']:
@@ -162,12 +175,14 @@ def loop(module, port, peers):
                     conn['in'] = list()
                     conn['out'] = collections.deque()
                     addr2fd[conn['peer']] = fileno
+                    logger.debug('ssl handshake done for %s', conn['peer'])
 
                     if conn['is_server'] is False:
                         out_msg_list.append(dict(msg='', buf=marshal.dumps(
                             dict(node=node, key=key))))
 
                 if event & ~(select.EPOLLIN | select.EPOLLOUT):
+                    logger.error('unhandled event(%0x)', event)
                     raise Exception('unhandled event({0})'.format(event))
 
             except ssl.SSLError as e:
@@ -193,13 +208,17 @@ def loop(module, port, peers):
                     addr2fd.pop(conn.get('src'), None)
 
                     if conn['handshake_done'] is True and 'src' in conn:
+                        logger.info('disconnected%s node(%s)',
+                            conn['peer'], conn['src'])
                         out_msg_list.append(module.on_disconnect(
                             conn['src'], exc, tb))
 
                     if conn['is_server']:
                         stats['srv_disconnect'] += 1
+                        logger.debug('disconnected%s', conn['peer'])
                     else:
                         stats['cli_disconnect'] += 1
+                        logger.debug('disconnected%s', conn['ip_port'])
                         clients.add(conn['ip_port'])
 
                 if out_msg_list:
@@ -210,15 +229,17 @@ def loop(module, port, peers):
                             buf = d.get('buf', '')
 
                             if dst not in addr2fd:
-                                logging.critical('{0} not found'.format(dst))
+                                logger.warning('%s not found', dst)
                                 continue
 
                             f = addr2fd[dst]
-                            connections[f]['out'].append(''.join([
-                                struct.pack('!Q', len(msg) + len(buf)),
-                                struct.pack('!H', len(msg)),
-                                msg,
-                                buf]))
+                            connections[f]['out'].append([
+                                (msg, len(buf)),
+                                ''.join([
+                                    struct.pack('!Q', len(msg) + len(buf)),
+                                    struct.pack('!H', len(msg)),
+                                    msg,
+                                    buf])])
                             epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
 
                 if conn['handshake_done'] is True and 'close' not in conn:
@@ -229,9 +250,9 @@ def loop(module, port, peers):
 
         if time.time() > old_stats[0] + 60:
             divisor = (time.time() - old_stats[0])*2**20
-            logging.info('in-mbps(%0.3f) out-mbps(%0.3f)' % (
+            logger.info('in-mbps(%0.3f) out-mbps(%0.3f)', 
                 8*(stats['in_bytes'] - old_stats[1]['in_bytes'])/divisor,
-                8*(stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor))
+                8*(stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor)
             old_stats = (time.time(), copy.deepcopy(stats))
 
         getattr(module, 'on_stats', lambda x: None)(copy.deepcopy(stats))
