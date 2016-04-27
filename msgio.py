@@ -12,33 +12,27 @@ import collections
 
 
 def loop(module, port, peers):
-    cert = os.getenv('MSGIO_CERT', 'cert.pem')
-    if not os.path.isfile(cert):
-        os.mknod(cert)
-        os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
-                  '-subj "/" -out {0} -keyout {0} 2> /dev/null'.format(cert))
-
-    tmp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tmp_sock.setblocking(0)
     try:
-        tmp_sock.connect(('0.0.0.0', port))
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setblocking(0)
+        s.connect(('0.0.0.0', port))
     except:
-        local_ip = tmp_sock.getsockname()[0]
+        port = (s.getsockname()[0], port)
 
-    if 'MSGIO_NODE' not in os.environ:
-        os.environ['MSGIO_NODE'] = '{0}:{1}'.format(local_ip, port)
-    node = os.getenv('MSGIO_NODE')
+    cert = os.getenv('MSGIO_CERT', 'cert.pem')
+    node = os.getenv('MSGIO_NODE', '{0}:{1}'.format(*port))
+    key = os.getenv('MSGIO_KEY', '')
+    os.environ['MSGIO_NODE'] = node
 
-    clients = set(filter(lambda x: x > (local_ip, port),
+    clients = set(filter(lambda x: x > port,
                          map(lambda x: (socket.gethostbyname(x[0]), x[1]),
                              peers)))
 
     listener_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener_sock.setblocking(0)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener_sock.bind((local_ip, port))
+    listener_sock.bind(port)
     listener_sock.listen(5)
-    logging.critical('listening on {0}'.format(port))
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
@@ -49,10 +43,14 @@ def loop(module, port, peers):
 
     connections = dict()
     addr2fd = dict()
-    key = os.getenv('MSGIO_KEY', '')
 
     old_stats = (0, copy.deepcopy(stats))
     last_connect_time = 0
+
+    if not os.path.isfile(cert):
+        os.mknod(cert)
+        os.system('openssl req -new -x509 -days 365 -nodes -newkey rsa:2048 '
+                  '-subj "/" -out {0} -keyout {0} 2> /dev/null'.format(cert))
 
     while True:
         if time.time() > last_connect_time + 1:
