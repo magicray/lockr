@@ -8,6 +8,7 @@ import struct
 import marshal
 import logging
 import traceback
+import collections
 
 
 def loop(module, port, peers):
@@ -50,28 +51,32 @@ def loop(module, port, peers):
     addr2fd = dict()
     key = os.getenv('MSGIO_KEY', '')
 
-    old_stats = (time.time(), copy.deepcopy(stats))
+    old_stats = (0, copy.deepcopy(stats))
+    last_connect_time = 0
 
     while True:
-        while clients:
-            ip_port = clients.pop()
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.setblocking(0)
-            connections[s.fileno()] = dict(
-                sock=s,
-                handshake_done=False,
-                is_server=False,
-                ip_port=ip_port)
-            epoll.register(s.fileno(), select.EPOLLOUT)
-            try:
-                stats['cli_connect'] += 1
-                s.connect(ip_port)
-            except Exception as e:
-                if 115 != e.errno:
-                    raise
+        if time.time() > last_connect_time + 1:
+            last_connect_time = time.time()
 
-        for fileno, event in epoll.poll():
+            while clients:
+                ip_port = clients.pop()
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.setblocking(0)
+                connections[s.fileno()] = dict(
+                    sock=s,
+                    handshake_done=False,
+                    is_server=False,
+                    ip_port=ip_port)
+                epoll.register(s.fileno(), select.EPOLLOUT)
+                try:
+                    stats['cli_connect'] += 1
+                    s.connect(ip_port)
+                except Exception as e:
+                    if 115 != e.errno:
+                        raise
+
+        for fileno, event in epoll.poll(1):
             if listener_sock.fileno() == fileno:
                 s, addr = listener_sock.accept()
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -93,22 +98,22 @@ def loop(module, port, peers):
                 out_msg_list = list()
 
                 if conn['handshake_done'] and event & select.EPOLLIN:
-                    conn['in_pkts'].append(conn['sock'].recv(32*1024))
-                    stats['in_bytes'] += len(conn['in_pkts'][-1])
-                    assert(len(conn['in_pkts'][-1]) > 0)
+                    conn['in'].append(conn['sock'].recv(32*1024))
+                    stats['in_bytes'] += len(conn['in'][-1])
+                    assert(len(conn['in'][-1]) > 0)
 
-                    size = struct.unpack('!Q', conn['in_pkts'][0][0:8])[0] + 10
+                    size = struct.unpack('!Q', conn['in'][0][0:8])[0] + 10
 
-                    total_size = sum(map(len, conn['in_pkts']))
+                    total_size = sum(map(len, conn['in']))
                     assert(total_size <= size)
 
                     if size == total_size:
                         msg_len = struct.unpack(
-                            '!H', conn['in_pkts'][0][8:10])[0]
-                        msg = conn['in_pkts'][0][10:10+msg_len]
+                            '!H', conn['in'][0][8:10])[0]
+                        msg = conn['in'][0][10:10+msg_len]
 
-                        conn['in_pkts'][0] = conn['in_pkts'][0][10+msg_len:]
-                        buf = ''.join(conn['in_pkts'])
+                        conn['in'][0] = conn['in'][0][10+msg_len:]
+                        buf = ''.join(conn['in'])
 
                         if '' == msg:
                             cred = marshal.loads(buf)
@@ -134,26 +139,17 @@ def loop(module, port, peers):
                             raise
 
                         stats['in_pkt'] += 1
-                        conn['in_pkts'] = list()
+                        conn['in'] = list()
 
                 if conn['handshake_done'] and event & select.EPOLLOUT:
-                    if 'pkt' not in conn:
-                        if conn['msgs']:
-                            conn['pkt'] = conn['msgs'].pop(0)
-                            conn['sent'] = 0
+                    if conn['out'][0]:
+                        n = conn['sock'].send(conn['out'][0][:32*1024])
+                        conn['out'][0] = conn['out'][0][n:]
+                        stats['out_bytes'] += n
 
-                    if 'pkt' in conn:
-                        if len(conn['pkt']) > conn['sent']:
-                            n = conn['sock'].send(conn['pkt'][
-                                conn['sent']:conn['sent']+32*1024])
-
-                            conn['sent'] += n
-                            stats['out_bytes'] += n
-
-                        if len(conn['pkt']) == conn['sent']:
-                            del(conn['pkt'])
-                            del(conn['sent'])
-                            stats['out_pkt'] += 1
+                    if not conn['out'][0]:
+                        conn['out'].popleft()
+                        stats['out_pkt'] += 1
 
                 if False == conn['handshake_done']:
                     if getattr(conn['sock'], 'do_handshake', None) is None:
@@ -165,8 +161,8 @@ def loop(module, port, peers):
                     conn['sock'].do_handshake()
                     conn['handshake_done'] = True
                     conn['peer'] = conn['sock'].getpeername()
-                    conn['in_pkts'] = list()
-                    conn['msgs'] = list()
+                    conn['in'] = list()
+                    conn['out'] = collections.deque()
                     addr2fd[conn['peer']] = fileno
 
                     if conn['is_server'] is False:
@@ -220,7 +216,7 @@ def loop(module, port, peers):
                                 continue
 
                             f = addr2fd[dst]
-                            connections[f]['msgs'].append(''.join([
+                            connections[f]['out'].append(''.join([
                                 struct.pack('!Q', len(msg) + len(buf)),
                                 struct.pack('!H', len(msg)),
                                 msg,
@@ -228,7 +224,7 @@ def loop(module, port, peers):
                             epoll.modify(f, select.EPOLLIN | select.EPOLLOUT)
 
                 if conn['handshake_done'] is True and 'close' not in conn:
-                    if conn['msgs'] or ('pkt' in conn):
+                    if conn['out']:
                         epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
                     else:
                         epoll.modify(fileno, select.EPOLLIN)
