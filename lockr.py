@@ -41,6 +41,8 @@ class g:
 
     @classmethod
     def json(cls):
+        g.clock = (g.clock[0], g.clock[1]+1)
+
         return json.dumps(dict(
             state=g.state,
             node=os.getenv('MSGIO_NODE'),
@@ -64,17 +66,15 @@ class g:
         cls.__dict__.update(d)
 
 
+def sync_broadcast_msg():
+    return [dict(dst=p, msg='sync', buf=g.json()) for p in g.peers]
+
+
 def sync(src, buf):
     g.peers[src] = json.loads(buf)
 
-    g.clock = (g.clock[0], g.clock[1]+1)
-    msgs = [dict(msg='sync', buf=g.json())]
-
-    if g.state.startswith('following-'):
-        return msgs
-
-    if g.state in ('old-sync', 'leader'):
-        return msgs
+    if g.state.startswith('following-') or g.state in ('old-sync', 'leader'):
+        return
 
     if 'new-sync' == g.state:
         in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
@@ -88,7 +88,7 @@ def sync(src, buf):
             g.state = 'leader'
             log('WRITE enabled')
 
-        return msgs
+            return sync_broadcast_msg()
 
     if g.peers[src]['maxfile'] == g.maxfile:
         peer_vclock = g.peers[src]['vclock']
@@ -144,12 +144,11 @@ def sync(src, buf):
             log('LEADER({0}) selected due to {1}'.format(src, leader[2]))
 
     if g.state.startswith('following-'):
-        msgs.append(dict(msg='replication_request', buf=g.json()))
-
         log('sent replication-request to({0}) file({1}) offset({2})'.format(
             src, g.maxfile, g.size))
 
-    return msgs
+        return sync_broadcast_msg() + [dict(msg='replication_request',
+                                            buf=g.json())]
 
 
 def replication_request(src, buf):
@@ -201,7 +200,7 @@ def replication_request(src, buf):
             os.fsync(g.fd)
             g.state = 'new-sync'
             log('new leader SESSION({0}) VCLK{1}'.format(g.maxfile, vclk))
-            if g.clock[1] % 2:
+            if int(time.time()) % 2:
                 log('exiting to force test vclock conflict')
                 os._exit(0)
 
@@ -232,7 +231,7 @@ def replication_request(src, buf):
         log('max file size reached({0} > {1})'.format(g.offset, g.max_size))
         os._exit(0)
 
-    return acks + get_replication_responses()
+    return sync_broadcast_msg() + acks + get_replication_responses()
 
 
 def get_replication_responses():
@@ -338,7 +337,7 @@ def replication_nextfile(src, buf):
 
     log('sent replication-request to({0}) file({1}) offset({2})'.format(
         src, g.maxfile, g.size))
-    return dict(msg='replication_request', buf=g.json())
+    return sync_broadcast_msg() + [dict(msg='replication_request', buf=g.json())]
 
 
 def replication_response(src, buf):
@@ -366,7 +365,7 @@ def replication_response(src, buf):
 
         log('sent replication-request to({0}) file({1}) offset({2})'.format(
             src, g.maxfile, g.size))
-        return dict(msg='replication_request', buf=g.json())
+        return sync_broadcast_msg() + [dict(msg='replication_request', buf=g.json())]
     except:
         traceback.print_exc()
         os._exit(0)
@@ -397,6 +396,7 @@ def on_disconnect(src, exc, tb):
             g.fd = None
         log('')
         log('NO LEADER as {0} disconnected'.format(src))
+        return sync_broadcast_msg()
 
     if src in g.followers:
         g.followers.pop(src)
@@ -864,7 +864,7 @@ if __name__ == '__main__':
     opt, args = parser.parse_args()
 
     logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
-    logging.getLogger('msgio').setLevel(logging.INFO)
+    logging.getLogger('msgio').setLevel(logging.WARNING)
 
     nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
                     opt.nodes.split(',')))
