@@ -864,7 +864,6 @@ if __name__ == '__main__':
     opt, args = parser.parse_args()
 
     logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
-    logging.getLogger('msgio').setLevel(logging.WARNING)
 
     nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
                     opt.nodes.split(',')))

@@ -11,7 +11,8 @@ import traceback
 import collections
 
 
-logger = logging.getLogger('msgio')
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.CRITICAL)
 
 
 def loop(module, port, peers):
@@ -41,15 +42,15 @@ def loop(module, port, peers):
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)
 
-    stats = dict(in_pkt=0, in_bytes=0, out_pkt=0, out_bytes=0,
-                 srv_accept=0, srv_established=0, srv_disconnect=0,
-                 cli_connect=0, cli_established=0, cli_disconnect=0)
-
     connections = dict()
     addr2fd = dict()
 
-    old_stats = (time.time(), copy.deepcopy(stats))
+    last_stats_time = time.time()
     last_connect_time = 0
+
+    stats = dict(in_pkts=0, in_bytes=0, out_pkts=0, out_bytes=0, dropped=0,
+                 srv_accept=0, srv_established=0, srv_disconnect=0,
+                 cli_connect=0, cli_established=0, cli_disconnect=0)
 
     if not os.path.isfile(cert):
         os.mknod(cert)
@@ -146,7 +147,7 @@ def loop(module, port, peers):
                             conn['close'] = (e, traceback.format_exc())
                             raise
 
-                        stats['in_pkt'] += 1
+                        stats['in_pkts'] += 1
                         conn['in'] = list()
 
                 if conn['handshake_done'] and event & select.EPOLLOUT:
@@ -160,7 +161,7 @@ def loop(module, port, peers):
                         meta, _ = conn['out'].popleft()
                         logger.info('to%s node(%s) msg(%s) len(%d)',
                             conn['peer'], src, meta[0], meta[1])
-                        stats['out_pkt'] += 1
+                        stats['out_pkts'] += 1
 
                 if False == conn['handshake_done']:
                     if getattr(conn['sock'], 'do_handshake', None) is None:
@@ -178,8 +179,11 @@ def loop(module, port, peers):
                     logger.debug('ssl handshake done for %s', conn['peer'])
 
                     if conn['is_server'] is False:
+                        stats['cli_established'] += 1
                         out_msg_list.append(dict(msg='', buf=marshal.dumps(
                             dict(node=node, key=key))))
+                    else:
+                        stats['srv_established'] += 1
 
                 if event & ~(select.EPOLLIN | select.EPOLLOUT):
                     logger.error('unhandled event(%0x)', event)
@@ -229,7 +233,7 @@ def loop(module, port, peers):
                             buf = d.get('buf', '')
 
                             if dst not in addr2fd:
-                                logger.warning('%s not found', dst)
+                                stats['dropped'] += 1
                                 continue
 
                             f = addr2fd[dst]
@@ -248,14 +252,24 @@ def loop(module, port, peers):
                     else:
                         epoll.modify(fileno, select.EPOLLIN)
 
-        if time.time() > old_stats[0] + 60:
-            divisor = (time.time() - old_stats[0])*2**20
-            logger.info('in-mbps(%0.3f) out-mbps(%0.3f)', 
-                8*(stats['in_bytes'] - old_stats[1]['in_bytes'])/divisor,
-                8*(stats['out_bytes'] - old_stats[1]['out_bytes'])/divisor)
-            old_stats = (time.time(), copy.deepcopy(stats))
+        if time.time() > last_stats_time + 10:
+            duration = int(time.time() - last_stats_time)
+            last_stats_time = time.time()
 
-        getattr(module, 'on_stats', lambda x: None)(copy.deepcopy(stats))
+            logger.critical(
+                'sec(%d) bytes(%d, %d) pkts(%d, %d, %d) conns(%d) '
+                'cli(%d, %d, %d) srv(%d, %d, %d)',
+                duration,
+                stats['in_bytes'], stats['out_bytes'],
+                stats['in_pkts'], stats['out_pkts'], stats['dropped'],
+                len(connections),
+                stats['cli_connect'], stats['cli_disconnect'],
+                stats['cli_established'],
+                stats['srv_accept'], stats['srv_disconnect'],
+                stats['srv_established'])
+
+            for k in stats:
+                stats[k] = 0
 
 
 class Client(object):
