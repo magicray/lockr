@@ -1,7 +1,6 @@
 import os
 import ssl
 import time
-import copy
 import socket
 import select
 import struct
@@ -80,7 +79,7 @@ def loop(module, port, peers):
                     if 115 != e.errno:
                         raise
 
-        for fileno, event in epoll.poll(1):
+        for fileno, event in epoll.poll(0.1):
             if listener_sock.fileno() == fileno:
                 s, addr = listener_sock.accept()
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -125,7 +124,8 @@ def loop(module, port, peers):
                             assert(key == cred['key'])
                             conn['src'] = cred['node']
                             addr2fd[conn['src']] = fileno
-                            logger.debug('from%s node(%s) msg(%s) len(%d)',
+                            logger.debug(
+                                'from%s node(%s) msg(%s) len(%d)',
                                 conn['peer'], conn['src'], msg, len(buf))
 
                             if conn['is_server'] is True:
@@ -140,7 +140,7 @@ def loop(module, port, peers):
                             else:
                                 src = conn.get('src', conn['peer'])
                                 logger.info('from%s node(%s) msg(%s) len(%d)',
-                                    conn['peer'], src, msg, len(buf))
+                                            conn['peer'], src, msg, len(buf))
                                 out_msg_list.append(module.on_message(
                                     src, msg, buf))
                         except Exception as e:
@@ -160,7 +160,7 @@ def loop(module, port, peers):
                         src = conn.get('src', conn['peer'])
                         meta, _ = conn['out'].popleft()
                         logger.info('to%s node(%s) msg(%s) len(%d)',
-                            conn['peer'], src, meta[0], meta[1])
+                                    conn['peer'], src, meta[0], meta[1])
                         stats['out_pkts'] += 1
 
                 if False == conn['handshake_done']:
@@ -213,7 +213,7 @@ def loop(module, port, peers):
 
                     if conn['handshake_done'] is True and 'src' in conn:
                         logger.info('disconnected%s node(%s)',
-                            conn['peer'], conn['src'])
+                                    conn['peer'], conn['src'])
                         out_msg_list.append(module.on_disconnect(
                             conn['src'], exc, tb))
 

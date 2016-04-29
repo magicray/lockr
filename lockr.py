@@ -337,7 +337,8 @@ def replication_nextfile(src, buf):
 
     log('sent replication-request to({0}) file({1}) offset({2})'.format(
         src, g.maxfile, g.size))
-    return sync_broadcast_msg() + [dict(msg='replication_request', buf=g.json())]
+    return [dict(msg='sync', buf=g.json()),
+            dict(msg='replication_request', buf=g.json())]
 
 
 def replication_response(src, buf):
@@ -365,7 +366,8 @@ def replication_response(src, buf):
 
         log('sent replication-request to({0}) file({1}) offset({2})'.format(
             src, g.maxfile, g.size))
-        return sync_broadcast_msg() + [dict(msg='replication_request', buf=g.json())]
+        return [dict(msg='sync', buf=g.json()),
+                dict(msg='replication_request', buf=g.json())]
     except:
         traceback.print_exc()
         os._exit(0)
@@ -387,16 +389,8 @@ def on_disconnect(src, exc, tb):
         del(g.peers[src])
 
     if 'following-' + src == g.state:
-        assert(not g.followers)
-
-        g.state = ''
-        if g.fd:
-            os.fsync(g.fd)
-            os.close(g.fd)
-            g.fd = None
-        log('')
-        log('NO LEADER as {0} disconnected'.format(src))
-        return sync_broadcast_msg()
+        log('exiting as LEADER{0} disconnected'.format(src))
+        os._exit(0)
 
     if src in g.followers:
         g.followers.pop(src)
@@ -408,10 +402,6 @@ def on_disconnect(src, exc, tb):
             log('exiting as followers({0}) < quorum({1})'.format(
                 len(g.followers), g.quorum))
             os._exit(0)
-
-
-def on_stats(stats):
-    g.stats = stats
 
 
 def state(src, buf):
