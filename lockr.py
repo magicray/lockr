@@ -73,6 +73,19 @@ def sync_broadcast_msg():
 def sync(src, buf):
     g.peers[src] = json.loads(buf)
 
+    if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
+        if g.state and 'following-' + src != g.state:
+            log('exiting as following(%s) while leader(%s) found',
+                g.state.split('-')[1], src)
+            os._exit(0)
+
+    if g.peers[src]['state'].startswith('following-'):
+        if g.state.startswith('following-'):
+            if g.peers[src]['state'] != g.state:
+                log('exiting due to leader conflict(%s, %s)',
+                    g.peers[src]['state'], g.state)
+                os._exit(0)
+
     if g.state.startswith('following-') or g.state in ('old-sync', 'leader'):
         return
 
@@ -82,8 +95,8 @@ def sync(src, buf):
                                 g.peers))
 
         if len(in_sync) >= g.quorum:
-            log('quorum({0} >= {1}) in sync with new session'.format(
-                len(in_sync), g.quorum))
+            log('quorum(%d >= %d) in sync with new session',
+                len(in_sync), g.quorum)
 
             g.state = 'leader'
             log('WRITE enabled')
@@ -97,8 +110,8 @@ def sync(src, buf):
         for key in set(peer_vclock).intersection(set(my_vclock)):
             if peer_vclock[key] > my_vclock[key]:
                 os.remove(os.path.join(g.data, str(g.maxfile)))
-                log(('REMOVED file({0}) as vclock({1}) is ahead'.format(
-                    g.maxfile, src)))
+                log(('REMOVED file(%d) as vclock(%d) is ahead',
+                    g.maxfile, src))
                 os._exit(0)
 
     if g.maxfile > 0 and g.peers[src]['minfile'] > g.maxfile:
@@ -107,7 +120,7 @@ def sync(src, buf):
         while True:
             try:
                 os.remove(os.path.join(g.data, str(g.maxfile)))
-                log('removed file({0})'.format(g.maxfile))
+                log('removed file(%d)', g.maxfile)
                 g.maxfile -= 1
             except:
                 os._exit(0)
@@ -115,7 +128,7 @@ def sync(src, buf):
 
     if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
         g.state = 'following-' + src
-        log('LEADER({0}) identified'.format(src))
+        log('LEADER(%s) identified', src)
     else:
         leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
         count = 0
@@ -141,7 +154,7 @@ def sync(src, buf):
 
         if (src == leader[0]) and (count >= g.quorum):
             g.state = 'following-' + src
-            log('LEADER({0}) selected due to {1}'.format(src, leader[2]))
+            log('LEADER(%s) selected due to %s', src, leader[2])
 
     if g.state.startswith('following-'):
         log('sent replication-request to({0}) file({1}) offset({2})'.format(
@@ -337,8 +350,8 @@ def replication_nextfile(src, buf):
 
     log('sent replication-request to({0}) file({1}) offset({2})'.format(
         src, g.maxfile, g.size))
-    return [dict(msg='sync', buf=g.json()),
-            dict(msg='replication_request', buf=g.json())]
+    return sync_broadcast_msg() + [dict(msg='replication_request',
+                                        buf=g.json())]
 
 
 def replication_response(src, buf):
@@ -366,8 +379,8 @@ def replication_response(src, buf):
 
         log('sent replication-request to({0}) file({1}) offset({2})'.format(
             src, g.maxfile, g.size))
-        return [dict(msg='sync', buf=g.json()),
-                dict(msg='replication_request', buf=g.json())]
+        return sync_broadcast_msg() + [dict(msg='replication_request',
+                                            buf=g.json())]
     except:
         traceback.print_exc()
         os._exit(0)
@@ -389,18 +402,17 @@ def on_disconnect(src, exc, tb):
         del(g.peers[src])
 
     if 'following-' + src == g.state:
-        log('exiting as LEADER{0} disconnected'.format(src))
+        log('exiting as LEADER({0}) disconnected'.format(src))
         os._exit(0)
 
     if src in g.followers:
         g.followers.pop(src)
-        log('removed follower({0}) remaining({1})'.format(
-            src, len(g.followers)))
+        log('removed follower(%s) remaining(%d)', src, len(g.followers))
 
     if g.state in ('old-sync', 'new-sync', 'leader'):
         if len(g.followers) < g.quorum:
-            log('exiting as followers({0}) < quorum({1})'.format(
-                len(g.followers), g.quorum))
+            log('exiting as followers(%d) < quorum(%d)',
+                len(g.followers), g.quorum)
             os._exit(0)
 
 
