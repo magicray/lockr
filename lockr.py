@@ -35,13 +35,14 @@ class g:
     offset = 0
     size = 0
     checksum = ''
-    stats = None
+    start_time = time.time()
 
     @classmethod
     def json(cls):
         g.clock = (g.clock[0], g.clock[1]+1)
 
         return json.dumps(dict(
+            uptime=int(time.time()-g.start_time),
             state=g.state,
             node=os.getenv('MSGIO_NODE'),
             minfile=g.minfile,
@@ -92,7 +93,7 @@ def sync(src, buf):
             g.state = 'leader'
             log('WRITE enabled')
 
-            return sync_broadcast_msg()
+        return sync_broadcast_msg()
 
     if g.peers[src]['maxfile'] == g.maxfile:
         peer_vclock = g.peers[src]['vclock']
@@ -141,15 +142,17 @@ def sync(src, buf):
             if k > leader[0]:
                 leader = (k, p, '{0} > {1}'.format(k, leader[0]))
 
-        if (src == leader[0]) and (count >= g.quorum):
-            g.state = 'following-' + src
+        if (os.getenv('MSGIO_NODE') != leader[0]) and (count >= g.quorum):
+            g.state = 'following-' + leader[0]
             log('LEADER(%s) selected due to %s', src, leader[2])
 
     if g.state.startswith('following-'):
+        leader = g.state.split('following-')[1]
         log('sent replication-request to(%s) file(%d) offset(%d)',
-            src, g.maxfile, g.size)
+            leader, g.maxfile, g.size)
 
-        return sync_broadcast_msg() + [dict(msg='replication_request',
+        return sync_broadcast_msg() + [dict(dst=leader,
+                                            msg='replication_request',
                                             buf=g.json())]
 
 
@@ -200,7 +203,7 @@ def replication_request(src, buf):
             os.fsync(g.fd)
             g.state = 'new-sync'
             log('new leader SESSION({0}) VCLK{1}'.format(g.maxfile, vclk))
-            if int(time.time()) % 2:
+            if 0 == int(time.time()) % 5:
                 log('exiting to force test vclock conflict')
                 os._exit(0)
 
@@ -255,9 +258,9 @@ def get_replication_responses():
         v1 = json.dumps(g.vclocks[req['maxfile']], sort_keys=True)
         v2 = json.dumps(req['vclock'], sort_keys=True)
         if req['vclock'] and v1 != v2:
-            log('vclock mismatch src{0} file({1})'.format(src, req['maxfile']))
-            log('local vclock {0}'.format(v1))
-            log('peer vclock {0}'.format(v2))
+            log('vclock mismatch src(%s) file(%d)', src, req['maxfile'])
+            log('local vclock %s', v1)
+            log('peer vclock %s', v2)
 
             log(('sent replication-truncate to{0} file({1}) offset({2}) '
                  'truncate(0)').format(src, req['maxfile'], req['size']))
@@ -282,15 +285,15 @@ def get_replication_responses():
                 if g.maxfile == req['maxfile']:
                     continue
 
-                log('sent replication-nextfile to{0} file({1})'.format(
-                    src, req['maxfile']+1))
+                log('sent replication-nextfile to(%s) file(%d)',
+                    src, req['maxfile']+1)
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                             buf=json.dumps(dict(filenum=req['maxfile']+1))))
 
             fd.seek(req['size'])
-            buf = fd.read(100*2**20)
+            buf = fd.read(opt.repl_size)
             if buf:
                 log('sent replication-response to(%s) file(%d) offset(%d) '
                     'size(%d)',
@@ -844,8 +847,10 @@ if __name__ == '__main__':
                       help='data directory', default='data')
     parser.add_option('--maxsize', dest='max_size', type='int',
                       help='max file size', default='256')
+    parser.add_option('--replsize', dest='repl_size', type='int',
+                      help='replication chunk size', default=10*2**20)
     parser.add_option('--timeout', dest='timeout', type='int',
-                      help='timeout in seconds', default='30')
+                      help='timeout in seconds', default='20')
 
     opt, args = parser.parse_args()
 
