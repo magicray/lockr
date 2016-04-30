@@ -57,7 +57,7 @@ def loop(module, port, peers):
                   '-subj "/" -out {0} -keyout {0} 2> /dev/null'.format(cert))
 
     while True:
-        if time.time() > last_connect_time + 1:
+        if time.time() > last_connect_time + 0.1:
             last_connect_time = time.time()
 
             while clients:
@@ -219,7 +219,7 @@ def loop(module, port, peers):
 
                     if conn['is_server']:
                         stats['srv_disconnect'] += 1
-                        logger.debug('disconnected%s', conn['peer'])
+                        logger.debug('disconnected%s', conn.get('peer'))
                     else:
                         stats['cli_disconnect'] += 1
                         logger.debug('disconnected%s', conn['ip_port'])
@@ -257,12 +257,12 @@ def loop(module, port, peers):
             last_stats_time = time.time()
 
             logger.critical(
-                'sec(%d) bytes(%d, %d) pkts(%d, %d, %d) conns(%d) '
+                'sec(%d) bytes(%d, %d) pkts(%d, %d, %d) conns(%d) dropped(%d) '
                 'cli(%d, %d, %d) srv(%d, %d, %d)',
                 duration,
                 stats['in_bytes'], stats['out_bytes'],
                 stats['in_pkts'], stats['out_pkts'], stats['dropped'],
-                len(connections),
+                len(connections), stats['dropped'],
                 stats['cli_connect'], stats['cli_disconnect'],
                 stats['cli_established'],
                 stats['srv_accept'], stats['srv_disconnect'],
