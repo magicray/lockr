@@ -9,6 +9,7 @@ import struct
 import signal
 import random
 import pprint
+import sqlite3
 import logging
 import hashlib
 import optparse
@@ -20,10 +21,9 @@ from logging import critical as log
 
 class g:
     fd = None
+    db = None
     kv = dict()
-    kv_tmp = dict()
-    key_list = collections.deque()
-    vclocks = dict()
+    header = dict()
     acks = collections.deque()
     peers = dict()
     followers = dict()
@@ -50,19 +50,15 @@ class g:
             offset=g.offset,
             size=g.size,
             clock=g.clock,
-            keys=[len(g.key_list), len(g.kv), len(g.kv_tmp), len(g.acks)],
+            keys=[len(g.kv), len(g.acks)],
+            header=g.header,
             peers=dict([(k, dict(
                 keys=v['keys'],
                 clock=v['clock'],
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
                 offset=v['offset'],
-                state=v['state'])) for k, v in g.peers.iteritems() if v]),
-            vclock=g.vclocks.get(g.maxfile, dict())))
-
-    @classmethod
-    def update(cls, d):
-        cls.__dict__.update(d)
+                state=v['state'])) for k, v in g.peers.iteritems() if v])))
 
 
 def sync_broadcast_msg():
@@ -95,12 +91,12 @@ def sync(src, buf):
 
         return sync_broadcast_msg()
 
-    if g.peers[src]['maxfile'] == g.maxfile:
-        peer_vclock = g.peers[src]['vclock']
-        my_vclock = g.vclocks.get(g.maxfile, dict())
+    if g.maxfile > 0 and g.peers[src]['maxfile'] == g.maxfile:
+        peer_header = g.peers[src]['header']
+        my_header = g.header
 
-        for key in set(peer_vclock).intersection(set(my_vclock)):
-            if peer_vclock[key] > my_vclock[key]:
+        for key in set(peer_header).intersection(set(my_header)):
+            if peer_header[key] > my_header[key]:
                 os.remove(os.path.join(opt.data, str(g.maxfile)))
                 log('REMOVED file(%d) as vclock(%s) is ahead', g.maxfile, src)
                 os._exit(0)
@@ -197,15 +193,17 @@ def replication_request(src, buf):
             for k in filter(lambda k: g.peers[k], g.peers):
                 vclk[k] = g.peers[k]['clock']
 
-            vclk = json.dumps(vclk)
+            header = json.dumps(vclk, sort_keys=True)
 
-            append(vclk)
+            append(header)
             os.fsync(g.fd)
             g.state = 'new-sync'
-            log('new leader SESSION({0}) VCLK{1}'.format(g.maxfile, vclk))
+            log('new leader TERM({0}) header{1}'.format(g.maxfile, header))
             if 0 == int(time.time()) % 5:
                 log('exiting to force test vclock conflict')
                 os._exit(0)
+
+            return sync_broadcast_msg() + get_replication_responses()
 
     acks = list()
     committed_offset = 0
@@ -222,19 +220,20 @@ def replication_request(src, buf):
                 if g.acks[0][0] > committed_offset:
                     break
 
-                ack = g.acks.popleft()
-                for key in ack[2]:
-                    f, t, v = g.kv_tmp.pop(key)
-                    kv_put(dict(key=key, filenum=f, txn=t, value=v))
-                acks.append(ack[1])
+                offset, dst = g.acks.popleft()
+                acks.append(dict(dst=dst, buf=''.join([
+                    struct.pack('!B', 0),
+                    struct.pack('!Q', g.maxfile),
+                    struct.pack('!Q', offset)])))
 
     if acks:
         os.fsync(g.fd)
+        g.db.commit()
     elif committed_offset == g.offset and g.offset > opt.max_size:
         log('max file size reached({0} > {1})'.format(g.offset, opt.max_size))
         os._exit(0)
 
-    return sync_broadcast_msg() + acks + get_replication_responses()
+    return acks + get_replication_responses()
 
 
 def get_replication_responses():
@@ -255,27 +254,29 @@ def get_replication_responses():
         if not os.path.isfile(os.path.join(opt.data, str(req['maxfile']))):
             continue
 
-        v1 = json.dumps(g.vclocks[req['maxfile']], sort_keys=True)
-        v2 = json.dumps(req['vclock'], sort_keys=True)
-        if req['vclock'] and v1 != v2:
-            log('vclock mismatch src(%s) file(%d)', src, req['maxfile'])
-            log('local vclock %s', v1)
-            log('peer vclock %s', v2)
+        with open(os.path.join(opt.data, str(req['maxfile'])), 'rb') as fd:
+            hdrlen = struct.unpack('!Q', fd.read(8))[0]
+            hdr = fd.read(hdrlen)
 
-            log(('sent replication-truncate to{0} file({1}) offset({2}) '
-                 'truncate(0)').format(src, req['maxfile'], req['size']))
+            reqhdr = json.dumps(req['header'], sort_keys=True)
+            if req['size'] > 0 and hdr != reqhdr:
+                log('header mismatch src(%s) file(%d)', src, req['maxfile'])
+                log('local header %s', hdr)
+                log('peer header %s', reqhdr)
 
-            g.followers[src] = None
-            msgs.append(dict(dst=src, msg='replication_truncate',
-                             buf=json.dumps(dict(truncate=0))))
+                log('sent replication-truncate to(%s) file(%d) offset(%d) '
+                    'truncate(0)', src, req['maxfile'], req['size'])
+
+                g.followers[src] = None
+                msgs.append(dict(dst=src, msg='replication_truncate',
+                                 buf=json.dumps(dict(truncate=0))))
 
         with open(os.path.join(opt.data, str(req['maxfile']))) as fd:
             fd.seek(0, 2)
 
             if fd.tell() < req['size']:
-                log(('sent replication-truncate to{0} file({1}) offset({2}) '
-                     'truncate({3})').format(
-                    src, req['maxfile'], req['size'], fd.tell()))
+                log('sent replication-truncate to(%s) file(%d) offset(%d) '
+                   'truncate(%d)', src, req['maxfile'], req['size'], fd.tell())
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_truncate',
@@ -308,8 +309,8 @@ def get_replication_responses():
 def replication_truncate(src, buf):
     req = json.loads(buf)
 
-    log('received replication-truncate from{0} size({1})'.format(
-        src, req['truncate']))
+    log('received replication-truncate from(%s) size(%d)',
+        src, req['truncate'])
 
     f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
@@ -339,8 +340,8 @@ def replication_nextfile(src, buf):
 
     log('sent replication-request to(%s) file(%d) offset(%d)',
         src, g.maxfile, g.size)
-    return sync_broadcast_msg() + [dict(msg='replication_request',
-                                        buf=g.json())]
+
+    return dict(msg='replication_request', buf=g.json())
 
 
 def replication_response(src, buf):
@@ -358,20 +359,19 @@ def replication_response(src, buf):
 
         assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
-        os.fsync(g.fd)
-        assert(g.offset+len(buf) == os.fstat(g.fd).st_size)
 
-        size = g.size
-        g.update(scan(opt.data, g.maxfile, g.offset, g.checksum,
-                      kv_put, vclock_put))
-        assert(g.size == size + len(buf))
+        os.fsync(g.fd)
+        g.size = os.fstat(g.fd).st_size
+
+        scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+        g.db.commit()
 
         log('sent replication-request to(%s) file(%d) offset(%d)',
             src, g.maxfile, g.size)
-        return sync_broadcast_msg() + [dict(msg='replication_request',
-                                            buf=g.json())]
+
+        return [dict(msg='sync', buf=g.json()),
+                dict(msg='replication_request', buf=g.json())]
     except:
-        traceback.print_exc()
         os._exit(0)
 
 
@@ -440,57 +440,33 @@ def put(src, buf):
         i = 0
         buf_list = list()
         keys = list()
-        size = 0
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
             keys.append(key)
-            filenum = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
-            offset = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
-            value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
-            value = buf[i+32+key_len:i+32+key_len+value_len]
 
-            f, t, v = g.kv.get(key, g.kv_tmp.get(key, (0, (0, 0), '')))
-            assert((t[0] == filenum) and (t[1] == offset)), 'version mismatch'
-            size += key_len + value_len
+            x = i + 8 + key_len
+            old_len = struct.unpack('!Q', buf[x:x+8])[0]
+            old = buf[x+8:x+8+old_len]
+
+            x = i + 8 + key_len + 8 + old_len
+            new_len = struct.unpack('!Q', buf[x:x+8])[0]
+            new = buf[x+8:x+8+new_len]
+
+            assert(old == db_get(key)), 'value mismatch'
 
             buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
-            buf_list.append(struct.pack('!Q', g.maxfile))
-            buf_list.append(struct.pack('!Q', g.offset))
-            buf_list.append(struct.pack('!Q', value_len))
-            buf_list.append(value)
+            buf_list.append(struct.pack('!Q', new_len))
+            buf_list.append(new)
 
-            i += 32 + key_len + value_len
+            i += 24 + key_len + old_len + new_len
 
         assert(i == len(buf)), 'invalid put request'
 
-        updated_keys = list()
-        while size > 0:
-            if not g.key_list or g.key_list[0][1] == g.maxfile:
-                break
-
-            k, f, t = g.key_list.popleft()
-            if k in g.kv and k not in keys and f != g.maxfile:
-                if t == g.kv[k][1]:
-                    buf_list.append(struct.pack('!Q', len(k)))
-                    buf_list.append(k)
-                    buf_list.append(struct.pack('!Q', t[0]))
-                    buf_list.append(struct.pack('!Q', t[1]))
-                    buf_list.append(struct.pack('!Q', len(g.kv[k][2])))
-                    buf_list.append(g.kv[k][2])
-                    updated_keys.append(k)
-                    size -= len(k) + len(g.kv[k][2])
-
-        res_list = [
-            struct.pack('!B', 0),
-            struct.pack('!Q', g.maxfile),
-            struct.pack('!Q', g.offset)]
-
         append(''.join(buf_list))
 
-        keys.extend(updated_keys)
-        g.acks.append((g.offset, dict(dst=src, buf=''.join(res_list)), keys))
+        g.acks.append((g.offset, src))
         return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
@@ -506,9 +482,9 @@ def append(buf):
                        0644)
 
     os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
+    g.size = os.fstat(g.fd).st_size
 
-    g.update(scan(opt.data, g.maxfile, g.offset, g.checksum,
-                  kv_tmp_put, vclock_put))
+    scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
 
 
 def get(src, buf):
@@ -517,40 +493,47 @@ def get(src, buf):
     while i < len(buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
-        f, t, v = g.kv.get(key, (0, (0, 0), ''))
+
+        value = db_get(key)
 
         result.append(struct.pack('!Q', key_len))
         result.append(key)
-        result.append(struct.pack('!Q', t[0]))
-        result.append(struct.pack('!Q', t[1]))
-        result.append(struct.pack('!Q', len(v)))
-        result.append(v)
+        result.append(struct.pack('!Q', len(value)))
+        result.append(value)
 
         i += 8 + key_len
 
     return dict(buf=''.join(result))
 
 
-def kv_put(d):
-    key = d['key']
-    if len(d['value']):
-        g.kv[key] = (d['filenum'], d['txn'], d['value'])
-        g.key_list.append((key, d['filenum'], d['txn']))
-    elif key in g.kv:
-        del(g.kv[key])
+def db_get(key):
+    row = g.db.execute('select value from kv where key=?', (key,)).fetchone()
+    if row:
+       return row[0]
+
+    return ''
 
 
-def kv_tmp_put(d):
-    g.kv_tmp[d['key']] = (d['filenum'], d['txn'], d['value'])
+def db_put(txn, filenum, offset, checksum):
+    g.maxfile = filenum
+    g.offset = offset
+    g.checksum = checksum.encode('hex')
+
+    for k, v in txn.iteritems():
+        g.db.execute('delete from kv where key=?', (k,))
+        if v:
+            g.db.execute('insert into kv values(?, ?, ?, ?)',
+                         (k, filenum, offset, v))
 
 
-def vclock_put(filenum, vclock):
-    g.vclocks[filenum] = vclock
+def header_put(header, filenum, offset, checksum):
+    g.maxfile = filenum
+    g.offset = offset
+    g.checksum = checksum.encode('hex')
+    g.header = json.loads(header)
 
 
 def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
-    start_time = time.time()
-    result = dict()
     checksum = checksum.decode('hex')
     while True:
         try:
@@ -568,57 +551,43 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                     assert(y == chksum.digest())
                     checksum = y
 
+                    txn = dict()
                     if offset > 0:
                         i = 0
                         while i < len(x):
                             key_len = struct.unpack('!Q', x[i:i+8])[0]
                             key = x[i+8:i+8+key_len]
 
-                            txn = (
-                                struct.unpack(
-                                    '!Q', x[i+8+key_len:i+16+key_len])[0],
-                                struct.unpack(
-                                    '!Q', x[i+16+key_len:i+24+key_len])[0])
-
                             value_len = struct.unpack(
-                                '!Q', x[i+24+key_len:i+32+key_len])[0]
-                            value = x[i+32+key_len:i+32+key_len+value_len]
+                                '!Q', x[i+8+key_len:i+16+key_len])[0]
+                            value = x[i+16+key_len:i+16+key_len+value_len]
 
-                            i += 32 + key_len + value_len
-
-                            callback_kv(dict(key=key,
-                                             filenum=filenum,
-                                             offset=offset+i-value_len,
-                                             txn=txn,
-                                             value=value))
-                    else:
-                        callback_vclock(filenum, json.loads(x))
+                            txn[key] = value
+                            i += 16 + key_len + value_len
 
                     offset += len(x) + 28
                     assert(offset <= total_size)
                     assert(offset == fd.tell())
 
-                    result.update(dict(
-                        maxfile=filenum,
-                        offset=offset,
-                        size=total_size,
-                        checksum=checksum.encode('hex')))
+                    if txn:
+                        callback_kv(txn, filenum, offset, checksum)
+                    else:
+                        callback_vclock(x, filenum, offset, checksum)
 
-                    if time.time() > start_time + 10:
-                        log(('scanned file({filenum}) offset({offset}) '
-                             'size({size})').format(**result))
-                        start_time = time.time()
+                    log('scanned file(%d) offset(%d)', filenum, offset)
 
             filenum += 1
             offset = 0
         except:
-            if 'filenum' in result:
-                log(('scanned file({filenum}) offset({offset}) '
-                     'size({size})').format(**result))
-            return result
+            return
 
 
 def init(peers):
+    g.db = sqlite3.connect(opt.index)
+    g.db.execute('''create table if not exists kv(key blob primary key,
+        file int, offset int, value blob)''')
+    g.db.execute('''create index if not exists kv_idx on kv(file, offset)''')
+
     g.quorum = int(len(peers)/2.0 + 0.6)
 
     if not os.path.isdir(opt.data):
@@ -641,41 +610,64 @@ def init(peers):
     if files:
         g.minfile = min(files)
         g.maxfile = min(files)
-        try:
-            with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
-                vclklen = struct.unpack('!Q', fd.read(8))[0]
-                g.vclocks[g.maxfile] = json.loads(fd.read(vclklen))
+
+        row = g.db.execute('''select file, offset from kv 
+            order by file desc, offset desc limit 1''').fetchone()
+        if row:
+            g.maxfile = row[0]
+            g.offset = row[1]
+            with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
+                fd.seek(g.offset-20)
                 g.checksum = fd.read(20).encode('hex')
-                g.offset = fd.tell()
-                fd.seek(0, 2)
-                g.size = fd.tell()
-                assert(g.offset == vclklen + 28)
-        except:
-            if g.minfile == g.maxfile:
-                os.remove(os.path.join(opt.data, str(g.minfile)))
-
-        g.__dict__.update(scan(opt.data, g.maxfile, g.offset, g.checksum,
-                               kv_put, vclock_put))
-
-        if g.kv:
-            remove_max = min([g.kv[k][0] for k in g.kv])
         else:
-            remove_max = g.maxfile
+            try:
+                with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
+                    hdrlen = struct.unpack('!Q', fd.read(8))[0]
+                    g.header = json.loads(fd.read(hdrlen))
+                    g.checksum = fd.read(20).encode('hex')
+                    g.offset = fd.tell()
+                    assert(g.offset == hdrlen + 28)
+            except:
+                if g.minfile == g.maxfile:
+                    os.remove(os.path.join(opt.data, str(g.minfile)))
+                    log('removed file(%d)', g.minfile)
 
-        for n in range(g.minfile, remove_max):
-            os.remove(os.path.join(opt.data, str(n)))
-            log('removed file({0})'.format(n))
+        scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
 
-        g.minfile = remove_max
+        with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
+            hdrlen = struct.unpack('!Q', fd.read(8))[0]
+            g.header = json.loads(fd.read(hdrlen))
+            fd.seek(g.offset-20)
+            g.checksum = fd.read(20).encode('hex')
+            fd.seek(0, 2)
+            g.size = fd.tell()
 
-        f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
-        n = os.fstat(f).st_size
-        if n > g.offset:
+
+        #row = g.db.execute('select min(txn) from kv').fetchone()
+        #if row:
+        #    with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
+        #        hdrlen = struct.unpack('!Q', fd.read(8))[0]
+        #        txn = json.loads(fd.read(hdrlen))['txn']
+        #    
+        #if g.kv:
+        #    remove_max = min([g.kv[k][0] for k in g.kv])
+        #else:
+        #    remove_max = g.maxfile
+
+        #for n in range(g.minfile, remove_max):
+        #    os.remove(os.path.join(opt.data, str(n)))
+        #    log('removed file({0})'.format(n))
+
+        #g.minfile = remove_max
+
+        if g.size > g.offset:
+            f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
             os.ftruncate(f, g.offset)
             os.fsync(f)
-            log('file({0}) truncated({1}) original({2})'.format(
-                g.maxfile, g.offset, n))
+            log('file(%d) truncated(%d) original(%d)',
+                g.maxfile, g.offset, g.size)
             os.close(f)
+            g.size = g.offset
 
         filenum = g.maxfile + 1
         while True:
@@ -750,21 +742,19 @@ class Lockr(object):
     def put(self, docs):
         items = list()
         for k, v in docs.iteritems():
-            ver = '0-0' if (v[0] is '-' or v[0] is None) else v[0]
-
             items.append(struct.pack('!Q', len(k)))
             items.append(k)
-            items.append(struct.pack('!Q', int(ver.split('-')[0])))
-            items.append(struct.pack('!Q', int(ver.split('-')[1])))
+            items.append(struct.pack('!Q', len(v[0])))
+            items.append(v[0])
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
         buf = self.request('put', ''.join(items))
         if 0 == struct.unpack('!B', buf[0])[0]:
-            f = struct.unpack('!Q', buf[1:9])[0]
-            o = struct.unpack('!Q', buf[9:17])[0]
+            filenum = struct.unpack('!Q', buf[1:9])[0]
+            offset = struct.unpack('!Q', buf[9:17])[0]
 
-            return 0, (f, o)
+            return 0, (filenum, offset)
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
@@ -781,14 +771,12 @@ class Lockr(object):
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
-            f = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
-            o = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
-            value_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
-            value = buf[i+32+key_len:i+32+key_len+value_len]
+            value_len = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
+            value = buf[i+16+key_len:i+16+key_len+value_len]
 
-            docs[key] = ('{0}-{1}'.format(f, o), value)
+            docs[key] = value
 
-            i += 32 + key_len + value_len
+            i += 16 + key_len + value_len
 
         return docs
 
@@ -811,17 +799,14 @@ class Client(cmd.Cmd):
 
     def do_get(self, line):
         for k, v in self.cli.get(line.split()).iteritems():
-            print('{0} <{1}> {2}'.format(k, v[0], v[1]))
+            print('{0} - {1}'.format(k, v))
 
     def do_put(self, line):
         cmd = shlex.split(line)
         tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-        docs = dict([(t[0], (t[1].strip('<>'), t[2])) for t in tup])
+        docs = dict([(t[0], (t[1], t[2])) for t in tup])
         code, value = self.cli.put(docs)
-        if 0 == code:
-            print('<{0}-{1}>'.format(value[0], value[1]))
-        else:
-            print('{0}'.format(value))
+        print(value)
 
     def do_watch(self, line):
         cmd = shlex.split(line)
@@ -845,6 +830,8 @@ if __name__ == '__main__':
                       help='comma separated list of server:port')
     parser.add_option('--data', dest='data', type='string',
                       help='data directory', default='data')
+    parser.add_option('--index', dest='index', type='string',
+                      help='index file path', default='snapshot.db')
     parser.add_option('--maxsize', dest='max_size', type='int',
                       help='max file size', default='256')
     parser.add_option('--replsize', dest='repl_size', type='int',
