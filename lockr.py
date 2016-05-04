@@ -28,8 +28,8 @@ class g:
     peers = dict()
     followers = dict()
     quorum = 0
+    clock = 0
     state = ''
-    clock = (0, 0)
     minfile = 0
     maxfile = 0
     offset = 0
@@ -39,7 +39,7 @@ class g:
 
     @classmethod
     def json(cls):
-        g.clock = (g.clock[0], g.clock[1]+1)
+        g.clock = int(time.time()*10**6)
 
         return json.dumps(dict(
             uptime=int(time.time()-g.start_time),
@@ -50,13 +50,13 @@ class g:
             offset=g.offset,
             size=g.size,
             clock=g.clock,
-            keys=[len(g.kv), len(g.acks)],
+            pending=[len(g.kv), len(g.acks)],
             header=g.header,
             peers=dict([(k, dict(
-                keys=v['keys'],
-                clock=v['clock'],
+                pending=v['pending'],
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
+                clock=v['clock'],
                 offset=v['offset'],
                 state=v['state'])) for k, v in g.peers.iteritems() if v])))
 
@@ -220,7 +220,10 @@ def replication_request(src, buf):
                 if g.acks[0][0] > committed_offset:
                     break
 
-                offset, dst = g.acks.popleft()
+                offset, dst, keys = g.acks.popleft()
+                for k in keys:
+                    del(g.kv[k])
+
                 acks.append(dict(dst=dst, buf=''.join([
                     struct.pack('!B', 0),
                     struct.pack('!Q', g.maxfile),
@@ -312,6 +315,10 @@ def replication_truncate(src, buf):
     log('received replication-truncate from(%s) size(%d)',
         src, req['truncate'])
 
+    g.db.execute('delete from data where file=?', (g.maxfile,))
+    g.db.execute('delete from data where file=?', (g.maxfile,))
+    g.commit()
+
     f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
     os.ftruncate(f, req['truncate'])
@@ -363,6 +370,7 @@ def replication_response(src, buf):
         os.fsync(g.fd)
         g.size = os.fstat(g.fd).st_size
 
+        assert(g.checksum)
         scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
         g.db.commit()
 
@@ -438,12 +446,13 @@ def put(src, buf):
 
     try:
         i = 0
-        buf_list = list()
-        keys = list()
+        keys = dict()
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
-            keys.append(key)
+
+            assert(key not in keys), 'duplicate key'
+            assert(key not in g.kv), 'txn in progress'
 
             x = i + 8 + key_len
             old_len = struct.unpack('!Q', buf[x:x+8])[0]
@@ -453,20 +462,34 @@ def put(src, buf):
             new_len = struct.unpack('!Q', buf[x:x+8])[0]
             new = buf[x+8:x+8+new_len]
 
-            assert(old == db_get(key)), 'value mismatch'
+            value = db_get(key)
 
-            buf_list.append(struct.pack('!Q', key_len))
-            buf_list.append(key)
-            buf_list.append(struct.pack('!Q', new_len))
-            buf_list.append(new)
+            keys[key] = (old == value, new == value, new)
 
             i += 24 + key_len + old_len + new_len
 
         assert(i == len(buf)), 'invalid put request'
 
+        if all([keys[k][1] for k in keys]):
+            return dict(buf=''.join([
+                    struct.pack('!B', 0),
+                    struct.pack('!Q', g.maxfile),
+                    struct.pack('!Q', g.offset)]))
+
+        assert(all([keys[k][0] for k in keys])), 'compare failed'
+
+        buf_list = list()
+        for key in keys:
+            buf_list.append(struct.pack('!Q', len(key)))
+            buf_list.append(key)
+            buf_list.append(struct.pack('!Q', len(keys[key][2])))
+            buf_list.append(keys[key][2])
+
+
         append(''.join(buf_list))
 
-        g.acks.append((g.offset, src))
+        g.kv.update(keys)
+        g.acks.append((g.offset, src, set(keys)))
         return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
@@ -494,7 +517,7 @@ def get(src, buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
 
-        value = db_get(key)
+        value = g.kv.get(key, db_get(key))
 
         result.append(struct.pack('!Q', len(value)))
         result.append(value)
@@ -594,6 +617,7 @@ def init(peers):
     g.db = sqlite3.connect(opt.index)
     g.db.execute('''create table if not exists data(key blob primary key,
         file unsigned, offset unsigned, length unsigned)''')
+    g.db.execute('create index if not exists data_file on data(file)')
     g.db.execute('''create table if not exists file(file unsigned primary key,
         header blob, length unsigned, checksum text)''')
 
@@ -602,32 +626,22 @@ def init(peers):
     if not os.path.isdir(opt.data):
         os.mkdir(opt.data)
 
-    try:
-        with open(os.path.join(opt.data, 'reboot')) as fd:
-            reboot = int(fd.read()) + 1
-    except:
-        reboot = 1
-    finally:
-        with open(os.path.join(opt.data, 'tmp'), 'w') as fd:
-            fd.write(str(reboot))
-        os.rename(os.path.join(opt.data, 'tmp'),
-                  os.path.join(opt.data, 'reboot'))
-        log('RESTARTING sequence({0})'.format(reboot))
-        g.clock = (reboot, 0)
-
-    files = map(int, filter(lambda x: x != 'reboot', os.listdir(opt.data)))
+    files = map(int, os.listdir(opt.data))
     if files:
         g.minfile = min(files)
         g.maxfile = min(files)
 
         row = g.db.execute('''select file, header, length, checksum from file
-                              order by file desc limit 1''').fetchone()
+                              order by file desc limit 1''').fetchall()
         if row:
-            g.maxfile = row[0]
-            g.header = json.loads(row[1])
-            g.offset = row[2]
-            g.checksum = row[3]
+            g.maxfile = row[0][0]
+            g.header = json.loads(row[0][1])
+            g.offset = row[0][2]
+            g.checksum = row[0][3]
         else:
+            g.db.execute('delete from file')
+            g.db.execute('delete from data')
+            g.db.commit()
             try:
                 with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
                     hdrlen = struct.unpack('!Q', fd.read(8))[0]
@@ -638,8 +652,6 @@ def init(peers):
             except:
                 if g.minfile == g.maxfile:
                     os.remove(os.path.join(opt.data, str(g.minfile)))
-                    g.db.execute('delete from file where file=?', (g.minfile,))
-                    g.db.execute('delete from data where file=?', (g.minfile,))
                     log('removed file(%d)', g.minfile)
 
         scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
@@ -649,22 +661,14 @@ def init(peers):
             g.size = fd.tell()
 
 
-        #row = g.db.execute('select min(txn) from kv').fetchone()
-        #if row:
-        #    with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
-        #        hdrlen = struct.unpack('!Q', fd.read(8))[0]
-        #        txn = json.loads(fd.read(hdrlen))['txn']
-        #    
-        #if g.kv:
-        #    remove_max = min([g.kv[k][0] for k in g.kv])
-        #else:
-        #    remove_max = g.maxfile
+        row = g.db.execute('select min(file) from data').fetchall()
+        remove_max = row[0][0] if row[0][0] is not None else g.maxfile
 
-        #for n in range(g.minfile, remove_max):
-        #    os.remove(os.path.join(opt.data, str(n)))
-        #    log('removed file({0})'.format(n))
+        for n in range(g.minfile, remove_max):
+            os.remove(os.path.join(opt.data, str(n)))
+            log('removed file({0})'.format(n))
 
-        #g.minfile = remove_max
+        g.minfile = remove_max
 
         if g.size > g.offset:
             f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
@@ -675,17 +679,8 @@ def init(peers):
             os.close(f)
             g.size = g.offset
 
-        filenum = g.maxfile + 1
-        while True:
-            try:
-                os.remove(os.path.join(opt.data, str(filenum)))
-                g.db.execute('delete from file where file=?', (filenum,))
-                g.db.execute('delete from data where file=?', (filenum,))
-                log('removed file({0})'.format(filenum))
-                filenum += 1
-            except:
-                break
         g.db.commit()
+        assert(g.maxfile == max(files))
 
 
 class Lockr(object):
