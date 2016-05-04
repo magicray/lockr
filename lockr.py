@@ -496,8 +496,6 @@ def get(src, buf):
 
         value = db_get(key)
 
-        result.append(struct.pack('!Q', key_len))
-        result.append(key)
         result.append(struct.pack('!Q', len(value)))
         result.append(value)
 
@@ -507,9 +505,13 @@ def get(src, buf):
 
 
 def db_get(key):
-    row = g.db.execute('select value from kv where key=?', (key,)).fetchone()
+    row = g.db.execute('select file, offset, length from data where key=?',
+                       (key,)).fetchone()
     if row:
-       return row[0]
+        filenum, offset, length = row
+        with open(os.path.join(opt.data, str(filenum)), 'rb') as fd:
+            fd.seek(offset, 0)
+            return fd.read(length)
 
     return ''
 
@@ -520,10 +522,13 @@ def db_put(txn, filenum, offset, checksum):
     g.checksum = checksum.encode('hex')
 
     for k, v in txn.iteritems():
-        g.db.execute('delete from kv where key=?', (k,))
+        g.db.execute('delete from data where key=?', (k,))
         if v:
-            g.db.execute('insert into kv values(?, ?, ?, ?)',
-                         (k, filenum, offset, v))
+            g.db.execute('insert into data values(?, ?, ?, ?)',
+                         (k, filenum, v[0], len(v[1])))
+
+    g.db.execute('''update file set length=?, checksum=? where file=?''',
+                 (offset, g.checksum, filenum))
 
 
 def header_put(header, filenum, offset, checksum):
@@ -531,6 +536,9 @@ def header_put(header, filenum, offset, checksum):
     g.offset = offset
     g.checksum = checksum.encode('hex')
     g.header = json.loads(header)
+
+    g.db.execute('''insert into file values(?, ?, ?, ?)''',
+                 (filenum, header, offset, g.checksum))
 
 
 def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
@@ -562,7 +570,7 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                                 '!Q', x[i+8+key_len:i+16+key_len])[0]
                             value = x[i+16+key_len:i+16+key_len+value_len]
 
-                            txn[key] = value
+                            txn[key] = (offset+8+i+16+key_len, value)
                             i += 16 + key_len + value_len
 
                     offset += len(x) + 28
@@ -584,9 +592,10 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
 
 def init(peers):
     g.db = sqlite3.connect(opt.index)
-    g.db.execute('''create table if not exists kv(key blob primary key,
-        file int, offset int, value blob)''')
-    g.db.execute('''create index if not exists kv_idx on kv(file, offset)''')
+    g.db.execute('''create table if not exists data(key blob primary key,
+        file unsigned, offset unsigned, length unsigned)''')
+    g.db.execute('''create table if not exists file(file unsigned primary key,
+        header blob, length unsigned, checksum text)''')
 
     g.quorum = int(len(peers)/2.0 + 0.6)
 
@@ -611,14 +620,13 @@ def init(peers):
         g.minfile = min(files)
         g.maxfile = min(files)
 
-        row = g.db.execute('''select file, offset from kv 
-            order by file desc, offset desc limit 1''').fetchone()
+        row = g.db.execute('''select file, header, length, checksum from file
+                              order by file desc limit 1''').fetchone()
         if row:
             g.maxfile = row[0]
-            g.offset = row[1]
-            with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
-                fd.seek(g.offset-20)
-                g.checksum = fd.read(20).encode('hex')
+            g.header = json.loads(row[1])
+            g.offset = row[2]
+            g.checksum = row[3]
         else:
             try:
                 with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
@@ -630,15 +638,13 @@ def init(peers):
             except:
                 if g.minfile == g.maxfile:
                     os.remove(os.path.join(opt.data, str(g.minfile)))
+                    g.db.execute('delete from file where file=?', (g.minfile,))
+                    g.db.execute('delete from data where file=?', (g.minfile,))
                     log('removed file(%d)', g.minfile)
 
         scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
 
         with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
-            hdrlen = struct.unpack('!Q', fd.read(8))[0]
-            g.header = json.loads(fd.read(hdrlen))
-            fd.seek(g.offset-20)
-            g.checksum = fd.read(20).encode('hex')
             fd.seek(0, 2)
             g.size = fd.tell()
 
@@ -673,10 +679,13 @@ def init(peers):
         while True:
             try:
                 os.remove(os.path.join(opt.data, str(filenum)))
+                g.db.execute('delete from file where file=?', (filenum,))
+                g.db.execute('delete from data where file=?', (filenum,))
                 log('removed file({0})'.format(filenum))
                 filenum += 1
             except:
                 break
+        g.db.commit()
 
 
 class Lockr(object):
@@ -767,16 +776,16 @@ class Lockr(object):
         buf = self.request('get', ''.join(buf))
 
         i = 0
+        k = 0
         docs = dict()
         while i < len(buf):
-            key_len = struct.unpack('!Q', buf[i:i+8])[0]
-            key = buf[i+8:i+8+key_len]
-            value_len = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
-            value = buf[i+16+key_len:i+16+key_len+value_len]
+            value_len = struct.unpack('!Q', buf[i:i+8])[0]
+            value = buf[i+8:i+8+value_len]
 
-            docs[key] = value
+            docs[keys[k]] = value
+            k += 1
 
-            i += 16 + key_len + value_len
+            i += 8 + value_len
 
         return docs
 
