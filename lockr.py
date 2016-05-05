@@ -639,11 +639,7 @@ def init(peers):
     if files:
         g.minfile = min(files)
         g.maxfile = min(files)
-        g.db.execute('delete from data where file < ? or file > ?',
-                     (g.minfile, g.maxfile))
-        g.db.execute('delete from file where file < ? or file > ?',
-                     (g.minfile, g.maxfile))
-        g.db.commit()
+        g.db.execute('delete from file where file < ? ',(g.minfile,))
 
         row = g.db.execute('''select file, header, length, checksum from file
                               order by file desc limit 1''').fetchall()
@@ -674,7 +670,6 @@ def init(peers):
             fd.seek(0, 2)
             g.size = fd.tell()
 
-
         row = g.db.execute('select min(file) from data').fetchall()
         remove_max = row[0][0] if row[0][0] is not None else g.maxfile
 
@@ -689,7 +684,7 @@ def init(peers):
             g.db.execute('delete from data where file = ? and offset >= ?',
                          (g.maxfile, g.offset))
             g.db.execute('delete from file where file >= ?', (g.maxfile,))
-            g.commit()
+            g.db.commit()
 
             f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
             os.ftruncate(f, g.offset)
