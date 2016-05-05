@@ -39,7 +39,9 @@ class g:
 
     @classmethod
     def json(cls):
-        g.clock = int(time.time()*10**6)
+        t = time.time()
+        x = time.strftime('%y%m%d.%H%M%S', time.gmtime(t))
+        g.clock = x + '.' + str(int((t-int(t))*10**6))
 
         return json.dumps(dict(
             uptime=int(time.time()-g.start_time),
@@ -87,7 +89,7 @@ def sync(src, buf):
                 len(in_sync), g.quorum)
 
             g.state = 'leader'
-            log('WRITE enabled')
+            log('WRITE enabled in msec(%03f)', (time.time()-g.start_time)*1000)
 
         return sync_broadcast_msg()
 
@@ -316,7 +318,8 @@ def replication_truncate(src, buf):
         src, req['truncate'])
 
     f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
-    assert(req['truncate'] < os.fstat(f).st_size)
+    n = os.fstat(f).st_size
+    assert(req['truncate'] < n)
     os.ftruncate(f, req['truncate'])
     os.fsync(f)
     os.close(f)
@@ -481,6 +484,16 @@ def put(src, buf):
             buf_list.append(struct.pack('!Q', len(keys[key][2])))
             buf_list.append(keys[key][2])
 
+        rows = g.db.execute('select * from data order by file, offset limit ?',
+                            (len(keys),))
+        for r in filter(lambda r: r[0] not in keys, rows.fetchall()):
+            key = bytes(r[0])
+            value = db_get(key)
+
+            buf_list.append(struct.pack('!Q', len(key)))
+            buf_list.append(key)
+            buf_list.append(struct.pack('!Q', len(value)))
+            buf_list.append(value)
 
         append(''.join(buf_list))
 
