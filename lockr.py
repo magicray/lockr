@@ -315,12 +315,8 @@ def replication_truncate(src, buf):
     log('received replication-truncate from(%s) size(%d)',
         src, req['truncate'])
 
-    g.db.execute('delete from data where file=?', (g.maxfile,))
-    g.db.execute('delete from data where file=?', (g.maxfile,))
-    g.commit()
-
     f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
-    n = os.fstat(f).st_size
+    assert(req['truncate'] < os.fstat(f).st_size)
     os.ftruncate(f, req['truncate'])
     os.fsync(f)
     os.close(f)
@@ -630,6 +626,11 @@ def init(peers):
     if files:
         g.minfile = min(files)
         g.maxfile = min(files)
+        g.db.execute('delete from data where file < ? or file > ?',
+                     (g.minfile, g.maxfile))
+        g.db.execute('delete from file where file < ? or file > ?',
+                     (g.minfile, g.maxfile))
+        g.db.commit()
 
         row = g.db.execute('''select file, header, length, checksum from file
                               order by file desc limit 1''').fetchall()
@@ -671,6 +672,12 @@ def init(peers):
         g.minfile = remove_max
 
         if g.size > g.offset:
+            g.db.execute('delete from data where file > ?',(g.maxfile,))
+            g.db.execute('delete from data where file = ? and offset >= ?',
+                         (g.maxfile, g.offset))
+            g.db.execute('delete from file where file >= ?', (g.maxfile,))
+            g.commit()
+
             f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
             os.ftruncate(f, g.offset)
             os.fsync(f)
@@ -680,7 +687,7 @@ def init(peers):
             g.size = g.offset
 
         g.db.commit()
-        assert(g.maxfile == max(files))
+        assert((g.maxfile == max(files)) or (g.maxfile+1 == max(files)))
 
 
 class Lockr(object):
@@ -802,8 +809,9 @@ class Client(cmd.Cmd):
         print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
     def do_get(self, line):
-        for k, v in self.cli.get(line.split()).iteritems():
-            print('{0} - {1}'.format(k, v))
+        result = self.cli.get(line.split())
+        for k in sorted(result.keys()):
+            print('{0} - {1}'.format(k, result[k]))
 
     def do_put(self, line):
         cmd = shlex.split(line)
