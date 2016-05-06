@@ -461,26 +461,29 @@ def put(src, buf):
 
             value = db_get(key)
 
-            keys[key] = (old == value, new == value, new)
+            keys[key] = (new, value if old != value else None)
 
             i += 24 + key_len + old_len + new_len
 
         assert(i == len(buf)), 'invalid put request'
 
-        if all([keys[k][1] for k in keys]):
-            return dict(buf=''.join([
-                    struct.pack('!B', 0),
-                    struct.pack('!Q', g.maxfile),
-                    struct.pack('!Q', g.offset)]))
+        if not all([keys[k][1] is None for k in keys]):
+            buf_list = [struct.pack('!B', 1)]
+            for k, v in keys.iteritems():
+                if v[1] is not None:
+                    buf_list.append(struct.pack('!Q', len(k)))
+                    buf_list.append(k)
+                    buf_list.append(struct.pack('!Q', len(v[1])))
+                    buf_list.append(v[1])
 
-        assert(all([keys[k][0] for k in keys])), 'compare failed'
+            return dict(buf=''.join(buf_list))
 
         buf_list = list()
         for key in keys:
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
-            buf_list.append(struct.pack('!Q', len(keys[key][2])))
-            buf_list.append(keys[key][2])
+            buf_list.append(struct.pack('!Q', len(keys[key][0])))
+            buf_list.append(keys[key][0])
 
         rows = g.db.execute('select * from data order by file, offset limit ?',
                             (len(keys)*2,)).fetchall()
@@ -499,7 +502,7 @@ def put(src, buf):
         g.acks.append((g.offset, src, set(keys)))
         return get_replication_responses()
     except:
-        return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
+        return dict(buf=struct.pack('!B', 2) + traceback.format_exc())
 
 
 def append(buf):
@@ -808,6 +811,18 @@ class Lockr(object):
             offset = struct.unpack('!Q', buf[9:17])[0]
 
             return 0, (filenum, offset)
+        elif 1 == struct.unpack('!B', buf[0])[0]:
+            kv = dict()
+            i = 1
+            while i < len(buf):
+                key_len = struct.unpack('!Q', buf[i:i+8])[0]
+                key = buf[i+8:i+8+key_len]
+                value_len = struct.unpack('!Q', buf[i+key_len:i+8+key_len])[0]
+                kv[key] = buf[i+16+key_len:i+16+key_len+value_len]
+
+                i += 16 + key_len + value_len
+
+            return 1, kv
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
@@ -860,7 +875,14 @@ class Client(cmd.Cmd):
         tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
         docs = dict([(t[0], (t[1], t[2])) for t in tup])
         code, value = self.cli.put(docs)
-        print(value)
+        if 0 == code:
+            print('committed : {0}'.format(value))
+        elif 1 == code:
+            print('compare failed for following keys:-')
+            for k, v in value.iteritems():
+                print('{0} - {1}'.format(k, v))
+        else:
+            print(value)
 
     def do_watch(self, line):
         cmd = shlex.split(line)
