@@ -487,9 +487,10 @@ def put(src, buf):
 
         g.kv.update(keys)
 
-        rows = g.db.execute('select * from data order by file, offset limit ?',
-                            (len(keys)*2,)).fetchall()
-        for r in filter(lambda r: r[0] not in g.kv, rows)[:len(keys)]:
+        rows = g.db.execute('''select key, file, length from data
+                               where file < ?  order by file, offset limit ?
+                            ''', (g.maxfile, len(keys))).fetchall()
+        for r in filter(lambda r: (r[0] not in g.kv) and (r[2] > 0), rows):
             key = bytes(r[0])
             value = db_get(key)
 
