@@ -520,6 +520,18 @@ def append(buf):
     scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
 
 
+def keys(src, buf):
+    rows = g.db.execute('select key from data where key like ? order by key',
+                        (buf+'%',))
+    result = list()
+    for r in rows:
+        key = bytes(r[0])
+        result.append(struct.pack('!Q', len(key)))
+        result.append(key)
+
+    return dict(buf=''.join(result))
+
+
 def get(src, buf):
     i = 0
     result = list()
@@ -817,7 +829,8 @@ class Lockr(object):
             while i < len(buf):
                 key_len = struct.unpack('!Q', buf[i:i+8])[0]
                 key = buf[i+8:i+8+key_len]
-                value_len = struct.unpack('!Q', buf[i+key_len:i+8+key_len])[0]
+                value_len = struct.unpack('!Q',
+                                          buf[i+8+key_len:i+16+key_len])[0]
                 kv[key] = buf[i+16+key_len:i+16+key_len+value_len]
 
                 i += 16 + key_len + value_len
@@ -848,6 +861,19 @@ class Lockr(object):
 
         return docs
 
+    def keys(self, prefix):
+        buf = self.request('keys', prefix)
+
+        i = 0
+        result = list()
+        while i < len(buf):
+            key_len = struct.unpack('!Q', buf[i:i+8])[0]
+            result.append(buf[i+8:i+8+key_len])
+
+            i += 8 + key_len
+
+        return result
+
 
 class Client(cmd.Cmd):
     prompt = '>'
@@ -865,8 +891,13 @@ class Client(cmd.Cmd):
     def do_state(self, line):
         print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
+    def do_keys(self, line):
+        prefix = shlex.split(line)[0] if line else ''
+        for k in self.cli.keys(prefix):
+            print(k)
+
     def do_get(self, line):
-        result = self.cli.get(line.split())
+        result = self.cli.get(shlex.split(line))
         for k in sorted(result.keys()):
             print('{0} - {1}'.format(k, result[k]))
 
