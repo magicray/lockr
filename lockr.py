@@ -485,9 +485,11 @@ def put(src, buf):
             buf_list.append(struct.pack('!Q', len(keys[key][0])))
             buf_list.append(keys[key][0])
 
+        g.kv.update(keys)
+
         rows = g.db.execute('select * from data order by file, offset limit ?',
                             (len(keys)*2,)).fetchall()
-        for r in filter(lambda r: r[0] not in keys, rows)[:len(keys)]:
+        for r in filter(lambda r: r[0] not in g.kv, rows)[:len(keys)]:
             key = bytes(r[0])
             value = db_get(key)
 
@@ -498,7 +500,6 @@ def put(src, buf):
 
         append(''.join(buf_list))
 
-        g.kv.update(keys)
         g.acks.append((g.offset, src, set(keys)))
         return get_replication_responses()
     except:
@@ -568,7 +569,7 @@ def db_put(txn, filenum, offset, checksum):
 
     for k, v in txn.iteritems():
         g.db.execute('delete from data where key=?', (k,))
-        if v:
+        if v[1]:
             g.db.execute('insert into data values(?, ?, ?, ?)',
                          (k, filenum, v[0], len(v[1])))
 
