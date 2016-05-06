@@ -259,22 +259,20 @@ def get_replication_responses():
         if not os.path.isfile(os.path.join(opt.data, str(req['maxfile']))):
             continue
 
-        with open(os.path.join(opt.data, str(req['maxfile'])), 'rb') as fd:
-            hdrlen = struct.unpack('!Q', fd.read(8))[0]
-            hdr = fd.read(hdrlen)
+        hdr = g.db.execute('select header from file where file=?',
+                           (req['maxfile'],)).fetchone()[0]
+        reqhdr = json.dumps(req['header'], sort_keys=True)
+        if req['size'] > 0 and hdr != reqhdr:
+            log('header mismatch src(%s) file(%d)', src, req['maxfile'])
+            log('local header %s', hdr)
+            log('peer header %s', reqhdr)
 
-            reqhdr = json.dumps(req['header'], sort_keys=True)
-            if req['size'] > 0 and hdr != reqhdr:
-                log('header mismatch src(%s) file(%d)', src, req['maxfile'])
-                log('local header %s', hdr)
-                log('peer header %s', reqhdr)
+            log('sent replication-truncate to(%s) file(%d) offset(%d) '
+                'truncate(0)', src, req['maxfile'], req['size'])
 
-                log('sent replication-truncate to(%s) file(%d) offset(%d) '
-                    'truncate(0)', src, req['maxfile'], req['size'])
-
-                g.followers[src] = None
-                msgs.append(dict(dst=src, msg='replication_truncate',
-                                 buf=json.dumps(dict(truncate=0))))
+            g.followers[src] = None
+            msgs.append(dict(dst=src, msg='replication_truncate',
+                             buf=json.dumps(dict(truncate=0))))
 
         with open(os.path.join(opt.data, str(req['maxfile']))) as fd:
             fd.seek(0, 2)
@@ -485,8 +483,8 @@ def put(src, buf):
             buf_list.append(keys[key][2])
 
         rows = g.db.execute('select * from data order by file, offset limit ?',
-                            (len(keys),))
-        for r in filter(lambda r: r[0] not in keys, rows.fetchall()):
+                            (len(keys)*2,)).fetchall()
+        for r in filter(lambda r: r[0] not in keys, rows)[:len(keys)]:
             key = bytes(r[0])
             value = db_get(key)
 
@@ -636,66 +634,102 @@ def init(peers):
         os.mkdir(opt.data)
 
     files = map(int, os.listdir(opt.data))
-    if files:
-        g.minfile = min(files)
-        g.maxfile = min(files)
-        g.db.execute('delete from file where file < ? ',(g.minfile,))
-
-        row = g.db.execute('''select file, header, length, checksum from file
-                              order by file desc limit 1''').fetchall()
-        if row:
-            g.maxfile = row[0][0]
-            g.header = json.loads(row[0][1])
-            g.offset = row[0][2]
-            g.checksum = row[0][3]
-        else:
-            g.db.execute('delete from file')
-            g.db.execute('delete from data')
-            g.db.commit()
-            try:
-                with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
-                    hdrlen = struct.unpack('!Q', fd.read(8))[0]
-                    g.header = json.loads(fd.read(hdrlen))
-                    g.checksum = fd.read(20).encode('hex')
-                    g.offset = fd.tell()
-                    assert(g.offset == hdrlen + 28)
-            except:
-                if g.minfile == g.maxfile:
-                    os.remove(os.path.join(opt.data, str(g.minfile)))
-                    log('removed file(%d)', g.minfile)
-
-        scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
-
-        with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
-            fd.seek(0, 2)
-            g.size = fd.tell()
-
-        row = g.db.execute('select min(file) from data').fetchall()
-        remove_max = row[0][0] if row[0][0] is not None else g.maxfile
-
-        for n in range(g.minfile, remove_max):
-            os.remove(os.path.join(opt.data, str(n)))
-            log('removed file({0})'.format(n))
-
-        g.minfile = remove_max
-
-        if g.size > g.offset:
-            g.db.execute('delete from data where file > ?',(g.maxfile,))
-            g.db.execute('delete from data where file = ? and offset >= ?',
-                         (g.maxfile, g.offset))
-            g.db.execute('delete from file where file >= ?', (g.maxfile,))
-            g.db.commit()
-
-            f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
-            os.ftruncate(f, g.offset)
-            os.fsync(f)
-            log('file(%d) truncated(%d) original(%d)',
-                g.maxfile, g.offset, g.size)
-            os.close(f)
-            g.size = g.offset
-
+    if not files:
+        g.db.execute('delete from file')
+        g.db.execute('delete from data')
         g.db.commit()
-        assert((g.maxfile == max(files)) or (g.maxfile+1 == max(files)))
+        return
+
+    with open(os.path.join(opt.data, str(max(files))), 'rb') as fd:
+        fd.seek(0, 2)
+        size = fd.tell()
+
+    if 0 == size:
+        os.remove(os.path.join(opt.data, str(max(files))))
+        log('removed file(%d)', max(files))
+        os._exit(0)
+
+    g.db.execute('delete from data where file < ?', (min(files),))
+    g.db.execute('delete from data where file > ?', (max(files),))
+    g.db.execute('delete from data where file = ? and offset+length > ?',
+                 (max(files), size))
+
+    g.db.execute('delete from file where file < ?', (min(files),))
+    g.db.execute('delete from file where file > ?', (max(files),))
+    g.db.execute('delete from file where file = ? and length > ?',
+                 (max(files), size))
+    g.db.commit()
+
+    g.minfile = min(files)
+
+    row = g.db.execute('''select file, header, length, checksum from file
+                          order by file desc limit 1''').fetchone()
+    if row:
+        g.maxfile = row[0]
+        g.header = json.loads(row[1])
+        g.offset = row[2]
+        g.checksum = row[3]
+    else:
+        g.maxfile = min(files)
+        g.db.execute('delete from file')
+        g.db.execute('delete from data')
+        g.db.commit()
+
+        try:
+            with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
+                hdrlen = struct.unpack('!Q', fd.read(8))[0]
+                hdr = fd.read(hdrlen)
+                g.header = json.loads(hdr)
+                g.checksum = fd.read(20).encode('hex')
+                g.offset = fd.tell()
+                assert(g.offset == hdrlen + 28)
+
+                g.db.execute('''insert into file values(?, ?, ?, ?)''',
+                             (g.minfile, hdr, g.offset, g.checksum))
+                g.db.commit()
+        except:
+            if g.minfile == g.maxfile:
+                os.remove(os.path.join(opt.data, str(g.minfile)))
+                log('removed file(%d)', g.minfile)
+                os._exit(0)
+
+    scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+    g.db.commit()
+
+    with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
+        fd.seek(0, 2)
+        g.size = fd.tell()
+
+    quit = False
+    if g.size > g.offset:
+        f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
+        os.ftruncate(f, g.offset)
+        os.fsync(f)
+        log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, g.size)
+        os.close(f)
+        quit = True
+
+    row = g.db.execute('select min(file) from data').fetchone()
+    remove_max = row[0] if row[0] is not None else g.maxfile
+
+    for n in range(g.minfile, remove_max):
+        os.remove(os.path.join(opt.data, str(n)))
+        log('removed file({0})'.format(n))
+        quit = True
+
+    g.minfile = remove_max
+
+    remove_min = g.maxfile + 1
+    while True:
+        try:
+            os.remove(os.path.join(opt.data, str(remove_min)))
+            log('removed file({0})'.format(remove_min))
+            quit = True
+        except:
+            break
+
+    if quit:
+        os._exit(0)
 
 
 class Lockr(object):
