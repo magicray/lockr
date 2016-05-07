@@ -65,35 +65,11 @@ class g:
                 state=v['state'])) for k, v in g.peers.iteritems() if v])))
 
 
-def sync_broadcast_msg():
-    return [dict(dst=p, msg='sync', buf=g.json()) for p in g.peers]
-
-
-def sync(src, buf):
+def vote(src, buf):
     g.peers[src] = json.loads(buf)
 
-    if g.peers[src]['state'].startswith('following-'):
-        if g.state.startswith('following-'):
-            if g.state < g.peers[src]['state']:
-                log('exiting as following a suboptimal leader(%s)', g.state)
-                os._exit(0)
-
-    if g.state.startswith('following-') or g.state in ('old-sync', 'leader'):
+    if g.state:
         return
-
-    if 'new-sync' == g.state:
-        in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
-                         filter(lambda k: g.offset == g.peers[k]['offset'],
-                                g.peers))
-
-        if len(in_sync) >= g.quorum:
-            log('quorum(%d >= %d) in sync with new session',
-                len(in_sync), g.quorum)
-
-            g.state = 'leader'
-            log('WRITE enabled in msec(%03f)', (time.time()-g.start_time)*1000)
-
-        return sync_broadcast_msg()
 
     if g.maxfile > 0 and g.peers[src]['maxfile'] == g.maxfile:
         peer_header = g.peers[src]['header']
@@ -115,56 +91,61 @@ def sync(src, buf):
                 g.maxfile -= 1
             except:
                 os._exit(0)
-                break
 
-    if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
-        g.state = 'following-' + src
-        log('LEADER(%s) identified', src)
-    else:
-        leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
-        count = 0
-        for k, v in g.peers.iteritems():
-            count += 1
-            l, p = leader[1], v
+    leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
+    count = 0
+    for k, v in g.peers.iteritems():
+        count += 1
+        l, p = leader[1], v
 
-            if l['maxfile'] != p['maxfile']:
-                if l['maxfile'] < p['maxfile']:
-                    leader = (k, p, 'maxfile({0} > {1})'.format(
-                        p['maxfile'], l['maxfile']))
-                continue
+        if l['maxfile'] != p['maxfile']:
+            if l['maxfile'] < p['maxfile']:
+                leader = (k, p, 'maxfile({0} > {1})'.format(
+                    p['maxfile'], l['maxfile']))
+            continue
 
-            if l['offset'] != p['offset']:
-                if l['offset'] < p['offset']:
-                    leader = (k, p, 'offset({0} > {1})'.format(
-                        p['offset'], l['offset']))
-                continue
+        if l['offset'] != p['offset']:
+            if l['offset'] < p['offset']:
+                leader = (k, p, 'offset({0} > {1})'.format(
+                    p['offset'], l['offset']))
+            continue
 
-            if k > leader[0]:
-                leader = (k, p, '{0} > {1}'.format(k, leader[0]))
+        if k > leader[0]:
+            leader = (k, p, '{0} > {1}'.format(k, leader[0]))
 
-        if (os.getenv('MSGIO_NODE') != leader[0]) and (count >= g.quorum):
-            g.state = 'following-' + leader[0]
-            log('LEADER(%s) selected due to %s', src, leader[2])
+    if (os.getenv('MSGIO_NODE') != leader[0]) and (count >= g.quorum):
+        g.state = 'following-' + leader[0]
+        log('sent replication-request to(%s) file(%d) offset(%d) as %s',
+            leader[0], g.maxfile, g.size, leader[2])
 
-    if g.state.startswith('following-'):
-        leader = g.state.split('following-')[1]
-        log('sent replication-request to(%s) file(%d) offset(%d)',
-            leader, g.maxfile, g.size)
+        return dict(dst=leader[0], msg='replication_request', buf=g.json())
 
-        return sync_broadcast_msg() + [dict(dst=leader,
-                                            msg='replication_request',
-                                            buf=g.json())]
+
+def switch_leader(src, buf):
+    g.peers[src] = json.loads(buf)
+    g.state = g.peers[src]['state']
+
+    leader = g.state.split('following-')[1]
+    log('received switch-leader from(%s) leader(%s)', src, leader)
+
+    log('sent replication-request to(%s) file(%d) offset(%d)',
+        leader, g.maxfile, g.size)
+
+    return dict(dst=leader, msg='replication_request', buf=g.json())
 
 
 def replication_request(src, buf):
     req = json.loads(buf)
+    g.peers[src] = req
 
     log('received replication-request from(%s) file(%d) offset(%d)',
         src, req['maxfile'], req['offset'])
 
     if g.state.startswith('following-'):
-        log('rejecting replication-request from(%s) as (%s)', src, g.state)
-        raise Exception('reject-replication-request')
+        log('sent switch-leader to(%s) leader(%s)',
+            src, g.state.split('following-')[1])
+
+        return dict(msg='switch_leader', buf=g.json())
 
     if src not in g.followers:
         log('accepted (%s) as follower(%d)', src, len(g.followers)+1)
@@ -174,6 +155,18 @@ def replication_request(src, buf):
     if not g.state and len(g.followers) == g.quorum:
         g.state = 'old-sync'
         log('assuming LEADERSHIP as quorum reached({0})'.format(g.quorum))
+
+    if 'new-sync' == g.state:
+        in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
+                         filter(lambda k: g.offset == g.peers[k]['offset'],
+                                g.peers))
+
+        if len(in_sync) >= g.quorum:
+            g.state = 'leader'
+            log('WRITE enabled in msec(%03f) quorum(%d >= %d)',
+                (time.time()-g.start_time)*1000, len(in_sync), g.quorum)
+
+            return get_replication_responses()
 
     if 'old-sync' == g.state:
         count = 0
@@ -207,7 +200,7 @@ def replication_request(src, buf):
                 log('exiting to force test vclock conflict')
                 os._exit(0)
 
-            return sync_broadcast_msg() + get_replication_responses()
+            return get_replication_responses()
 
     acks = list()
     watch = list()
@@ -380,8 +373,7 @@ def replication_response(src, buf):
         log('sent replication-request to(%s) file(%d) offset(%d)',
             src, g.maxfile, g.size)
 
-        return [dict(msg='sync', buf=g.json()),
-                dict(msg='replication_request', buf=g.json())]
+        return dict(msg='replication_request', buf=g.json())
     except:
         os._exit(0)
 
@@ -391,7 +383,7 @@ def on_message(src, msg, buf):
 
 
 def on_connect(src):
-    return dict(msg='sync', buf=g.json())
+    return dict(msg='vote', buf=g.json())
 
 
 def on_disconnect(src, exc, tb):
