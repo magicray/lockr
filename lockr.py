@@ -23,6 +23,8 @@ class g:
     fd = None
     db = None
     kv = dict()
+    src2key = dict()
+    key2src = dict()
     header = dict()
     acks = collections.deque()
     peers = dict()
@@ -53,9 +55,9 @@ class g:
             size=g.size,
             clock=g.clock,
             pending=[len(g.kv), len(g.acks)],
+            watch=[len(g.src2key), len(g.key2src)],
             header=g.header,
             peers=dict([(k, dict(
-                pending=v['pending'],
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
                 clock=v['clock'],
@@ -208,6 +210,7 @@ def replication_request(src, buf):
             return sync_broadcast_msg() + get_replication_responses()
 
     acks = list()
+    watch = list()
     committed_offset = 0
     if 'leader' == g.state:
         offsets = list()
@@ -225,6 +228,9 @@ def replication_request(src, buf):
                 offset, dst, keys = g.acks.popleft()
                 for k in keys:
                     del(g.kv[k])
+                    value = db_get(k)
+                    for s in g.key2src.get(k, set()):
+                        watch.append(dict(dst=s, buf=value))
 
                 acks.append(dict(dst=dst, buf=''.join([
                     struct.pack('!B', 0),
@@ -238,7 +244,7 @@ def replication_request(src, buf):
         log('max file size reached({0} > {1})'.format(g.offset, opt.max_size))
         os._exit(0)
 
-    return acks + get_replication_responses()
+    return acks + watch + get_replication_responses()
 
 
 def get_replication_responses():
@@ -392,8 +398,16 @@ def on_disconnect(src, exc, tb):
     if exc and str(exc) != 'reject-replication-request':
         log(tb)
 
-    if src in g.peers:
-        del(g.peers[src])
+    if src in g.src2key:
+        key = g.src2key.pop(src)
+        g.key2src[key].remove(src)
+        if not g.key2src[key]:
+            g.key2src.pop(key)
+
+    if src not in g.peers:
+        return
+
+    del(g.peers[src])
 
     if 'following-' + src == g.state:
         log('exiting as LEADER({0}) disconnected'.format(src))
@@ -415,26 +429,10 @@ def state(src, buf):
 
 
 def watch(src, buf):
-    try:
-        i = 0
-        while i < len(buf):
-            key_len = struct.unpack('!Q', buf[i:i+8])[0]
-            key = buf[i+8:i+8+key_len]
-            txn = (struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0],
-                   struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0])
+    g.src2key[src] = buf
+    g.key2src.setdefault(buf, set()).add(src)
 
-            i += 24 + key_len
-
-        return dict(buf=''.join([
-            struct.pack('!B', 0),
-            struct.pack('!Q', len('key')),
-            'key',
-            struct.pack('!Q', 1),
-            struct.pack('!Q', 2),
-            struct.pack('!Q', len('Hello')),
-            'Hello']))
-    except:
-        return dict(buf=struct.pack('!B', 1) + traceback.format_exc())
+    return dict(buf=db_get(buf))
 
 
 def put(src, buf):
@@ -764,7 +762,8 @@ class Lockr(object):
                         try:
                             t = time.time()
                             s = msgio.Client(srv)
-                            stats = json.loads(s.request('state'))
+                            s.send('state')
+                            stats = json.loads(s.recv())
                             log('connection to %s succeeded in %.03f msec' % (
                                 srv, (time.time()-t)*1000))
                             if 'leader' == stats['state']:
@@ -775,7 +774,8 @@ class Lockr(object):
                             log('connection to %s failed in %.03f msec' % (
                                 srv, (time.time()-t)*1000))
 
-                result = self.server.request(req, buf)
+                self.server.send(req, buf)
+                result = self.server.recv()
                 log('received response(%s) from %s in %0.3f msec' % (
                     req, self.server.server, (time.time() - req_begin)*1000))
                 return result
@@ -787,27 +787,10 @@ class Lockr(object):
     def state(self):
         return json.loads(self.request('state'))
 
-    def watch(self, docs):
-        buf = list()
-        for k, v in docs.iteritems():
-            buf.append(struct.pack('!Q', len(k)))
-            buf.append(k)
-            buf.append(struct.pack('!Q', v[0]))
-            buf.append(struct.pack('!Q', v[1]))
-
-        buf = self.request('watch', ''.join(buf))
-
-        if 0 == struct.unpack('!B', buf[0])[0]:
-            key_len = struct.unpack('!Q', buf[1:9])[0]
-            key = buf[9:9+key_len]
-            txn = (struct.unpack('!Q', buf[9+key_len:17+key_len])[0],
-                   struct.unpack('!Q', buf[17+key_len:25+key_len])[0])
-            value_len = struct.unpack('!Q', buf[25+key_len:33+key_len])[0]
-            value = buf[33+key_len:33+key_len+value_len]
-
-            return (0, (key, txn, value))
-        else:
-            return struct.unpack('!B', buf[0])[0], buf[1:]
+    def watch(self, key):
+        yield self.request('watch', key)
+        while True:
+            yield self.server.recv()
 
     def put(self, docs):
         items = list()
@@ -918,17 +901,12 @@ class Client(cmd.Cmd):
             print(value)
 
     def do_watch(self, line):
-        cmd = shlex.split(line)
-
-        code, result = self.cli.watch(
-            dict(map(lambda x: (x[0], tuple(map(int,
-                                                x[1].strip('<>').split('-')))),
-                     zip(cmd[0::2], cmd[1::2]))))
-        if 0 == code:
-            key, txn, value = result
-            print('{0} <{1}-{2}> {3}'.format(key, txn[0], txn[1], value))
-        else:
-            print(result)
+        while True:
+            try:
+                for value in self.cli.watch(shlex.split(line)[0]):
+                    print(value)
+            except:
+                pass
 
 
 if __name__ == '__main__':

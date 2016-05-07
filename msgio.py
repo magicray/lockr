@@ -211,11 +211,11 @@ def loop(module, port, peers):
                     addr2fd.pop(conn.get('peer'), None)
                     addr2fd.pop(conn.get('src'), None)
 
-                    if conn['handshake_done'] is True and 'src' in conn:
+                    if conn['handshake_done'] is True:
                         logger.info('disconnected%s node(%s)',
-                                    conn['peer'], conn['src'])
+                                    conn['peer'], conn.get('src'))
                         out_msg_list.append(module.on_disconnect(
-                            conn['src'], exc, tb))
+                            conn.get('src', conn['peer']), exc, tb))
 
                     if conn['is_server']:
                         stats['srv_disconnect'] += 1
@@ -280,13 +280,14 @@ class Client(object):
         self.sock = ssl.wrap_socket(sock)
         self.sock.connect(server)
 
-    def request(self, req, buf=''):
+    def send(self, req, buf=''):
         self.sock.sendall(''.join([
             struct.pack('!Q', len(req) + len(buf)),
             struct.pack('!H', len(req)),
             req,
             buf]))
 
+    def recv(self):
         def recvall(length):
             pkt = list()
             while length > 0:
