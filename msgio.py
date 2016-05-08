@@ -171,8 +171,8 @@ def loop(module, port, peers):
                             server_side=False)
 
                     conn['sock'].do_handshake()
-                    conn['handshake_done'] = True
                     conn['peer'] = conn['sock'].getpeername()
+                    conn['handshake_done'] = True
                     conn['in'] = list()
                     conn['out'] = collections.deque()
                     addr2fd[conn['peer']] = fileno
