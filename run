@@ -1,9 +1,8 @@
 #!/bin/bash
 
-export PYTHONPATH=~/git/lockr
 PEERS=localhost:$2,localhost:$3,localhost:$4,localhost:$5
 
 while true; do
     echo
-    python -mlockr --port $1 --nodes $PEERS
+    python ~/git/lockr --port $1 --nodes $PEERS
 done

@@ -1,18 +1,11 @@
 import os
-import sys
-import cmd
-import time
 import json
-import shlex
+import time
 import msgio
 import struct
-import signal
-import random
-import pprint
 import sqlite3
 import logging
 import hashlib
-import optparse
 import traceback
 import collections
 
@@ -20,6 +13,7 @@ from logging import critical as log
 
 
 class g:
+    opt = None
     fd = None
     db = None
     kv = dict()
@@ -77,7 +71,7 @@ def vote(src, buf):
 
         for key in set(peer_header).intersection(set(my_header)):
             if peer_header[key] > my_header[key]:
-                os.remove(os.path.join(opt.data, str(g.maxfile)))
+                os.remove(os.path.join(g.opt.data, str(g.maxfile)))
                 log('REMOVED file(%d) as vclock(%s) is ahead', g.maxfile, src)
                 os._exit(0)
 
@@ -86,7 +80,7 @@ def vote(src, buf):
             src, g.peers[src]['minfile'], g.maxfile)
         while True:
             try:
-                os.remove(os.path.join(opt.data, str(g.maxfile)))
+                os.remove(os.path.join(g.opt.data, str(g.maxfile)))
                 log('removed file(%d)', g.maxfile)
                 g.maxfile -= 1
             except:
@@ -244,8 +238,8 @@ def replication_request(src, buf):
     if acks:
         os.fsync(g.fd)
         g.db.commit()
-    elif committed_offset == g.offset and g.offset > opt.max_size:
-        log('max file size reached({0} > {1})'.format(g.offset, opt.max_size))
+    elif committed_offset == g.offset and g.offset > g.opt.max_size:
+        log('max file size reached({0} > {1})'.format(g.offset, g.opt.max_size))
         os._exit(0)
 
     return acks + watch + get_replication_responses()
@@ -258,7 +252,7 @@ def get_replication_responses():
 
         if 0 == req['maxfile']:
             f = map(int, filter(lambda x: x != 'reboot',
-                                os.listdir(opt.data)))
+                                os.listdir(g.opt.data)))
             if f:
                 log('sent replication-nextfile to(%s) file(%d)', src, min(f))
 
@@ -266,7 +260,7 @@ def get_replication_responses():
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                                  buf=json.dumps(dict(filenum=min(f)))))
 
-        if not os.path.isfile(os.path.join(opt.data, str(req['maxfile']))):
+        if not os.path.isfile(os.path.join(g.opt.data, str(req['maxfile']))):
             continue
 
         hdr = g.db.execute('select header from file where file=?',
@@ -284,7 +278,7 @@ def get_replication_responses():
             msgs.append(dict(dst=src, msg='replication_truncate',
                              buf=json.dumps(dict(truncate=0))))
 
-        with open(os.path.join(opt.data, str(req['maxfile']))) as fd:
+        with open(os.path.join(g.opt.data, str(req['maxfile']))) as fd:
             fd.seek(0, 2)
 
             if fd.tell() < req['size']:
@@ -307,7 +301,7 @@ def get_replication_responses():
                             buf=json.dumps(dict(filenum=req['maxfile']+1))))
 
             fd.seek(req['size'])
-            buf = fd.read(opt.repl_size)
+            buf = fd.read(g.opt.repl_size)
             if buf:
                 log('sent replication-response to(%s) file(%d) offset(%d) '
                     'size(%d)',
@@ -325,7 +319,7 @@ def replication_truncate(src, buf):
     log('received replication-truncate from(%s) size(%d)',
         src, req['truncate'])
 
-    f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
+    f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
     assert(req['truncate'] < n)
     os.ftruncate(f, req['truncate'])
@@ -367,7 +361,7 @@ def replication_response(src, buf):
         assert(len(buf) > 0)
 
         if not g.fd:
-            g.fd = os.open(os.path.join(opt.data, str(g.maxfile)),
+            g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
                            os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                            0644)
 
@@ -378,7 +372,7 @@ def replication_response(src, buf):
         g.size = os.fstat(g.fd).st_size
 
         assert(g.checksum)
-        scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+        scan(g.opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
         g.db.commit()
 
         log('sent replication-request to(%s) file(%d) offset(%d)',
@@ -439,7 +433,7 @@ def watch(src, buf):
 
 
 def put(src, buf):
-    if g.offset > opt.max_size:
+    if g.offset > g.opt.max_size:
         return
 
     try:
@@ -513,14 +507,14 @@ def append(buf):
     chksum.update(buf)
 
     if not g.fd:
-        g.fd = os.open(os.path.join(opt.data, str(g.maxfile)),
+        g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
                        os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                        0644)
 
     os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
     g.size = os.fstat(g.fd).st_size
 
-    scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+    scan(g.opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
 
 
 def keys(src, buf):
@@ -557,7 +551,7 @@ def db_get(key):
                        (key,)).fetchone()
     if row:
         filenum, offset, length = row
-        with open(os.path.join(opt.data, str(filenum)), 'rb') as fd:
+        with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
             fd.seek(offset, 0)
             return fd.read(length)
 
@@ -638,8 +632,9 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
             return
 
 
-def init(peers):
-    g.db = sqlite3.connect(opt.index)
+def init(peers, opt):
+    g.opt = opt
+    g.db = sqlite3.connect(g.opt.index)
     g.db.execute('''create table if not exists data(key blob primary key,
         file unsigned, offset unsigned, length unsigned)''')
     g.db.execute('create index if not exists data_file on data(file)')
@@ -648,22 +643,22 @@ def init(peers):
 
     g.quorum = int(len(peers)/2.0 + 0.6)
 
-    if not os.path.isdir(opt.data):
-        os.mkdir(opt.data)
+    if not os.path.isdir(g.opt.data):
+        os.mkdir(g.opt.data)
 
-    files = map(int, os.listdir(opt.data))
+    files = map(int, os.listdir(g.opt.data))
     if not files:
         g.db.execute('delete from file')
         g.db.execute('delete from data')
         g.db.commit()
         return
 
-    with open(os.path.join(opt.data, str(max(files))), 'rb') as fd:
+    with open(os.path.join(g.opt.data, str(max(files))), 'rb') as fd:
         fd.seek(0, 2)
         size = fd.tell()
 
     if 0 == size:
-        os.remove(os.path.join(opt.data, str(max(files))))
+        os.remove(os.path.join(g.opt.data, str(max(files))))
         log('removed file(%d)', max(files))
         os._exit(0)
 
@@ -694,7 +689,7 @@ def init(peers):
         g.db.commit()
 
         try:
-            with open(os.path.join(opt.data, str(g.minfile)), 'rb') as fd:
+            with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
                 hdrlen = struct.unpack('!Q', fd.read(8))[0]
                 hdr = fd.read(hdrlen)
                 g.header = json.loads(hdr)
@@ -707,20 +702,20 @@ def init(peers):
                 g.db.commit()
         except:
             if g.minfile == g.maxfile:
-                os.remove(os.path.join(opt.data, str(g.minfile)))
+                os.remove(os.path.join(g.opt.data, str(g.minfile)))
                 log('removed file(%d)', g.minfile)
                 os._exit(0)
 
-    scan(opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+    scan(g.opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
     g.db.commit()
 
-    with open(os.path.join(opt.data, str(g.maxfile)), 'rb') as fd:
+    with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
         fd.seek(0, 2)
         g.size = fd.tell()
 
     quit = False
     if g.size > g.offset:
-        f = os.open(os.path.join(opt.data, str(g.maxfile)), os.O_RDWR)
+        f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
         os.ftruncate(f, g.offset)
         os.fsync(f)
         log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, g.size)
@@ -731,7 +726,7 @@ def init(peers):
     remove_max = row[0] if row[0] is not None else g.maxfile
 
     for n in range(g.minfile, remove_max):
-        os.remove(os.path.join(opt.data, str(n)))
+        os.remove(os.path.join(g.opt.data, str(n)))
         log('removed file({0})'.format(n))
         quit = True
 
@@ -740,7 +735,7 @@ def init(peers):
     remove_min = g.maxfile + 1
     while True:
         try:
-            os.remove(os.path.join(opt.data, str(remove_min)))
+            os.remove(os.path.join(g.opt.data, str(remove_min)))
             log('removed file({0})'.format(remove_min))
             quit = True
         except:
@@ -748,197 +743,3 @@ def init(peers):
 
     if quit:
         os._exit(0)
-
-
-class Lockr(object):
-    def __init__(self, servers, timeout=30):
-        self.servers = servers
-        self.server = None
-        self.timeout = timeout
-
-    def request(self, req, buf=''):
-        req_begin = time.time()
-        while time.time() < (req_begin + self.timeout):
-            try:
-                if not self.server:
-                    for srv in self.servers:
-                        try:
-                            t = time.time()
-                            s = msgio.Client(srv)
-                            s.send('state')
-                            stats = json.loads(s.recv())
-                            log('connection to %s succeeded in %.03f msec' % (
-                                srv, (time.time()-t)*1000))
-                            if 'leader' == stats['state']:
-                                self.server = s
-                                log('connected to leader {0}'.format(srv))
-                                break
-                        except:
-                            log('connection to %s failed in %.03f msec' % (
-                                srv, (time.time()-t)*1000))
-
-                self.server.send(req, buf)
-                result = self.server.recv()
-                log('received response(%s) from %s in %0.3f msec' % (
-                    req, self.server.server, (time.time() - req_begin)*1000))
-                return result
-            except:
-                self.server = None
-
-        raise Exception('timed out')
-
-    def state(self):
-        return json.loads(self.request('state'))
-
-    def watch(self, key):
-        yield self.request('watch', key)
-        while True:
-            yield self.server.recv()
-
-    def put(self, docs):
-        items = list()
-        for k, v in docs.iteritems():
-            items.append(struct.pack('!Q', len(k)))
-            items.append(k)
-            items.append(struct.pack('!Q', len(v[0])))
-            items.append(v[0])
-            items.append(struct.pack('!Q', len(v[1])))
-            items.append(v[1])
-
-        buf = self.request('put', ''.join(items))
-        if 0 == struct.unpack('!B', buf[0])[0]:
-            filenum = struct.unpack('!Q', buf[1:9])[0]
-            offset = struct.unpack('!Q', buf[9:17])[0]
-
-            return 0, (filenum, offset)
-        elif 1 == struct.unpack('!B', buf[0])[0]:
-            kv = dict()
-            i = 1
-            while i < len(buf):
-                key_len = struct.unpack('!Q', buf[i:i+8])[0]
-                key = buf[i+8:i+8+key_len]
-                value_len = struct.unpack('!Q',
-                                          buf[i+8+key_len:i+16+key_len])[0]
-                kv[key] = buf[i+16+key_len:i+16+key_len+value_len]
-
-                i += 16 + key_len + value_len
-
-            return 1, kv
-
-        return struct.unpack('!B', buf[0])[0], buf[1:]
-
-    def get(self, keys):
-        buf = list()
-        for key in keys:
-            buf.append(struct.pack('!Q', len(key)))
-            buf.append(key)
-
-        buf = self.request('get', ''.join(buf))
-
-        i = 0
-        k = 0
-        docs = dict()
-        while i < len(buf):
-            value_len = struct.unpack('!Q', buf[i:i+8])[0]
-            value = buf[i+8:i+8+value_len]
-
-            docs[keys[k]] = value
-            k += 1
-
-            i += 8 + value_len
-
-        return docs
-
-    def keys(self, prefix):
-        buf = self.request('keys', prefix)
-
-        i = 0
-        result = list()
-        while i < len(buf):
-            key_len = struct.unpack('!Q', buf[i:i+8])[0]
-            result.append(buf[i+8:i+8+key_len])
-
-            i += 8 + key_len
-
-        return result
-
-
-class Client(cmd.Cmd):
-    prompt = '>'
-
-    def __init__(self, servers):
-        cmd.Cmd.__init__(self)
-        self.cli = Lockr(servers)
-
-    def do_EOF(self, line):
-        self.do_quit(line)
-
-    def do_quit(self, line):
-        exit(0)
-
-    def do_state(self, line):
-        print(pprint.pformat(self.cli.state()).replace("u'", " '"))
-
-    def do_keys(self, line):
-        prefix = shlex.split(line)[0] if line else ''
-        for k in self.cli.keys(prefix):
-            print(k)
-
-    def do_get(self, line):
-        result = self.cli.get(shlex.split(line))
-        for k in sorted(result.keys()):
-            print('{0} - {1}'.format(k, result[k]))
-
-    def do_put(self, line):
-        cmd = shlex.split(line)
-        tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-        docs = dict([(t[0], (t[1], t[2])) for t in tup])
-        code, value = self.cli.put(docs)
-        if 0 == code:
-            print('committed : {0}'.format(value))
-        elif 1 == code:
-            print('compare failed for following keys:-')
-            for k, v in value.iteritems():
-                print('{0} - {1}'.format(k, v))
-        else:
-            print(value)
-
-    def do_watch(self, line):
-        while True:
-            try:
-                for value in self.cli.watch(shlex.split(line)[0]):
-                    print(value)
-            except:
-                pass
-
-
-if __name__ == '__main__':
-    parser = optparse.OptionParser()
-    parser.add_option('--port', dest='port', type='int',
-                      help='port number')
-    parser.add_option('--nodes', dest='nodes', type='string',
-                      help='comma separated list of server:port')
-    parser.add_option('--data', dest='data', type='string',
-                      help='data directory', default='data')
-    parser.add_option('--index', dest='index', type='string',
-                      help='index file path', default='snapshot.db')
-    parser.add_option('--maxsize', dest='max_size', type='int',
-                      help='max file size', default='256')
-    parser.add_option('--replsize', dest='repl_size', type='int',
-                      help='replication chunk size', default=10*2**20)
-    parser.add_option('--timeout', dest='timeout', type='int',
-                      help='timeout in seconds', default='20')
-
-    opt, args = parser.parse_args()
-
-    logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
-
-    nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
-                    opt.nodes.split(',')))
-
-    if opt.port:
-        init(nodes)
-        signal.alarm(random.randint(opt.timeout, 2*opt.timeout))
-        msgio.loop(sys.modules[__name__], opt.port, nodes)
-    else:
-        Client(nodes).cmdloop()
