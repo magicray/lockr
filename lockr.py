@@ -92,46 +92,55 @@ def vote(src, buf):
             except:
                 os._exit(0)
 
-    leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
-    count = 0
-    for k, v in g.peers.iteritems():
-        count += 1
-        l, p = leader[1], v
+    if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
+        g.state = 'following-' + src
+        reason = 'leader identified'
+    else:
+        leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
+        count = 0
+        for k, v in g.peers.iteritems():
+            if v['state'].startswith('following-'):
+                continue
 
-        if l['maxfile'] != p['maxfile']:
-            if l['maxfile'] < p['maxfile']:
-                leader = (k, p, 'maxfile({0} > {1})'.format(
-                    p['maxfile'], l['maxfile']))
-            continue
+            count += 1
+            l, p = leader[1], v
 
-        if l['offset'] != p['offset']:
-            if l['offset'] < p['offset']:
-                leader = (k, p, 'offset({0} > {1})'.format(
-                    p['offset'], l['offset']))
-            continue
+            if l['maxfile'] != p['maxfile']:
+                if l['maxfile'] < p['maxfile']:
+                    leader = (k, p, 'maxfile({0} > {1})'.format(
+                        p['maxfile'], l['maxfile']))
+                continue
 
-        if k > leader[0]:
-            leader = (k, p, '{0} > {1}'.format(k, leader[0]))
+            if l['offset'] != p['offset']:
+                if l['offset'] < p['offset']:
+                    leader = (k, p, 'offset({0} > {1})'.format(
+                        p['offset'], l['offset']))
+                continue
 
-    if (os.getenv('MSGIO_NODE') != leader[0]) and (count >= g.quorum):
-        g.state = 'following-' + leader[0]
+            if k > leader[0]:
+                leader = (k, p, '{0} > {1}'.format(k, leader[0]))
+
+        if (os.getenv('MSGIO_NODE') != leader[0]) and (count >= g.quorum):
+            g.state = 'following-' + leader[0]
+            reason = leader[2]
+
+    if g.state.startswith('following-'):
+        leader = g.state.split('following-')[1]
+
         log('sent replication-request to(%s) file(%d) offset(%d) as %s',
-            leader[0], g.maxfile, g.size, leader[2])
+            leader, g.maxfile, g.size, reason)
+        msgs = [dict(dst=leader, msg='replication_request', buf=g.json())]
 
-        return dict(dst=leader[0], msg='replication_request', buf=g.json())
+        for f in g.followers:
+            log('sent leader-conflict to(%s) leader(%s)', f, leader)
+            msgs.append(dict(dst=f, msg='leader_conflict'))
+
+        return msgs
 
 
-def switch_leader(src, buf):
-    g.peers[src] = json.loads(buf)
-    g.state = g.peers[src]['state']
-
-    leader = g.state.split('following-')[1]
-    log('received switch-leader from(%s) leader(%s)', src, leader)
-
-    log('sent replication-request to(%s) file(%d) offset(%d)',
-        leader, g.maxfile, g.size)
-
-    return dict(dst=leader, msg='replication_request', buf=g.json())
+def leader_conflict(src, buf):
+    log('received leader_conflict from(%s)', src)
+    os._exit(0)
 
 
 def replication_request(src, buf):
@@ -142,10 +151,8 @@ def replication_request(src, buf):
         src, req['maxfile'], req['offset'])
 
     if g.state.startswith('following-'):
-        log('sent switch-leader to(%s) leader(%s)',
-            src, g.state.split('following-')[1])
-
-        return dict(msg='switch_leader', buf=g.json())
+        log('rejecting replication-request from(%s)', src)
+        raise Exception('reject-replication-request')
 
     if src not in g.followers:
         log('accepted (%s) as follower(%d)', src, len(g.followers)+1)
@@ -166,7 +173,11 @@ def replication_request(src, buf):
             log('WRITE enabled in msec(%03f) quorum(%d >= %d)',
                 (time.time()-g.start_time)*1000, len(in_sync), g.quorum)
 
-            return get_replication_responses()
+            msgs = list()
+            for f in set(g.peers) - set(g.followers):
+                log('sent leader-conflict to non-follower(%s)', f)
+                msgs.append(dict(dst=f, msg='leader_conflict'))
+            return msgs + get_replication_responses()
 
     if 'old-sync' == g.state:
         count = 0
