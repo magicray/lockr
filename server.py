@@ -1,10 +1,8 @@
 import os
 import json
 import time
-import msgio
 import struct
 import sqlite3
-import logging
 import hashlib
 import traceback
 import collections
@@ -239,7 +237,8 @@ def replication_request(src, buf):
         os.fsync(g.fd)
         g.db.commit()
     elif committed_offset == g.offset and g.offset > g.opt.max_size:
-        log('max file size reached({0} > {1})'.format(g.offset, g.opt.max_size))
+        log('max file size reached({0} > {1})'.format(g.offset,
+                                                      g.opt.max_size))
         os._exit(0)
 
     return acks + watch + get_replication_responses()
@@ -283,7 +282,8 @@ def get_replication_responses():
 
             if fd.tell() < req['size']:
                 log('sent replication-truncate to(%s) file(%d) offset(%d) '
-                   'truncate(%d)', src, req['maxfile'], req['size'], fd.tell())
+                    'truncate(%d)',
+                    src, req['maxfile'], req['size'], fd.tell())
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_truncate',
