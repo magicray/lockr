@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import fcntl
 import struct
 import sqlite3
 import hashlib
@@ -12,6 +13,7 @@ from logging import critical as log
 
 class g:
     opt = None
+    dfd = None
     fd = None
     db = None
     kv = dict()
@@ -645,6 +647,9 @@ def init(peers, opt):
 
     if not os.path.isdir(g.opt.data):
         os.mkdir(g.opt.data)
+
+    g.dfd = os.open(g.opt.data, os.O_RDONLY)
+    fcntl.flock(g.dfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     files = map(int, os.listdir(g.opt.data))
     if not files:

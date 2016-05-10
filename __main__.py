@@ -1,10 +1,8 @@
 import os
 import cmd
 import time
-import msgio
 import shlex
 import client
-import server
 import pprint
 import signal
 import random
@@ -83,8 +81,6 @@ if __name__ == '__main__':
 
     opt, args = parser.parse_args()
 
-    logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
-
     nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
                     opt.nodes.split(',')))
 
@@ -100,12 +96,16 @@ if __name__ == '__main__':
 
         while True:
             if 0 == os.fork():
+                import msgio
+                import server
+
+                logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
+
                 if opt.logfile:
                     os.dup2(os.open('{0}.{1}'.format(
-                                    opt.logfile,
-                                    time.strftime('%y%m%d', time.gmtime())),
-                                    os.O_CREAT | os.O_WRONLY | os.O_APPEND),
-                            2)
+                        opt.logfile,
+                        time.strftime('%y%m%d', time.gmtime())),
+                        os.O_CREAT | os.O_WRONLY | os.O_APPEND), 2)
 
                 logging.critical('')
                 server.init(nodes, opt)
