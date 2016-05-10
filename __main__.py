@@ -1,4 +1,6 @@
+import os
 import cmd
+import time
 import msgio
 import shlex
 import client
@@ -76,6 +78,8 @@ if __name__ == '__main__':
                       help='replication chunk size', default=10*2**20)
     parser.add_option('--timeout', dest='timeout', type='int',
                       help='timeout in seconds', default='20')
+    parser.add_option('--logfile', dest='logfile', type='str',
+                      help='logfile name')
 
     opt, args = parser.parse_args()
 
@@ -85,8 +89,30 @@ if __name__ == '__main__':
                     opt.nodes.split(',')))
 
     if opt.port:
-        server.init(nodes, opt)
-        signal.alarm(random.randint(opt.timeout, 2*opt.timeout))
-        msgio.loop(server, opt.port, nodes)
+        os.close(0)
+        os.close(1)
+
+        if opt.logfile:
+            if os.fork():
+                os._exit(0)
+
+            os.setsid()
+
+        while True:
+            if 0 == os.fork():
+                if opt.logfile:
+                    os.dup2(os.open('{0}.{1}'.format(
+                                    opt.logfile,
+                                    time.strftime('%y%m%d', time.gmtime())),
+                                    os.O_CREAT | os.O_WRONLY | os.O_APPEND),
+                            2)
+
+                logging.critical('')
+                server.init(nodes, opt)
+                signal.alarm(random.randint(opt.timeout, 2*opt.timeout))
+                msgio.loop(server, opt.port, nodes)
+                os._exit(0)
+
+            os.wait()
     else:
         Client(nodes).cmdloop()
