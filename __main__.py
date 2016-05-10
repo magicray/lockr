@@ -81,6 +81,8 @@ if __name__ == '__main__':
 
     opt, args = parser.parse_args()
 
+    logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
+
     nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
                     opt.nodes.split(',')))
 
@@ -98,8 +100,6 @@ if __name__ == '__main__':
             if 0 == os.fork():
                 import msgio
                 import server
-
-                logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
 
                 if opt.logfile:
                     os.dup2(os.open('{0}.{1}'.format(
