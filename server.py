@@ -17,8 +17,6 @@ class g:
     fd = None
     db = None
     kv = dict()
-    src2key = dict()
-    key2src = dict()
     header = dict()
     acks = collections.deque()
     peers = dict()
@@ -49,7 +47,6 @@ class g:
             size=g.size,
             clock=g.clock,
             pending=[len(g.kv), len(g.acks)],
-            watch=[len(g.src2key), len(g.key2src)],
             header=g.header,
             peers=dict([(k, dict(
                 minfile=v['minfile'],
@@ -226,9 +223,6 @@ def replication_request(src, buf):
                 offset, dst, keys = g.acks.popleft()
                 for k in keys:
                     del(g.kv[k])
-                    value = db_get(k)
-                    for s in g.key2src.get(k, set()):
-                        watch.append(dict(dst=s, buf=value))
 
                 acks.append(dict(dst=dst, buf=''.join([
                     struct.pack('!B', 0),
@@ -397,12 +391,6 @@ def on_disconnect(src, exc, tb):
     if exc and str(exc) != 'reject-replication-request':
         log(tb)
 
-    if src in g.src2key:
-        key = g.src2key.pop(src)
-        g.key2src[key].remove(src)
-        if not g.key2src[key]:
-            g.key2src.pop(key)
-
     if src not in g.peers:
         return
 
@@ -428,10 +416,22 @@ def state(src, buf):
 
 
 def watch(src, buf):
-    g.src2key[src] = buf
-    g.key2src.setdefault(buf, set()).add(src)
+    filenum = struct.unpack('!Q', buf[0:8])[0]
+    offset = struct.unpack('!Q', buf[8:16])[0]
+    key = buf[16:]
 
-    return dict(buf=db_get(buf))
+    rows = g.db.execute('''select key from data where key like ?
+                           and ((file = ? and offset > ?) or (file > ?))
+                        ''', (key+'%', filenum, offset, filenum)).fetchall()
+
+    result = [struct.pack('!Q', g.maxfile), struct.pack('!Q', g.offset)]
+
+    for row in rows:
+        key = bytes(row[0])
+        result.append(struct.pack('!Q', len(key)))
+        result.append(key)
+
+    return dict(buf=''.join(result))
 
 
 def put(src, buf):

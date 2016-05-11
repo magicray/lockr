@@ -47,9 +47,33 @@ class Lockr(object):
         return json.loads(self.request('state'))
 
     def watch(self, key):
-        yield self.request('watch', key)
+        marker = (0, 0)
+        sleep = 0
         while True:
-            yield self.server.recv()
+            buf = self.request('watch', ''.join([struct.pack('!Q', marker[0]),
+                                                 struct.pack('!Q', marker[1]),
+                                                 key]))
+
+            marker = (struct.unpack('!Q', buf[0:8])[0],
+                      struct.unpack('!Q', buf[8:16])[0])
+
+            keys = list()
+            i = 16
+            while i < len(buf):
+                key_len = struct.unpack('!Q', buf[i:i+8])[0]
+                keys.append(buf[i+8:i+8+key_len])
+
+                i += 8 + key_len
+
+            assert(i == len(buf))
+
+            yield keys
+
+            if keys:
+                sleep = 0
+            else:
+                sleep = 1 if 0 == sleep else max(30, sleep*2)
+                time.sleep(sleep)
 
     def put(self, docs):
         items = list()
