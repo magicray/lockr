@@ -2,12 +2,13 @@ import time
 import json
 import msgio
 import struct
+import logging
 
-from logging import critical as log
-
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.CRITICAL)
 
 class Lockr(object):
-    def __init__(self, servers, timeout=30):
+    def __init__(self, servers, timeout=5):
         self.servers = servers
         self.server = None
         self.timeout = timeout
@@ -23,20 +24,21 @@ class Lockr(object):
                             s = msgio.Client(srv)
                             s.send('state')
                             stats = json.loads(s.recv())
-                            log('connection to %s succeeded in %.03f msec' % (
-                                srv, (time.time()-t)*1000))
+                            logger.debug('connection to %s succeeded in %.03f '
+                                         'msec', srv, (time.time()-t)*1000)
                             if 'leader' == stats['state']:
                                 self.server = s
-                                log('connected to leader {0}'.format(srv))
+                                logger.debug('connected to leader %s',
+                                             str(srv))
                                 break
                         except:
-                            log('connection to %s failed in %.03f msec' % (
-                                srv, (time.time()-t)*1000))
+                           logger.debug('connection to %s failed in %.03f '
+                                        'msec', srv, (time.time()-t)*1000)
 
                 self.server.send(req, buf)
                 result = self.server.recv()
-                log('received response(%s) from %s in %0.3f msec' % (
-                    req, self.server.server, (time.time() - req_begin)*1000))
+                logger.critical('received response(%s) from %s in %0.3f msec',
+                    req, self.server.server, (time.time() - req_begin)*1000)
                 return result
             except:
                 self.server = None
@@ -46,7 +48,7 @@ class Lockr(object):
     def state(self):
         return json.loads(self.request('state'))
 
-    def watch(self, key):
+    def watch(self, key, timeout=15):
         marker = (0, 0)
         sleep = 0
         while True:
@@ -67,12 +69,11 @@ class Lockr(object):
 
             assert(i == len(buf))
 
-            yield keys
-
             if keys:
                 sleep = 0
+                yield keys
             else:
-                sleep = 1 if 0 == sleep else max(30, sleep*2)
+                sleep = 1 if 0 == sleep else min(timeout, sleep*2)
                 time.sleep(sleep)
 
     def put(self, docs):
