@@ -7,6 +7,7 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
 
+
 class Lockr(object):
     def __init__(self, servers, timeout=5):
         self.servers = servers
@@ -32,13 +33,14 @@ class Lockr(object):
                                              str(srv))
                                 break
                         except:
-                           logger.debug('connection to %s failed in %.03f '
-                                        'msec', srv, (time.time()-t)*1000)
+                            logger.debug('connection to %s failed in %.03f '
+                                         'msec', srv, (time.time()-t)*1000)
 
                 self.server.send(req, buf)
                 result = self.server.recv()
                 logger.critical('received response(%s) from %s in %0.3f msec',
-                    req, self.server.server, (time.time() - req_begin)*1000)
+                                req, self.server.server,
+                                (time.time() - req_begin)*1000)
                 return result
             except:
                 self.server = None
