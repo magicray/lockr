@@ -17,7 +17,6 @@ class g:
     fd = None
     db = None
     kv = set()
-    header = dict()
     acks = collections.deque()
     peers = dict()
     followers = dict()
@@ -47,8 +46,8 @@ class g:
             offset=g.offset,
             size=g.size,
             clock=g.clock,
+            header=json.loads(get_header(g.maxfile)),
             pending=[len(g.kv), len(g.acks)],
-            header=g.header,
             peers=dict([(k, dict(
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
@@ -65,7 +64,7 @@ def vote(src, buf):
 
     if g.maxfile > 0 and g.peers[src]['maxfile'] == g.maxfile:
         peer_header = g.peers[src]['header']
-        my_header = g.header
+        my_header = json.loads(get_header(g.maxfile))
 
         for key in set(peer_header).intersection(set(my_header)):
             if peer_header[key] > my_header[key]:
@@ -196,9 +195,7 @@ def replication_request(src, buf):
             header = json.dumps(vclk, sort_keys=True)
 
             append(header)
-            scan(g.maxfile, g.offset, g.checksum)
             os.fsync(g.fd)
-            g.db.commit()
             g.state = 'new-sync'
             log('new leader TERM({0}) header{1}'.format(g.maxfile, header))
             if 0 == int(time.time()) % 5:
@@ -208,7 +205,6 @@ def replication_request(src, buf):
             return get_replication_responses()
 
     acks = list()
-    watch = list()
     committed_offset = 0
     if 'leader' == g.state:
         offsets = list()
@@ -240,7 +236,7 @@ def replication_request(src, buf):
         log('max file size reached(%d > %d)', g.offset, g.opt.max_size)
         os._exit(0)
 
-    return acks + watch + get_replication_responses()
+    return acks + get_replication_responses()
 
 
 def get_replication_responses():
@@ -261,8 +257,7 @@ def get_replication_responses():
         if not os.path.isfile(os.path.join(g.opt.data, str(req['maxfile']))):
             continue
 
-        hdr = g.db.execute('select header from file where file=?',
-                           (req['maxfile'],)).fetchone()[0]
+        hdr = get_header(req['maxfile'])
         reqhdr = json.dumps(req['header'], sort_keys=True)
         if req['size'] > 0 and hdr != reqhdr:
             log('header mismatch src(%s) file(%d)', src, req['maxfile'])
@@ -424,14 +419,23 @@ def watch(src, buf):
     offset = struct.unpack('!Q', buf[8:16])[0]
     key = buf[16:]
 
-    rows = g.db.execute('''select key from data where key like ?
-                           and ((file = ? and offset > ?) or (file > ?))
-                        ''', (key+'%', filenum, offset, filenum)).fetchall()
+    if 0 == filenum and 0 == offset:
+        rows = g.db.execute('select key from data where key like ?',
+                            (key+'%',))
+    else:
+        rows = g.db.execute('''select key from data where key like ?
+                               and ((file = ? and offset > ?) or
+                                    (file > ?))
+                               and gc = 0
+                            ''', (key+'%', filenum, offset, filenum)).fetchall()
 
     result = [struct.pack('!Q', g.maxfile), struct.pack('!Q', g.offset)]
 
     for row in rows:
         key = bytes(row[0])
+        if '' == key:
+            continue
+
         result.append(struct.pack('!Q', len(key)))
         result.append(key)
 
@@ -540,6 +544,9 @@ def keys(src, buf):
     result = list()
     for r in rows:
         key = bytes(r[0])
+        if '' == key:
+            continue
+
         result.append(struct.pack('!Q', len(key)))
         result.append(key)
 
@@ -585,18 +592,15 @@ def db_put(txn, filenum, offset, checksum, flags):
         g.db.execute('insert into data values(?, ?, ?, ?, ?)',
                      (k, filenum, v[0], len(v[1]), flags))
 
-    g.db.execute('''update file set length=?, checksum=? where file=?''',
-                 (offset, g.checksum, filenum))
-
 
 def header_put(header, filenum, offset, checksum):
     g.maxfile = filenum
     g.offset = offset
     g.checksum = checksum.encode('hex')
-    g.header = json.loads(header)
 
-    g.db.execute('''insert into file values(?, ?, ?, ?)''',
-                 (filenum, header, offset, g.checksum))
+    g.db.execute("delete from data where key=''")
+    g.db.execute("insert into data values('', ?, ?, ?, ?)",
+                     (filenum, 8, len(header)+4, False))
 
 
 def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
@@ -653,8 +657,16 @@ def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
             filenum += 1
             offset = 0
         except:
-            # log(traceback.format_exc())
             return
+
+
+def get_header(filenum):
+    if not os.path.isfile(os.path.join(g.opt.data, str(filenum))):
+        return json.dumps(dict())
+
+    with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+        hdrlen = struct.unpack('!Q', fd.read(8))[0]
+        return fd.read(hdrlen)[4:]
 
 
 def init(peers, opt):
@@ -664,8 +676,6 @@ def init(peers, opt):
         file unsigned, offset unsigned, length unsigned, gc unsigned)''')
     g.db.execute('create index if not exists data_1 on data(file, offset)')
     g.db.execute('create index if not exists data_2 on data(length)')
-    g.db.execute('''create table if not exists file(file unsigned primary key,
-        header blob, length unsigned, checksum text)''')
 
     g.quorum = int(len(peers)/2.0 + 0.6)
 
@@ -677,7 +687,6 @@ def init(peers, opt):
 
     files = map(int, os.listdir(g.opt.data))
     if not files:
-        g.db.execute('delete from file')
         g.db.execute('delete from data')
         g.db.commit()
         return
@@ -696,25 +705,21 @@ def init(peers, opt):
     g.db.execute('delete from data where file > ?', (max(files),))
     g.db.execute('delete from data where file = ? and offset+length > ?',
                  (max(files), size))
-
-    g.db.execute('delete from file where file < ?', (min(files),))
-    g.db.execute('delete from file where file > ?', (max(files),))
-    g.db.execute('delete from file where file = ? and length > ?',
-                 (max(files), size))
     g.db.commit()
 
     g.minfile = min(files)
 
-    row = g.db.execute('''select file, header, length, checksum from file
-                          order by file desc limit 1''').fetchone()
+    row = g.db.execute('''select file, offset, length from data
+                          order by file desc, offset desc limit 1
+                       ''').fetchone()
     if row:
         g.maxfile = row[0]
-        g.header = json.loads(row[1])
-        g.offset = row[2]
-        g.checksum = row[3]
+        g.offset = row[1] + row[2] + 20
+        with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
+            fd.seek(row[1] + row[2])
+            g.checksum = fd.read(20).encode('hex')
     else:
         g.maxfile = min(files)
-        g.db.execute('delete from file')
         g.db.execute('delete from data')
         g.db.commit()
 
@@ -722,13 +727,9 @@ def init(peers, opt):
             with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
                 hdrlen = struct.unpack('!Q', fd.read(8))[0]
                 hdr = fd.read(hdrlen)
-                g.header = json.loads(hdr)
                 g.checksum = fd.read(20).encode('hex')
                 g.offset = fd.tell()
                 assert(g.offset == hdrlen + 28)
-
-                g.db.execute('''insert into file values(?, ?, ?, ?)''',
-                             (g.minfile, hdr, g.offset, g.checksum))
                 g.db.commit()
         except:
             if g.minfile == g.maxfile:
