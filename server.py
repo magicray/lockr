@@ -16,7 +16,7 @@ class g:
     dfd = None
     fd = None
     db = None
-    kv = dict()
+    kv = set()
     header = dict()
     acks = collections.deque()
     peers = dict()
@@ -28,6 +28,7 @@ class g:
     maxfile = 0
     offset = 0
     size = 0
+    chksum = None
     checksum = ''
     start_time = time.time()
 
@@ -195,6 +196,7 @@ def replication_request(src, buf):
             header = json.dumps(vclk, sort_keys=True)
 
             append(header)
+            scan(g.maxfile, g.offset, g.checksum)
             os.fsync(g.fd)
             g.state = 'new-sync'
             log('new leader TERM({0}) header{1}'.format(g.maxfile, header))
@@ -222,7 +224,7 @@ def replication_request(src, buf):
 
                 offset, dst, keys = g.acks.popleft()
                 for k in keys:
-                    del(g.kv[k])
+                    g.kv.remove(k)
 
                 acks.append(dict(dst=dst, buf=''.join([
                     struct.pack('!B', 0),
@@ -231,10 +233,10 @@ def replication_request(src, buf):
 
     if acks:
         os.fsync(g.fd)
+        scan(g.maxfile, g.offset, g.checksum, g.maxfile, committed_offset)
         g.db.commit()
     elif committed_offset == g.offset and g.offset > g.opt.max_size:
-        log('max file size reached({0} > {1})'.format(g.offset,
-                                                      g.opt.max_size))
+        log('max file size reached(%d > %d)', g.offset, g.opt.max_size)
         os._exit(0)
 
     return acks + watch + get_replication_responses()
@@ -368,7 +370,7 @@ def replication_response(src, buf):
         g.size = os.fstat(g.fd).st_size
 
         assert(g.checksum)
-        scan(g.opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+        scan(g.maxfile, g.offset, g.checksum)
         g.db.commit()
 
         log('sent replication-request to(%s) file(%d) offset(%d)',
@@ -475,6 +477,8 @@ def put(src, buf):
 
             return dict(buf=''.join(buf_list))
 
+        g.kv.update(keys)
+
         buf_list = list()
         for key in keys:
             buf_list.append(struct.pack('!Q', len(key)))
@@ -482,12 +486,15 @@ def put(src, buf):
             buf_list.append(struct.pack('!Q', len(keys[key][0])))
             buf_list.append(keys[key][0])
 
-        g.kv.update(keys)
+        append(''.join(buf_list))
 
-        rows = g.db.execute('''select key, file, length from data
-                               where file < ?  order by file, offset limit ?
-                            ''', (g.maxfile, len(keys))).fetchall()
-        for r in filter(lambda r: (r[0] not in g.kv) and (r[2] > 0), rows):
+        rows = g.db.execute('''select key from data
+                               where file < ? and length > 0
+                               order by file, offset limit ?
+                            ''', (g.maxfile, len(keys)*2)).fetchall()
+        log(str(rows))
+        buf_list = list()
+        for r in filter(lambda r: r[0] not in g.kv, rows)[0:len(keys)]:
             key = bytes(r[0])
             value = db_get(key)
 
@@ -495,28 +502,31 @@ def put(src, buf):
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', len(value)))
             buf_list.append(value)
+            log('rewriting %s', key)
 
         append(''.join(buf_list))
 
-        g.acks.append((g.offset, src, set(keys)))
+        g.acks.append((g.size, src, set(keys)))
         return get_replication_responses()
     except:
         return dict(buf=struct.pack('!B', 2) + traceback.format_exc())
 
 
 def append(buf):
-    chksum = hashlib.sha1(g.checksum.decode('hex'))
-    chksum.update(buf)
+    if not g.chksum:
+        g.chksum = hashlib.sha1(g.checksum.decode('hex'))
+    else:
+        g.chksum = hashlib.sha1(g.chksum.digest())
+
+    g.chksum.update(buf)
 
     if not g.fd:
         g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
                        os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                        0644)
 
-    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + chksum.digest())
+    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + g.chksum.digest())
     g.size = os.fstat(g.fd).st_size
-
-    scan(g.opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
 
 
 def keys(src, buf):
@@ -538,7 +548,7 @@ def get(src, buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
 
-        value = g.kv.get(key, db_get(key))
+        value = db_get(key)
 
         result.append(struct.pack('!Q', len(value)))
         result.append(value)
@@ -567,9 +577,9 @@ def db_put(txn, filenum, offset, checksum):
 
     for k, v in txn.iteritems():
         g.db.execute('delete from data where key=?', (k,))
-        if v[1]:
-            g.db.execute('insert into data values(?, ?, ?, ?)',
-                         (k, filenum, v[0], len(v[1])))
+        g.db.execute('insert into data values(?, ?, ?, ?)',
+                     (k, filenum, v[0], len(v[1])))
+        log('inserting %s - %d %d %d', k, filenum, v[0], len(v[1]))
 
     g.db.execute('''update file set length=?, checksum=? where file=?''',
                  (offset, g.checksum, filenum))
@@ -585,17 +595,24 @@ def header_put(header, filenum, offset, checksum):
                  (filenum, header, offset, g.checksum))
 
 
-def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
+def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
+         cb_txn=db_put, cb_hdr=header_put):
+
     checksum = checksum.decode('hex')
     while True:
         try:
-            with open(os.path.join(path, str(filenum)), 'rb') as fd:
+            assert(filenum <= e_filenum)
+
+            with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
                 fd.seek(0, 2)
                 total_size = fd.tell()
                 fd.seek(offset)
 
                 while(offset < total_size):
-                    x = fd.read(struct.unpack('!Q', fd.read(8))[0])
+                    l = struct.unpack('!Q', fd.read(8))[0]
+                    assert(l + 28 <= e_offset)
+
+                    x = fd.read(l)
                     y = fd.read(20)
 
                     chksum = hashlib.sha1(checksum)
@@ -622,16 +639,16 @@ def scan(path, filenum, offset, checksum, callback_kv, callback_vclock):
                     assert(offset == fd.tell())
 
                     if txn:
-                        callback_kv(txn, filenum, offset, checksum)
+                        cb_txn(txn, filenum, offset, checksum)
                     else:
-                        callback_vclock(x, filenum, offset, checksum)
+                        cb_hdr(x, filenum, offset, checksum)
 
                     log('scanned file(%d) offset(%d)', filenum, offset)
 
             filenum += 1
             offset = 0
         except:
-            return
+           return
 
 
 def init(peers, opt):
@@ -667,6 +684,7 @@ def init(peers, opt):
         log('removed file(%d)', max(files))
         os._exit(0)
 
+    g.db.execute('delete from data where length = 0')
     g.db.execute('delete from data where file < ?', (min(files),))
     g.db.execute('delete from data where file > ?', (max(files),))
     g.db.execute('delete from data where file = ? and offset+length > ?',
@@ -711,7 +729,7 @@ def init(peers, opt):
                 log('removed file(%d)', g.minfile)
                 os._exit(0)
 
-    scan(g.opt.data, g.maxfile, g.offset, g.checksum, db_put, header_put)
+    scan(g.maxfile, g.offset, g.checksum)
     g.db.commit()
 
     with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
