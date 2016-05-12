@@ -198,6 +198,7 @@ def replication_request(src, buf):
             append(header)
             scan(g.maxfile, g.offset, g.checksum)
             os.fsync(g.fd)
+            g.db.commit()
             g.state = 'new-sync'
             log('new leader TERM({0}) header{1}'.format(g.maxfile, header))
             if 0 == int(time.time()) % 5:
@@ -369,7 +370,7 @@ def replication_response(src, buf):
         os.fsync(g.fd)
         g.size = os.fstat(g.fd).st_size
 
-        assert(g.checksum)
+        #assert(g.checksum)
         scan(g.maxfile, g.offset, g.checksum)
         g.db.commit()
 
@@ -378,6 +379,7 @@ def replication_response(src, buf):
 
         return dict(msg='replication_request', buf=g.json())
     except:
+        log(traceback.format_exc())
         os._exit(0)
 
 
@@ -492,7 +494,7 @@ def put(src, buf):
                                where file < ? and length > 0
                                order by file, offset limit ?
                             ''', (g.maxfile, len(keys)*2)).fetchall()
-        log(str(rows))
+
         buf_list = list()
         for r in filter(lambda r: r[0] not in g.kv, rows)[0:len(keys)]:
             key = bytes(r[0])
@@ -502,9 +504,8 @@ def put(src, buf):
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', len(value)))
             buf_list.append(value)
-            log('rewriting %s', key)
 
-        append(''.join(buf_list))
+        append(''.join(buf_list), True)
 
         g.acks.append((g.size, src, set(keys)))
         return get_replication_responses()
@@ -512,12 +513,15 @@ def put(src, buf):
         return dict(buf=struct.pack('!B', 2) + traceback.format_exc())
 
 
-def append(buf):
+def append(buf, gc=False):
     if not g.chksum:
         g.chksum = hashlib.sha1(g.checksum.decode('hex'))
     else:
         g.chksum = hashlib.sha1(g.chksum.digest())
 
+    gc = struct.pack('!I', gc)
+
+    g.chksum.update(gc)
     g.chksum.update(buf)
 
     if not g.fd:
@@ -525,7 +529,8 @@ def append(buf):
                        os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                        0644)
 
-    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + g.chksum.digest())
+    length = struct.pack('!Q', len(buf) + 4)
+    os.write(g.fd, length + gc + buf + g.chksum.digest())
     g.size = os.fstat(g.fd).st_size
 
 
@@ -570,16 +575,15 @@ def db_get(key):
     return ''
 
 
-def db_put(txn, filenum, offset, checksum):
+def db_put(txn, filenum, offset, checksum, flags):
     g.maxfile = filenum
     g.offset = offset
     g.checksum = checksum.encode('hex')
 
     for k, v in txn.iteritems():
         g.db.execute('delete from data where key=?', (k,))
-        g.db.execute('insert into data values(?, ?, ?, ?)',
-                     (k, filenum, v[0], len(v[1])))
-        log('inserting %s - %d %d %d', k, filenum, v[0], len(v[1]))
+        g.db.execute('insert into data values(?, ?, ?, ?, ?)',
+                     (k, filenum, v[0], len(v[1]), flags))
 
     g.db.execute('''update file set length=?, checksum=? where file=?''',
                  (offset, g.checksum, filenum))
@@ -614,6 +618,7 @@ def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
 
                     x = fd.read(l)
                     y = fd.read(20)
+                    flags = struct.unpack('!I', x[0:4])[0]
 
                     chksum = hashlib.sha1(checksum)
                     chksum.update(x)
@@ -622,7 +627,7 @@ def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
 
                     txn = dict()
                     if offset > 0:
-                        i = 0
+                        i = 4
                         while i < len(x):
                             key_len = struct.unpack('!Q', x[i:i+8])[0]
                             key = x[i+8:i+8+key_len]
@@ -639,24 +644,26 @@ def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
                     assert(offset == fd.tell())
 
                     if txn:
-                        cb_txn(txn, filenum, offset, checksum)
+                        cb_txn(txn, filenum, offset, checksum, flags)
                     else:
-                        cb_hdr(x, filenum, offset, checksum)
+                        cb_hdr(x[4:], filenum, offset, checksum)
 
                     log('scanned file(%d) offset(%d)', filenum, offset)
 
             filenum += 1
             offset = 0
         except:
-           return
+            # log(traceback.format_exc())
+            return
 
 
 def init(peers, opt):
     g.opt = opt
     g.db = sqlite3.connect(g.opt.index)
     g.db.execute('''create table if not exists data(key blob primary key,
-        file unsigned, offset unsigned, length unsigned)''')
-    g.db.execute('create index if not exists data_file on data(file)')
+        file unsigned, offset unsigned, length unsigned, gc unsigned)''')
+    g.db.execute('create index if not exists data_1 on data(file, offset)')
+    g.db.execute('create index if not exists data_2 on data(length)')
     g.db.execute('''create table if not exists file(file unsigned primary key,
         header blob, length unsigned, checksum text)''')
 
