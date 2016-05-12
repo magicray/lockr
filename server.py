@@ -365,7 +365,6 @@ def replication_response(src, buf):
         os.fsync(g.fd)
         g.size = os.fstat(g.fd).st_size
 
-        #assert(g.checksum)
         scan(g.maxfile, g.offset, g.checksum)
         g.db.commit()
 
@@ -768,6 +767,7 @@ def init(peers, opt):
         try:
             os.remove(os.path.join(g.opt.data, str(remove_min)))
             log('removed file({0})'.format(remove_min))
+            remove_min += 1
             quit = True
         except:
             break
