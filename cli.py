@@ -2,6 +2,7 @@ import cmd
 import shlex
 import client
 import pprint
+import traceback
 
 
 class Client(cmd.Cmd):
@@ -49,8 +50,16 @@ class Client(cmd.Cmd):
         while True:
             try:
                 for result in self.cli.watch(key):
-                    kv = self.cli.get(result)
-                    for k in sorted(kv.keys()):
-                        print('{0} - {1}'.format(k, kv[k]))
+                    print('marker : {0}'.format(result['marker']))
+                    if result['added']:
+                        for k, v in result['added'].iteritems():
+                            print('added {0} - {1}'.format(k, v))
+                    if result['updated']:
+                        for k, v in result['updated'].iteritems():
+                            print('updated {0} - {1}'.format(k, v))
+                    if result['deleted']:
+                        for k in result['deleted']:
+                            print('deleted {0}'.format(k))
             except:
+                traceback.print_exc()
                 pass

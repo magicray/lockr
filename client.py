@@ -50,30 +50,49 @@ class Lockr(object):
     def state(self):
         return json.loads(self.request('state'))
 
-    def watch(self, key, timeout=15):
+    def watch(self, prefix, timeout=15):
         marker = (0, 0)
+        old_list = set()
         sleep = 0
         while True:
             buf = self.request('watch', ''.join([struct.pack('!Q', marker[0]),
                                                  struct.pack('!Q', marker[1]),
-                                                 key]))
+                                                 prefix]))
 
             marker = (struct.unpack('!Q', buf[0:8])[0],
                       struct.unpack('!Q', buf[8:16])[0])
 
-            keys = list()
+            result = dict(marker=marker, added=dict(), updated=dict())
+
             i = 16
+            modified = set()
+            unmodified = set()
             while i < len(buf):
                 key_len = struct.unpack('!Q', buf[i:i+8])[0]
-                keys.append(buf[i+8:i+8+key_len])
+                key = buf[i+8:i+8+key_len]
+                value_len = struct.unpack('!Q',
+                                          buf[i+8+key_len:i+16+key_len])[0]
+                value = buf[i+16+key_len:i+16+key_len+value_len]
 
-                i += 8 + key_len
+                if value:
+                    modified.add(key)
+                    if key in old_list:
+                        result['updated'][key] = value
+                    else:
+                        result['added'][key] = value
+                else:
+                    unmodified.add(key)
+
+                i += 16 + key_len + value_len
 
             assert(i == len(buf))
 
-            if keys:
+            result['deleted'] = old_list - modified - unmodified
+            old_list = modified.union(unmodified)
+
+            if result['added'] or result['updated'] or result['deleted']:
                 sleep = 0
-                yield keys
+                yield result
             else:
                 sleep = 1 if 0 == sleep else min(timeout, sleep*2)
                 time.sleep(sleep)

@@ -418,9 +418,12 @@ def watch(src, buf):
     offset = struct.unpack('!Q', buf[8:16])[0]
     key = buf[16:]
 
+
+    all_keys = g.db.execute('select key from data where key like ?',
+                            (key+'%',)).fetchall()
+
     if 0 == filenum and 0 == offset:
-        rows = g.db.execute('select key from data where key like ?',
-                            (key+'%',))
+        rows = all_keys
     else:
         rows = g.db.execute('''select key from data where key like ?
                                and ((file = ? and offset > ?) or
@@ -430,13 +433,20 @@ def watch(src, buf):
 
     result = [struct.pack('!Q', g.maxfile), struct.pack('!Q', g.offset)]
 
-    for row in rows:
-        key = bytes(row[0])
-        if '' == key:
-            continue
+    keys = set([bytes(row[0]) for row in rows if '' != row[0]])
+    all_keys = set([bytes(row[0]) for row in all_keys if '' != row[0]])
 
-        result.append(struct.pack('!Q', len(key)))
-        result.append(key)
+    for k in keys:
+        v = db_get(k)
+        result.append(struct.pack('!Q', len(k)))
+        result.append(k)
+        result.append(struct.pack('!Q', len(v)))
+        result.append(v)
+
+    for k in all_keys - keys:
+        result.append(struct.pack('!Q', len(k)))
+        result.append(k)
+        result.append(struct.pack('!Q', 0))
 
     return dict(buf=''.join(result))
 
@@ -588,8 +598,9 @@ def db_put(txn, filenum, offset, checksum, flags):
 
     for k, v in txn.iteritems():
         g.db.execute('delete from data where key=?', (k,))
-        g.db.execute('insert into data values(?, ?, ?, ?, ?)',
-                     (k, filenum, v[0], len(v[1]), flags))
+        if v[1]:
+            g.db.execute('insert into data values(?, ?, ?, ?, ?)',
+                         (k, filenum, v[0], len(v[1]), flags))
 
 
 def header_put(header, filenum, offset, checksum):
@@ -699,7 +710,6 @@ def init(peers, opt):
         log('removed file(%d)', max(files))
         os._exit(0)
 
-    g.db.execute('delete from data where length = 0')
     g.db.execute('delete from data where file < ?', (min(files),))
     g.db.execute('delete from data where file > ?', (max(files),))
     g.db.execute('delete from data where file = ? and offset+length > ?',
