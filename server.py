@@ -372,7 +372,7 @@ def replication_response(src, buf):
 
         return dict(msg='replication_request', buf=g.json())
     except:
-        log(traceback.format_exc())
+        # log(traceback.format_exc())
         os._exit(0)
 
 
@@ -423,40 +423,59 @@ def watch(src, buf):
     g.watch[src] = (filenum, offset)
 
 
-def updates(src, buf):
+def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
-    key = buf[16:]
+    flags = struct.unpack('!I', buf[16:20])[0]
 
+    keys = list()
+    i = 20
+    while i < len(buf):
+        begin_len = struct.unpack('!Q', buf[i:i+8])[0]
+        begin = buf[i+8:i+8+begin_len]
+        end_len = struct.unpack('!Q', buf[i+8+begin_len:i+16+begin_len])[0]
+        end = buf[i+16+begin_len:i+16+begin_len+end_len]
+        keys.append((begin, end))
 
-    all_keys = g.db.execute('select key from data where key like ?',
-                            (key+'%',)).fetchall()
+        i += 16 + begin_len + end_len
 
-    if 0 == filenum and 0 == offset:
-        rows = all_keys
-    else:
-        rows = g.db.execute('''select key from data where key like ?
-                               and ((file = ? and offset > ?) or
-                                    (file > ?))
-                               and gc = 0
-                            ''', (key+'%', filenum, offset, filenum)).fetchall()
+    assert(i == len(buf))
 
     result = [struct.pack('!Q', g.maxfile), struct.pack('!Q', g.offset)]
 
-    keys = set([bytes(row[0]) for row in rows if '' != row[0]])
-    all_keys = set([bytes(row[0]) for row in all_keys if '' != row[0]])
+    for begin_key, end_key in keys:
+        full = g.db.execute('''select key, length from data
+                               where key between ? and ?''',
+            (sqlite3.Binary(begin_key), sqlite3.Binary(end_key))).fetchall()
 
-    for k in keys:
-        v = db_get(k)
-        result.append(struct.pack('!Q', len(k)))
-        result.append(k)
-        result.append(struct.pack('!Q', len(v)))
-        result.append(v)
+        if 0 == filenum and 0 == offset:
+            new = full
+        else:
+            new = g.db.execute('''select key, length from data
+                                  where key between ? and ?
+                                  and ((file = ? and offset > ?) or
+                                       (file > ?))
+                                  and gc = 0''',
+                (sqlite3.Binary(begin_key), sqlite3.Binary(end_key), filenum,
+                 offset, filenum)).fetchall()
 
-    for k in all_keys - keys:
-        result.append(struct.pack('!Q', len(k)))
-        result.append(k)
-        result.append(struct.pack('!Q', 0))
+        new = dict([(bytes(r[0]), r[1]) for r in new if '' != r[0]])
+
+        for key, length in new.iteritems():
+            result.append(struct.pack('!Q', len(key)))
+            result.append(key)
+            result.append(struct.pack('!Q', length))
+            if 0 == flags:
+                result.append(db_get(key))
+
+        for k, length in full:
+            key = bytes(k)
+            if key in new or '' == key:
+                continue
+
+            result.append(struct.pack('!Q', len(key)))
+            result.append(key)
+            result.append(struct.pack('!Q', 0))
 
     return dict(buf=''.join(result))
 
@@ -519,7 +538,7 @@ def put(src, buf):
                             ''', (g.maxfile, len(keys)*2)).fetchall()
 
         buf_list = list()
-        for r in filter(lambda r: r[0] not in g.kv, rows)[0:len(keys)]:
+        for r in filter(lambda r: bytes(r[0]) not in g.kv, rows)[0:len(keys)]:
             key = bytes(r[0])
             value = db_get(key)
 
@@ -557,46 +576,17 @@ def append(buf, gc=False):
     g.size = os.fstat(g.fd).st_size
 
 
-def keys(src, buf):
-    rows = g.db.execute('select key from data where key like ? order by key',
-                        (buf+'%',))
-    result = list()
-    for r in rows:
-        key = bytes(r[0])
-        if '' == key:
-            continue
-
-        result.append(struct.pack('!Q', len(key)))
-        result.append(key)
-
-    return dict(buf=''.join(result))
-
-
-def get(src, buf):
-    i = 0
-    result = list()
-    while i < len(buf):
-        key_len = struct.unpack('!Q', buf[i:i+8])[0]
-        key = buf[i+8:i+8+key_len]
-
-        value = db_get(key)
-
-        result.append(struct.pack('!Q', len(value)))
-        result.append(value)
-
-        i += 8 + key_len
-
-    return dict(buf=''.join(result))
-
-
 def db_get(key):
     row = g.db.execute('select file, offset, length from data where key=?',
-                       (key,)).fetchone()
+                       (sqlite3.Binary(key),)).fetchone()
     if row:
         filenum, offset, length = row
         with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
             fd.seek(offset, 0)
-            return fd.read(length)
+            buf = fd.read(length)
+
+            assert(len(buf) == length)
+            return buf
 
     return ''
 
@@ -607,10 +597,10 @@ def db_put(txn, filenum, offset, checksum, flags):
     g.checksum = checksum.encode('hex')
 
     for k, v in txn.iteritems():
-        g.db.execute('delete from data where key=?', (k,))
+        g.db.execute('delete from data where key=?', (sqlite3.Binary(k),))
         if v[1]:
             g.db.execute('insert into data values(?, ?, ?, ?, ?)',
-                         (k, filenum, v[0], len(v[1]), flags))
+                         (sqlite3.Binary(k), filenum, v[0], len(v[1]), flags))
 
 
 def header_put(header, filenum, offset, checksum):
@@ -618,9 +608,9 @@ def header_put(header, filenum, offset, checksum):
     g.offset = offset
     g.checksum = checksum.encode('hex')
 
-    g.db.execute("delete from data where key=''")
-    g.db.execute("insert into data values('', ?, ?, ?, ?)",
-                     (filenum, 8, len(header)+4, False))
+    g.db.execute("delete from data where key=?", (sqlite3.Binary(''),))
+    g.db.execute("insert into data values(?, ?, ?, ?, ?)",
+                 (sqlite3.Binary(''), filenum, 8, len(header)+4, False))
 
 
 def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,

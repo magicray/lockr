@@ -14,8 +14,8 @@ class Lockr(object):
         self.server = None
         self.timeout = timeout
 
-        self.watch_marker = (0, 0)
-        self.watch_keys = set()
+        self.offset = (0, 0)
+        self.keys = set()
 
     def request(self, req, buf=''):
         req_begin = time.time()
@@ -53,51 +53,6 @@ class Lockr(object):
     def state(self):
         return json.loads(self.request('state'))
 
-    def watch(self, prefix, timeout=15):
-        while True:
-            buf = self.request('updates', ''.join([
-                struct.pack('!Q', self.watch_marker[0]),
-                struct.pack('!Q', self.watch_marker[1]),
-                prefix]))
-
-            self.watch_marker = (struct.unpack('!Q', buf[0:8])[0],
-                                 struct.unpack('!Q', buf[8:16])[0])
-
-            result = dict(added=dict(), updated=dict())
-
-            i = 16
-            modified = set()
-            unmodified = set()
-            while i < len(buf):
-                key_len = struct.unpack('!Q', buf[i:i+8])[0]
-                key = buf[i+8:i+8+key_len]
-                value_len = struct.unpack('!Q',
-                                          buf[i+8+key_len:i+16+key_len])[0]
-                value = buf[i+16+key_len:i+16+key_len+value_len]
-
-                if value:
-                    modified.add(key)
-                    if key in self.watch_keys:
-                        result['updated'][key] = value
-                    else:
-                        result['added'][key] = value
-                else:
-                    unmodified.add(key)
-
-                i += 16 + key_len + value_len
-
-            assert(i == len(buf))
-
-            result['deleted'] = self.watch_keys - modified - unmodified
-            self.watch_keys = modified.union(unmodified)
-
-            if result['added'] or result['updated'] or result['deleted']:
-                yield result
-
-            self.request('watch', ''.join([
-                struct.pack('!Q', self.watch_marker[0]),
-                struct.pack('!Q', self.watch_marker[1])]))
-
     def put(self, docs):
         items = list()
         for k, v in docs.iteritems():
@@ -130,37 +85,59 @@ class Lockr(object):
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
-    def get(self, keys):
-        buf = list()
-        for key in keys:
-            buf.append(struct.pack('!Q', len(key)))
-            buf.append(key)
+    def get(self, begin, end, key_only=True, offset=(0, 0)):
+        buf = self.request('get', ''.join([
+                struct.pack('!Q', offset[0]),
+                struct.pack('!Q', offset[1]),
+                struct.pack('!I', 1 if key_only else 0),
+                struct.pack('!Q', len(begin)),
+                begin,
+                struct.pack('!Q', len(end)),
+                end]))
 
-        buf = self.request('get', ''.join(buf))
+        offset = (struct.unpack('!Q', buf[0:8])[0],
+                  struct.unpack('!Q', buf[8:16])[0])
 
-        i = 0
-        k = 0
-        docs = dict()
-        while i < len(buf):
-            value_len = struct.unpack('!Q', buf[i:i+8])[0]
-            value = buf[i+8:i+8+value_len]
-
-            docs[keys[k]] = value
-            k += 1
-
-            i += 8 + value_len
-
-        return docs
-
-    def keys(self, prefix):
-        buf = self.request('keys', prefix)
-
-        i = 0
-        result = list()
+        i = 16
+        result = dict()
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
-            result.append(buf[i+8:i+8+key_len])
+            key = buf[i+8:i+8+key_len]
+            value_len = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
 
-            i += 8 + key_len
+            if key_only:
+                result[key] = value_len
+                i += 16 + key_len
+            else:
+                result[key] = buf[i+16+key_len:i+16+key_len+value_len]
+                i += 16 + key_len + value_len
 
-        return result
+        assert(i == len(buf))
+
+        return offset, result
+
+    def watch(self, begin, end):
+        while True:
+            self.offset, ret = self.get(begin, end, False, self.offset)
+            result = dict(added=dict(), updated=dict())
+            modified = set()
+            unmodified = set()
+            for key, value in ret.iteritems():
+                if value:
+                    modified.add(key)
+                    if key in self.keys:
+                        result['updated'][key] = value
+                    else:
+                        result['added'][key] = value
+                else:
+                    unmodified.add(key)
+
+            result['deleted'] = self.keys - modified - unmodified
+            self.keys = modified.union(unmodified)
+
+            if result['added'] or result['updated'] or result['deleted']:
+                yield result
+
+            self.request('watch', ''.join([
+                struct.pack('!Q', self.offset[0]),
+                struct.pack('!Q', self.offset[1])]))

@@ -2,6 +2,7 @@ import cmd
 import shlex
 import client
 import pprint
+import struct
 import traceback
 
 
@@ -21,15 +22,25 @@ class Client(cmd.Cmd):
     def do_state(self, line):
         print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
-    def do_keys(self, line):
-        prefix = shlex.split(line)[0] if line else ''
-        for k in self.cli.keys(prefix):
-            print(k)
+    def get(self, key_only, line):
+        begin, end = struct.pack('!B', 0), struct.pack('!B', 255)
+        if line:
+            l = shlex.split(line)
+            if 1 == len(l):
+                begin = l[0]
+                end = begin + struct.pack('!B', 255)
+            else:
+                begin, end = l[0], l[1]
 
-    def do_get(self, line):
-        result = self.cli.get(shlex.split(line))
+        offset, result = self.cli.get(begin, end, key_only)
         for k in sorted(result.keys()):
             print('{0} - {1}'.format(k, result[k]))
+
+    def do_keys(self, line):
+        self.get(True, line)
+
+    def do_get(self, line):
+        self.get(False, line)
 
     def do_put(self, line):
         cmd = shlex.split(line)
@@ -46,10 +57,17 @@ class Client(cmd.Cmd):
             print(value)
 
     def do_watch(self, line):
-        key = shlex.split(line)[0]
+        begin, end = struct.pack('!B', 0), struct.pack('!B', 255)
+        if line:
+            l = shlex.split(line)
+            if 1 == len(l):
+                begin = l[0]
+                end = begin + struct.pack('!B', 255)
+            else:
+                begin, end = l[0], l[1]
         while True:
             try:
-                for result in self.cli.watch(key):
+                for result in self.cli.watch(begin, end):
                     for k in sorted(result['added'].keys()):
                         print('ADD {0} - {1}'.format(k, result['added'][k]))
                     for k in sorted(result['updated'].keys()):
