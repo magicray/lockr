@@ -17,6 +17,7 @@ class g:
     fd = None
     db = None
     kv = set()
+    watch = dict()
     acks = collections.deque()
     peers = dict()
     followers = dict()
@@ -47,7 +48,7 @@ class g:
             size=g.size,
             clock=g.clock,
             header=json.loads(get_header(g.maxfile)),
-            pending=[len(g.kv), len(g.acks)],
+            pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
@@ -195,7 +196,7 @@ def replication_request(src, buf):
             header = json.dumps(vclk, sort_keys=True)
 
             append(header)
-            os.fsync(g.fd)
+            commit()
             g.state = 'new-sync'
             log('new leader TERM({0}) header{1}'.format(g.maxfile, header))
             if 0 == int(time.time()) % 5:
@@ -229,9 +230,13 @@ def replication_request(src, buf):
                     struct.pack('!Q', offset)])))
 
     if acks:
-        os.fsync(g.fd)
         scan(g.maxfile, g.offset, g.checksum, g.maxfile, committed_offset)
-        g.db.commit()
+        commit()
+        for k in g.watch.keys():
+            f, o = g.watch[k]
+            if g.maxfile > f or (g.maxfile == f and g.offset > o):
+                g.watch.pop(k)
+                acks.append(dict(dst=k))
     elif committed_offset == g.offset and g.offset > g.opt.max_size:
         log('max file size reached(%d > %d)', g.offset, g.opt.max_size)
         os._exit(0)
@@ -317,11 +322,8 @@ def replication_truncate(src, buf):
     n = os.fstat(f).st_size
     assert(req['truncate'] < n)
     os.ftruncate(f, req['truncate'])
-    os.fsync(f)
-    os.close(f)
 
-    log('file({0}) truncated({1}) original({2})'.format(
-        g.maxfile, req['truncate'], n))
+    log('file(%d) truncated(%d) original(%d)', g.maxfile, req['truncate'], n)
     os._exit(0)
 
 
@@ -336,8 +338,7 @@ def replication_nextfile(src, buf):
     g.size = 0
 
     if g.fd:
-        os.fsync(g.fd)
-        os.close(g.fd)
+        commit()
         g.fd = None
 
     log('sent replication-request to(%s) file(%d) offset(%d)',
@@ -347,8 +348,7 @@ def replication_nextfile(src, buf):
 
 
 def replication_response(src, buf):
-    log(('received replication-response from({0}) size({1})').format(
-        src, len(buf)))
+    log('received replication-response from(%s) size(%d)', src, len(buf))
 
     try:
         assert(src == g.state.split('-')[1])
@@ -362,11 +362,10 @@ def replication_response(src, buf):
         assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
 
-        os.fsync(g.fd)
         g.size = os.fstat(g.fd).st_size
 
         scan(g.maxfile, g.offset, g.checksum)
-        g.db.commit()
+        commit()
 
         log('sent replication-request to(%s) file(%d) offset(%d)',
             src, g.maxfile, g.size)
@@ -390,6 +389,7 @@ def on_disconnect(src, exc, tb):
         log(tb)
 
     if src not in g.peers:
+        g.watch.pop(src, None)
         return
 
     del(g.peers[src])
@@ -414,6 +414,16 @@ def state(src, buf):
 
 
 def watch(src, buf):
+    filenum = struct.unpack('!Q', buf[0:8])[0]
+    offset = struct.unpack('!Q', buf[8:16])[0]
+
+    if (g.maxfile > filenum) or (g.maxfile == filenum and g.offset > offset):
+        return dict()
+
+    g.watch[src] = (filenum, offset)
+
+
+def updates(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
     key = buf[16:]
@@ -679,6 +689,13 @@ def get_header(filenum):
         return fd.read(hdrlen)[4:]
 
 
+def commit():
+    if g.fd:
+        os.fsync(g.fd)
+    os.fsync(g.dfd)
+    g.db.commit()
+
+
 def init(peers, opt):
     g.opt = opt
     g.db = sqlite3.connect(g.opt.index)
@@ -698,89 +715,55 @@ def init(peers, opt):
     files = map(int, os.listdir(g.opt.data))
     if not files:
         g.db.execute('delete from data')
-        g.db.commit()
+        commit()
         return
 
-    with open(os.path.join(g.opt.data, str(max(files))), 'rb') as fd:
-        fd.seek(0, 2)
-        size = fd.tell()
+    try:
+        g.db.execute('delete from data where file < ?', (min(files),))
+        g.minfile = min(files)
 
-    if 0 == size:
-        os.remove(os.path.join(g.opt.data, str(max(files))))
-        log('removed file(%d)', max(files))
-        os._exit(0)
+        row = g.db.execute('''select file, offset, length from data
+                              order by file desc, offset desc limit 1
+                           ''').fetchone()
+        if row:
+            g.maxfile = row[0]
+            g.offset = row[1] + row[2] + 20
+            with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
+                fd.seek(row[1] + row[2])
+                g.checksum = fd.read(20).encode('hex')
+                assert(40 == len(g.checksum))
+        else:
+            g.maxfile = min(files)
+            g.db.execute('delete from data')
 
-    g.db.execute('delete from data where file < ?', (min(files),))
-    g.db.execute('delete from data where file > ?', (max(files),))
-    g.db.execute('delete from data where file = ? and offset+length > ?',
-                 (max(files), size))
-    g.db.commit()
-
-    g.minfile = min(files)
-
-    row = g.db.execute('''select file, offset, length from data
-                          order by file desc, offset desc limit 1
-                       ''').fetchone()
-    if row:
-        g.maxfile = row[0]
-        g.offset = row[1] + row[2] + 20
-        with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
-            fd.seek(row[1] + row[2])
-            g.checksum = fd.read(20).encode('hex')
-    else:
-        g.maxfile = min(files)
-        g.db.execute('delete from data')
-        g.db.commit()
-
-        try:
             with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
                 hdrlen = struct.unpack('!Q', fd.read(8))[0]
                 hdr = fd.read(hdrlen)
                 g.checksum = fd.read(20).encode('hex')
                 g.offset = fd.tell()
                 assert(g.offset == hdrlen + 28)
-                g.db.commit()
-        except:
-            if g.minfile == g.maxfile:
-                os.remove(os.path.join(g.opt.data, str(g.minfile)))
-                log('removed file(%d)', g.minfile)
-                os._exit(0)
 
-    scan(g.maxfile, g.offset, g.checksum)
-    g.db.commit()
+        scan(g.maxfile, g.offset, g.checksum)
 
-    with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
-        fd.seek(0, 2)
-        g.size = fd.tell()
+        g.size = g.offset
 
-    quit = False
-    if g.size > g.offset:
+        row = g.db.execute('select min(file) from data').fetchone()
+        g.minfile = row[0] if row[0] is not None else g.maxfile
+
+        for n in range(min(files),g.minfile) + range(g.maxfile+1,max(files)+1):
+            os.remove(os.path.join(g.opt.data, str(n)))
+            log('removed file({0})'.format(n))
+
         f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
-        os.ftruncate(f, g.offset)
-        os.fsync(f)
-        log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, g.size)
+        n = os.fstat(f).st_size
+        if n > g.offset:
+            os.ftruncate(f, g.offset)
+            os.fsync(f)
+            log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, n)
         os.close(f)
-        quit = True
 
-    row = g.db.execute('select min(file) from data').fetchone()
-    remove_max = row[0] if row[0] is not None else g.maxfile
-
-    for n in range(g.minfile, remove_max):
-        os.remove(os.path.join(g.opt.data, str(n)))
-        log('removed file({0})'.format(n))
-        quit = True
-
-    g.minfile = remove_max
-
-    remove_min = g.maxfile + 1
-    while True:
-        try:
-            os.remove(os.path.join(g.opt.data, str(remove_min)))
-            log('removed file({0})'.format(remove_min))
-            remove_min += 1
-            quit = True
-        except:
-            break
-
-    if quit:
+        commit()
+    except:
+        g.db.execute('delete from data where file >= ?', (g.maxfile,))
+        commit()
         os._exit(0)

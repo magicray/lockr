@@ -50,16 +50,11 @@ class Client(cmd.Cmd):
         while True:
             try:
                 for result in self.cli.watch(key):
-                    print('marker : {0}'.format(result['marker']))
-                    if result['added']:
-                        for k, v in result['added'].iteritems():
-                            print('added {0} - {1}'.format(k, v))
-                    if result['updated']:
-                        for k, v in result['updated'].iteritems():
-                            print('updated {0} - {1}'.format(k, v))
-                    if result['deleted']:
-                        for k in result['deleted']:
-                            print('deleted {0}'.format(k))
+                    for k in sorted(result['added'].keys()):
+                        print('ADD {0} - {1}'.format(k, result['added'][k]))
+                    for k in sorted(result['updated'].keys()):
+                        print('MOD {0} - {1}'.format(k, result['updated'][k]))
+                    for k in sorted(result['deleted']):
+                        print('DEL {0}'.format(k))
             except:
-                traceback.print_exc()
                 pass

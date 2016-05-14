@@ -14,6 +14,9 @@ class Lockr(object):
         self.server = None
         self.timeout = timeout
 
+        self.watch_marker = (0, 0)
+        self.watch_keys = set()
+
     def request(self, req, buf=''):
         req_begin = time.time()
         while time.time() < (req_begin + self.timeout):
@@ -51,18 +54,16 @@ class Lockr(object):
         return json.loads(self.request('state'))
 
     def watch(self, prefix, timeout=15):
-        marker = (0, 0)
-        old_list = set()
-        sleep = 0
         while True:
-            buf = self.request('watch', ''.join([struct.pack('!Q', marker[0]),
-                                                 struct.pack('!Q', marker[1]),
-                                                 prefix]))
+            buf = self.request('updates', ''.join([
+                struct.pack('!Q', self.watch_marker[0]),
+                struct.pack('!Q', self.watch_marker[1]),
+                prefix]))
 
-            marker = (struct.unpack('!Q', buf[0:8])[0],
-                      struct.unpack('!Q', buf[8:16])[0])
+            self.watch_marker = (struct.unpack('!Q', buf[0:8])[0],
+                                 struct.unpack('!Q', buf[8:16])[0])
 
-            result = dict(marker=marker, added=dict(), updated=dict())
+            result = dict(added=dict(), updated=dict())
 
             i = 16
             modified = set()
@@ -76,7 +77,7 @@ class Lockr(object):
 
                 if value:
                     modified.add(key)
-                    if key in old_list:
+                    if key in self.watch_keys:
                         result['updated'][key] = value
                     else:
                         result['added'][key] = value
@@ -87,15 +88,15 @@ class Lockr(object):
 
             assert(i == len(buf))
 
-            result['deleted'] = old_list - modified - unmodified
-            old_list = modified.union(unmodified)
+            result['deleted'] = self.watch_keys - modified - unmodified
+            self.watch_keys = modified.union(unmodified)
 
             if result['added'] or result['updated'] or result['deleted']:
-                sleep = 0
                 yield result
-            else:
-                sleep = 1 if 0 == sleep else min(timeout, sleep*2)
-                time.sleep(sleep)
+
+            self.request('watch', ''.join([
+                struct.pack('!Q', self.watch_marker[0]),
+                struct.pack('!Q', self.watch_marker[1])]))
 
     def put(self, docs):
         items = list()

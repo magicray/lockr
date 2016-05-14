@@ -1,5 +1,6 @@
 import os
 import time
+import fcntl
 import signal
 import random
 import logging
@@ -33,6 +34,8 @@ if __name__ == '__main__':
                     opt.nodes.split(',')))
 
     if opt.port:
+        fcntl.flock(os.open('.', os.O_RDONLY), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
         os.close(0)
         os.close(1)
 
