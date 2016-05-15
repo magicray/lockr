@@ -95,10 +95,13 @@ class Lockr(object):
                 struct.pack('!Q', len(end)),
                 end]))
 
-        offset = (struct.unpack('!Q', buf[0:8])[0],
-                  struct.unpack('!Q', buf[8:16])[0])
+        if 0 != struct.unpack('!B', buf[0])[0]:
+            raise Exception(buf[1:])
 
-        i = 16
+        offset = (struct.unpack('!Q', buf[1:9])[0],
+                  struct.unpack('!Q', buf[9:17])[0])
+
+        i = 17
         result = dict()
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]

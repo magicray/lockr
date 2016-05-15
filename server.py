@@ -372,11 +372,17 @@ def replication_response(src, buf):
 
         return dict(msg='replication_request', buf=g.json())
     except:
-        # log(traceback.format_exc())
         os._exit(0)
 
 
 def on_message(src, msg, buf):
+    if type(src) is tuple:
+        try:
+            assert(msg in ('get', 'put', 'watch', 'state')), 'invalid command'
+            return globals()[msg](src, buf)
+        except:
+            return dict(buf=struct.pack('!B', 255) + traceback.format_exc())
+
     return globals()[msg](src, buf)
 
 
@@ -452,7 +458,9 @@ def get(src, buf):
 
     assert(i == len(buf))
 
-    result = [struct.pack('!Q', g.maxfile), struct.pack('!Q', g.offset)]
+    result = [struct.pack('!B', 0),
+              struct.pack('!Q', g.maxfile),
+              struct.pack('!Q', g.offset)]
 
     for begin_key, end_key in keys:
         full = g.db.execute('''select key, length from data
@@ -494,75 +502,73 @@ def put(src, buf):
     if g.offset > g.opt.max_size:
         return
 
-    try:
-        i = 0
-        keys = dict()
-        while i < len(buf):
-            key_len = struct.unpack('!Q', buf[i:i+8])[0]
-            key = buf[i+8:i+8+key_len]
+    i = 0
+    keys = dict()
+    while i < len(buf):
+        key_len = struct.unpack('!Q', buf[i:i+8])[0]
+        key = buf[i+8:i+8+key_len]
 
-            assert(key not in keys), 'duplicate key'
-            assert(key not in g.kv), 'txn in progress'
+        assert(key not in keys), 'duplicate key'
+        assert(key not in g.kv), 'txn in progress'
 
-            x = i + 8 + key_len
-            old_len = struct.unpack('!Q', buf[x:x+8])[0]
-            old = buf[x+8:x+8+old_len]
+        x = i + 8 + key_len
+        old_len = struct.unpack('!Q', buf[x:x+8])[0]
+        old = buf[x+8:x+8+old_len]
 
-            x = i + 8 + key_len + 8 + old_len
-            new_len = struct.unpack('!Q', buf[x:x+8])[0]
-            new = buf[x+8:x+8+new_len]
+        x = i + 8 + key_len + 8 + old_len
+        new_len = struct.unpack('!Q', buf[x:x+8])[0]
+        new = buf[x+8:x+8+new_len]
 
-            value = db_get(key)
+        value = db_get(key)
 
-            keys[key] = (new, value if old != value else None)
+        keys[key] = (new, value if old != value else None)
 
-            i += 24 + key_len + old_len + new_len
+        i += 24 + key_len + old_len + new_len
 
-        assert(i == len(buf)), 'invalid put request'
+    assert(i == len(buf)), 'invalid put request'
+    assert(len(keys)), 'empty request'
 
-        if not all([keys[k][1] is None for k in keys]):
-            buf_list = [struct.pack('!B', 1)]
-            for k, v in keys.iteritems():
-                if v[1] is not None:
-                    buf_list.append(struct.pack('!Q', len(k)))
-                    buf_list.append(k)
-                    buf_list.append(struct.pack('!Q', len(v[1])))
-                    buf_list.append(v[1])
+    if not all([keys[k][1] is None for k in keys]):
+        buf_list = [struct.pack('!B', 1)]
+        for k, v in keys.iteritems():
+            if v[1] is not None:
+                buf_list.append(struct.pack('!Q', len(k)))
+                buf_list.append(k)
+                buf_list.append(struct.pack('!Q', len(v[1])))
+                buf_list.append(v[1])
 
-            return dict(buf=''.join(buf_list))
+        return dict(buf=''.join(buf_list))
 
-        g.kv.update(keys)
+    g.kv.update(keys)
 
-        buf_list = list()
-        for key in keys:
-            buf_list.append(struct.pack('!Q', len(key)))
-            buf_list.append(key)
-            buf_list.append(struct.pack('!Q', len(keys[key][0])))
-            buf_list.append(keys[key][0])
+    buf_list = list()
+    for key in keys:
+        buf_list.append(struct.pack('!Q', len(key)))
+        buf_list.append(key)
+        buf_list.append(struct.pack('!Q', len(keys[key][0])))
+        buf_list.append(keys[key][0])
 
-        append(''.join(buf_list))
+    append(''.join(buf_list))
 
-        rows = g.db.execute('''select key from data
-                               where file < ? and length > 0
-                               order by file, offset limit ?
-                            ''', (g.maxfile, len(keys)*2)).fetchall()
+    rows = g.db.execute('''select key from data
+                           where file < ? and length > 0
+                           order by file, offset limit ?
+                        ''', (g.maxfile, len(keys)*2)).fetchall()
 
-        buf_list = list()
-        for r in filter(lambda r: bytes(r[0]) not in g.kv, rows)[0:len(keys)]:
-            key = bytes(r[0])
-            value = db_get(key)
+    buf_list = list()
+    for r in filter(lambda r: bytes(r[0]) not in g.kv, rows)[0:len(keys)]:
+        key = bytes(r[0])
+        value = db_get(key)
 
-            buf_list.append(struct.pack('!Q', len(key)))
-            buf_list.append(key)
-            buf_list.append(struct.pack('!Q', len(value)))
-            buf_list.append(value)
+        buf_list.append(struct.pack('!Q', len(key)))
+        buf_list.append(key)
+        buf_list.append(struct.pack('!Q', len(value)))
+        buf_list.append(value)
 
-        append(''.join(buf_list), True)
+    append(''.join(buf_list), True)
 
-        g.acks.append((g.size, src, set(keys)))
-        return get_replication_responses()
-    except:
-        return dict(buf=struct.pack('!B', 2) + traceback.format_exc())
+    g.acks.append((g.size, src, set(keys)))
+    return get_replication_responses()
 
 
 def append(buf, gc=False):
