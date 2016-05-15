@@ -435,6 +435,17 @@ def get(src, buf):
         begin = buf[i+8:i+8+begin_len]
         end_len = struct.unpack('!Q', buf[i+8+begin_len:i+16+begin_len])[0]
         end = buf[i+16+begin_len:i+16+begin_len+end_len]
+
+        if not begin:
+            begin = g.db.execute('select min(key) from data').fetchone()[0]
+        else:
+            begin = sqlite3.Binary(begin)
+
+        if not end:
+            end = g.db.execute('select max(key) from data').fetchone()[0]
+        else:
+            end = sqlite3.Binary(end)
+
         keys.append((begin, end))
 
         i += 16 + begin_len + end_len
@@ -446,7 +457,7 @@ def get(src, buf):
     for begin_key, end_key in keys:
         full = g.db.execute('''select key, length from data
                                where key between ? and ?''',
-            (sqlite3.Binary(begin_key), sqlite3.Binary(end_key))).fetchall()
+            (begin_key, end_key)).fetchall()
 
         if 0 == filenum and 0 == offset:
             new = full
@@ -456,8 +467,7 @@ def get(src, buf):
                                   and ((file = ? and offset > ?) or
                                        (file > ?))
                                   and gc = 0''',
-                (sqlite3.Binary(begin_key), sqlite3.Binary(end_key), filenum,
-                 offset, filenum)).fetchall()
+                (begin_key, end_key, filenum, offset, filenum)).fetchall()
 
         new = dict([(bytes(r[0]), r[1]) for r in new if '' != r[0]])
 
@@ -465,7 +475,7 @@ def get(src, buf):
             result.append(struct.pack('!Q', len(key)))
             result.append(key)
             result.append(struct.pack('!Q', length))
-            if 0 == flags:
+            if flags:
                 result.append(db_get(key))
 
         for k, length in full:
@@ -608,9 +618,9 @@ def header_put(header, filenum, offset, checksum):
     g.offset = offset
     g.checksum = checksum.encode('hex')
 
-    g.db.execute("delete from data where key=?", (sqlite3.Binary(''),))
-    g.db.execute("insert into data values(?, ?, ?, ?, ?)",
-                 (sqlite3.Binary(''), filenum, 8, len(header)+4, False))
+    g.db.execute('delete from data where key is null')
+    g.db.execute('insert into data values(null, ?, ?, ?, ?)',
+                 (filenum, 8, len(header)+4, False))
 
 
 def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,

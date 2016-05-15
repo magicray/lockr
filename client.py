@@ -85,11 +85,11 @@ class Lockr(object):
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
-    def get(self, begin, end, key_only=True, offset=(0, 0)):
+    def get(self, begin, end, flags=False, offset=(0, 0)):
         buf = self.request('get', ''.join([
                 struct.pack('!Q', offset[0]),
                 struct.pack('!Q', offset[1]),
-                struct.pack('!I', 1 if key_only else 0),
+                struct.pack('!I', flags),
                 struct.pack('!Q', len(begin)),
                 begin,
                 struct.pack('!Q', len(end)),
@@ -105,12 +105,12 @@ class Lockr(object):
             key = buf[i+8:i+8+key_len]
             value_len = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
 
-            if key_only:
-                result[key] = value_len
-                i += 16 + key_len
-            else:
+            if flags:
                 result[key] = buf[i+16+key_len:i+16+key_len+value_len]
                 i += 16 + key_len + value_len
+            else:
+                result[key] = value_len
+                i += 16 + key_len
 
         assert(i == len(buf))
 
@@ -118,22 +118,17 @@ class Lockr(object):
 
     def watch(self, begin, end):
         while True:
-            self.offset, ret = self.get(begin, end, False, self.offset)
+            self.offset, ret = self.get(begin, end, True, self.offset)
             result = dict(added=dict(), updated=dict())
-            modified = set()
-            unmodified = set()
             for key, value in ret.iteritems():
                 if value:
-                    modified.add(key)
                     if key in self.keys:
                         result['updated'][key] = value
                     else:
                         result['added'][key] = value
-                else:
-                    unmodified.add(key)
 
-            result['deleted'] = self.keys - modified - unmodified
-            self.keys = modified.union(unmodified)
+            result['deleted'] = self.keys - set(ret)
+            self.keys = set(ret)
 
             if result['added'] or result['updated'] or result['deleted']:
                 yield result

@@ -22,8 +22,8 @@ class Client(cmd.Cmd):
     def do_state(self, line):
         print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
-    def get(self, key_only, line):
-        begin, end = struct.pack('!B', 0), struct.pack('!B', 255)
+    def parse_line(self, line):
+        begin, end = '', ''
         if line:
             l = shlex.split(line)
             if 1 == len(l):
@@ -31,16 +31,19 @@ class Client(cmd.Cmd):
                 end = begin + struct.pack('!B', 255)
             else:
                 begin, end = l[0], l[1]
+        return begin, end
 
-        offset, result = self.cli.get(begin, end, key_only)
+    def get(self, line, with_values):
+        begin, end = self.parse_line(line)
+        offset, result = self.cli.get(begin, end, with_values)
         for k in sorted(result.keys()):
             print('{0} - {1}'.format(k, result[k]))
 
     def do_keys(self, line):
-        self.get(True, line)
+        self.get(line, False)
 
     def do_get(self, line):
-        self.get(False, line)
+        self.get(line, True)
 
     def do_put(self, line):
         cmd = shlex.split(line)
@@ -57,14 +60,7 @@ class Client(cmd.Cmd):
             print(value)
 
     def do_watch(self, line):
-        begin, end = struct.pack('!B', 0), struct.pack('!B', 255)
-        if line:
-            l = shlex.split(line)
-            if 1 == len(l):
-                begin = l[0]
-                end = begin + struct.pack('!B', 255)
-            else:
-                begin, end = l[0], l[1]
+        begin, end = self.parse_line(line)
         while True:
             try:
                 for result in self.cli.watch(begin, end):
