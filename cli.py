@@ -3,7 +3,6 @@ import shlex
 import client
 import pprint
 import struct
-import traceback
 
 
 class Client(cmd.Cmd):

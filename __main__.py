@@ -13,10 +13,12 @@ if __name__ == '__main__':
                       help='port number')
     parser.add_option('--nodes', dest='nodes', type='string',
                       help='comma separated list of server:port')
+    parser.add_option('--cert', dest='cert', type='string',
+                      help='ssl certificate location', default='ssl.crt')
     parser.add_option('--data', dest='data', type='string',
                       help='data directory', default='data')
     parser.add_option('--index', dest='index', type='string',
-                      help='index file path', default='snapshot.db')
+                      help='index file path', default='index.db')
     parser.add_option('--maxsize', dest='max_size', type='int',
                       help='max file size', default='256')
     parser.add_option('--replsize', dest='repl_size', type='int',
@@ -59,7 +61,7 @@ if __name__ == '__main__':
                 logging.critical('')
                 server.init(nodes, opt)
                 signal.alarm(random.randint(opt.timeout, 2*opt.timeout))
-                msgio.loop(server, opt.port, nodes)
+                msgio.loop(server, opt.port, nodes, 'key', opt.cert)
                 os._exit(0)
 
             os.wait()

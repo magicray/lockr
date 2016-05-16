@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
 
 
-def loop(module, port, peers):
+def loop(module, port, peers, key, cert):
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setblocking(0)
@@ -22,10 +22,7 @@ def loop(module, port, peers):
     except:
         port = (s.getsockname()[0], port)
 
-    cert = os.getenv('MSGIO_CERT', 'cert.pem')
-    node = os.getenv('MSGIO_NODE', '{0}:{1}'.format(*port))
-    key = os.getenv('MSGIO_KEY', '')
-    os.environ['MSGIO_NODE'] = node
+    node = '{0}:{1}'.format(*port)
 
     clients = set(filter(lambda x: x > port,
                          map(lambda x: (socket.gethostbyname(x[0]), x[1]),
@@ -37,6 +34,7 @@ def loop(module, port, peers):
     listener_sock.bind(port)
     listener_sock.listen(5)
     logger.critical('listening on %s', port)
+    module.on_listen(node)
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)

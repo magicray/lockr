@@ -30,6 +30,7 @@ class g:
     size = 0
     chksum = None
     checksum = ''
+    node = None
     start_time = time.time()
 
     @classmethod
@@ -41,7 +42,7 @@ class g:
         return json.dumps(dict(
             uptime=int(time.time()-g.start_time),
             state=g.state,
-            node=os.getenv('MSGIO_NODE'),
+            node=g.node,
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
@@ -88,7 +89,7 @@ def vote(src, buf):
         g.state = 'following-' + src
         reason = 'leader identified'
     else:
-        leader = (os.getenv('MSGIO_NODE'), g.__dict__, 'self')
+        leader = (g.node, g.__dict__, 'self')
         count = 0
         for k, v in g.peers.iteritems():
             if v['state'].startswith('following-'):
@@ -112,7 +113,7 @@ def vote(src, buf):
             if k > leader[0]:
                 leader = (k, p, '{0} > {1}'.format(k, leader[0]))
 
-        if (os.getenv('MSGIO_NODE') != leader[0]) and (count >= g.quorum):
+        if (g.node != leader[0]) and (count >= g.quorum):
             g.state = 'following-' + leader[0]
             reason = leader[2]
 
@@ -189,7 +190,7 @@ def replication_request(src, buf):
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {os.getenv('MSGIO_NODE'): g.clock}
+            vclk = {g.node: g.clock}
             for k in filter(lambda k: g.peers[k], g.peers):
                 vclk[k] = g.peers[k]['clock']
 
@@ -384,6 +385,10 @@ def on_message(src, msg, buf):
             return dict(buf=struct.pack('!B', 255) + traceback.format_exc())
 
     return globals()[msg](src, buf)
+
+
+def on_listen(node):
+    g.node = node
 
 
 def on_connect(src):
