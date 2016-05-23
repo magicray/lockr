@@ -22,23 +22,20 @@ class g:
     peers = dict()
     followers = dict()
     quorum = 0
-    clock = 0
     state = ''
     minfile = 0
     maxfile = 0
     offset = 0
+    size_prev = 0
     size = 0
     chksum = None
     checksum = ''
+    counter = 0
     node = None
     start_time = time.time()
 
     @classmethod
     def json(cls):
-        t = time.time()
-        x = time.strftime('%y%m%d.%H%M%S', time.gmtime(t))
-        g.clock = x + '.' + str(int((t-int(t))*10**6))
-
         return json.dumps(dict(
             uptime=int(time.time()-g.start_time),
             state=g.state,
@@ -46,15 +43,16 @@ class g:
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
+            size_prev=g.size_prev,
             size=g.size,
-            clock=g.clock,
-            header=json.loads(get_header(g.maxfile)),
+            counter=g.counter,
             pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
-                clock=v['clock'],
                 offset=v['offset'],
+                size=v['size'],
+                size_prev=v['size_prev'],
                 state=v['state'])) for k, v in g.peers.iteritems() if v])))
 
 
@@ -64,15 +62,12 @@ def vote(src, buf):
     if g.state:
         return
 
-    if g.maxfile > 0 and g.peers[src]['maxfile'] == g.maxfile:
-        peer_header = g.peers[src]['header']
-        my_header = json.loads(get_header(g.maxfile))
-
-        for key in set(peer_header).intersection(set(my_header)):
-            if peer_header[key] > my_header[key]:
-                os.remove(os.path.join(g.opt.data, str(g.maxfile)))
-                log('REMOVED file(%d) as vclock(%s) is ahead', g.maxfile, src)
-                os._exit(0)
+    if g.peers[src]['maxfile'] == g.maxfile:
+        if g.peers[src]['size_prev'] > g.size_prev:
+            os.remove(os.path.join(g.opt.data, str(g.maxfile)))
+            log('REMOVED file(%d) as peer(%s) prev size(%d > %d)',
+                g.maxfile, src, g.peers[src]['size_prev'], g.size_prev)
+            os._exit(0)
 
     if g.maxfile > 0 and g.peers[src]['minfile'] > g.maxfile:
         log('src(%s) minfile(%d) > maxfile(%d)',
@@ -92,9 +87,6 @@ def vote(src, buf):
         leader = (g.node, g.__dict__, 'self')
         count = 0
         for k, v in g.peers.iteritems():
-            if v['state'].startswith('following-'):
-                continue
-
             count += 1
             l, p = leader[1], v
 
@@ -187,21 +179,23 @@ def replication_request(src, buf):
             log('quorum({0} >= {1}) in sync with old session'.format(
                 count, g.quorum))
 
+            g.size_prev = g.offset
             g.maxfile += 1
             g.offset = 0
 
-            vclk = {g.node: g.clock}
-            for k in filter(lambda k: g.peers[k], g.peers):
-                vclk[k] = g.peers[k]['clock']
+            k = g.db.execute('''select key from data
+                                where file < ? and length > 0
+                                order by file, offset limit 1
+                             ''', (g.maxfile,)).fetchone()
+            k, v = (bytes(k[0]), db_get(bytes(k[0]))) if k else ('', 'init')
 
-            header = json.dumps(vclk, sort_keys=True)
-
-            append(header)
+            append(''.join([struct.pack('!Q', len(k)), k,
+                            struct.pack('!Q', len(v)), v]))
             commit()
             g.state = 'new-sync'
-            log('new leader TERM({0}) header{1}'.format(g.maxfile, header))
+            log('new TERM({0}) initiated'.format(g.maxfile))
             if 0 == int(time.time()) % 5:
-                log('exiting to force test vclock conflict')
+                log('exiting to force test')
                 os._exit(0)
 
             return get_replication_responses()
@@ -238,9 +232,6 @@ def replication_request(src, buf):
             if g.maxfile > f or (g.maxfile == f and g.offset > o):
                 g.watch.pop(k)
                 acks.append(dict(dst=k))
-    elif committed_offset == g.offset and g.offset > g.opt.max_size:
-        log('max file size reached(%d > %d)', g.offset, g.opt.max_size)
-        os._exit(0)
 
     return acks + get_replication_responses()
 
@@ -251,8 +242,7 @@ def get_replication_responses():
         req = g.followers[src]
 
         if 0 == req['maxfile']:
-            f = map(int, filter(lambda x: x != 'reboot',
-                                os.listdir(g.opt.data)))
+            f = map(int, os.listdir(g.opt.data))
             if f:
                 log('sent replication-nextfile to(%s) file(%d)', src, min(f))
 
@@ -262,20 +252,6 @@ def get_replication_responses():
 
         if not os.path.isfile(os.path.join(g.opt.data, str(req['maxfile']))):
             continue
-
-        hdr = get_header(req['maxfile'])
-        reqhdr = json.dumps(req['header'], sort_keys=True)
-        if req['size'] > 0 and hdr != reqhdr:
-            log('header mismatch src(%s) file(%d)', src, req['maxfile'])
-            log('local header %s', hdr)
-            log('peer header %s', reqhdr)
-
-            log('sent replication-truncate to(%s) file(%d) offset(%d) '
-                'truncate(0)', src, req['maxfile'], req['size'])
-
-            g.followers[src] = None
-            msgs.append(dict(dst=src, msg='replication_truncate',
-                             buf=json.dumps(dict(truncate=0))))
 
         with open(os.path.join(g.opt.data, str(req['maxfile']))) as fd:
             fd.seek(0, 2)
@@ -334,6 +310,7 @@ def replication_nextfile(src, buf):
     log('received replication-nextfile from(%s) filenum(%d)',
         src, req['filenum'])
 
+    g.size_prev = g.size
     g.maxfile = req['filenum']
     g.offset = 0
     g.size = 0
@@ -377,6 +354,8 @@ def replication_response(src, buf):
 
 
 def on_message(src, msg, buf):
+    g.counter += 1
+
     if type(src) is tuple:
         try:
             assert(msg in ('get', 'put', 'watch', 'state')), 'invalid command'
@@ -403,7 +382,7 @@ def on_disconnect(src, exc, tb):
         g.watch.pop(src, None)
         return
 
-    del(g.peers[src])
+    g.peers.pop(src)
 
     if 'following-' + src == g.state:
         log('exiting as LEADER({0}) disconnected'.format(src))
@@ -505,7 +484,8 @@ def get(src, buf):
 
 def put(src, buf):
     if g.offset > g.opt.max_size:
-        return
+        log('max file size reached(%d > %d)', g.offset, g.opt.max_size)
+        os._exit(0)
 
     i = 0
     keys = dict()
@@ -624,19 +604,7 @@ def db_put(txn, filenum, offset, checksum, flags):
                          (sqlite3.Binary(k), filenum, v[0], len(v[1]), flags))
 
 
-def header_put(header, filenum, offset, checksum):
-    g.maxfile = filenum
-    g.offset = offset
-    g.checksum = checksum.encode('hex')
-
-    g.db.execute('delete from data where key is null')
-    g.db.execute('insert into data values(null, ?, ?, ?, ?)',
-                 (filenum, 8, len(header)+4, False))
-
-
-def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
-         cb_txn=db_put, cb_hdr=header_put):
-
+def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64, cb=db_put):
     checksum = checksum.decode('hex')
     while True:
         try:
@@ -660,28 +628,24 @@ def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
                     assert(y == chksum.digest())
                     checksum = y
 
+                    i = 4
                     txn = dict()
-                    if offset > 0:
-                        i = 4
-                        while i < len(x):
-                            key_len = struct.unpack('!Q', x[i:i+8])[0]
-                            key = x[i+8:i+8+key_len]
+                    while i < len(x):
+                        key_len = struct.unpack('!Q', x[i:i+8])[0]
+                        key = x[i+8:i+8+key_len]
 
-                            value_len = struct.unpack(
-                                '!Q', x[i+8+key_len:i+16+key_len])[0]
-                            value = x[i+16+key_len:i+16+key_len+value_len]
+                        value_len = struct.unpack(
+                            '!Q', x[i+8+key_len:i+16+key_len])[0]
+                        value = x[i+16+key_len:i+16+key_len+value_len]
 
-                            txn[key] = (offset+8+i+16+key_len, value)
-                            i += 16 + key_len + value_len
+                        txn[key] = (offset+8+i+16+key_len, value)
+                        i += 16 + key_len + value_len
 
                     offset += len(x) + 28
                     assert(offset <= total_size)
                     assert(offset == fd.tell())
 
-                    if txn:
-                        cb_txn(txn, filenum, offset, checksum, flags)
-                    else:
-                        cb_hdr(x[4:], filenum, offset, checksum)
+                    cb(txn, filenum, offset, checksum, flags)
 
                     log('scanned file(%d) offset(%d)', filenum, offset)
 
@@ -691,20 +655,13 @@ def scan(filenum, offset, checksum, e_filenum=2**64-1, e_offset=2**64-1,
             return
 
 
-def get_header(filenum):
-    if not os.path.isfile(os.path.join(g.opt.data, str(filenum))):
-        return json.dumps(dict())
-
-    with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
-        hdrlen = struct.unpack('!Q', fd.read(8))[0]
-        return fd.read(hdrlen)[4:]
-
-
 def commit():
+    t = time.time()
     if g.fd:
         os.fsync(g.fd)
-    os.fsync(g.dfd)
     g.db.commit()
+    os.fsync(g.dfd)
+    log('committed in msec(%03f)', (time.time() - t)*1000)
 
 
 def init(peers, opt):
@@ -774,6 +731,10 @@ def init(peers, opt):
         os.close(f)
 
         commit()
+
+        if g.minfile < g.maxfile:
+            g.size_prev = os.path.getsize(
+                os.path.join(g.opt.data, str(g.maxfile-1)))
     except:
         g.db.execute('delete from data where file >= ?', (g.maxfile,))
         commit()

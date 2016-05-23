@@ -71,3 +71,12 @@ class Client(cmd.Cmd):
                         print('DEL {0}'.format(k))
             except:
                 pass
+
+    def do_test(self, line):
+        while True:
+            for i in range(10000):
+                key = '%05d' % (i)
+                offset, result = self.cli.get(key, key, True)
+                prev = result.get(key, '')
+                new = str(int(prev) + 1) if prev else '1'
+                self.cli.put({key : (prev, new)})

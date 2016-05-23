@@ -278,6 +278,9 @@ class Client(object):
         self.sock = ssl.wrap_socket(sock)
         self.sock.connect(server)
 
+    def close(self):
+        self.sock.close()
+
     def send(self, req, buf=''):
         self.sock.sendall(''.join([
             struct.pack('!Q', len(req) + len(buf)),

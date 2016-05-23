@@ -35,6 +35,8 @@ class Lockr(object):
                                 logger.debug('connected to leader %s',
                                              str(srv))
                                 break
+
+                            s.close()
                         except:
                             logger.debug('connection to %s failed in %.03f '
                                          'msec', srv, (time.time()-t)*1000)
@@ -48,7 +50,7 @@ class Lockr(object):
             except:
                 self.server = None
 
-        raise Exception('timed out')
+        raise Exception('timed out {0}'.format(time.time()-req_begin))
 
     def state(self):
         return json.loads(self.request('state'))
