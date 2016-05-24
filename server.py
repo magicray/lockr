@@ -30,7 +30,6 @@ class g:
     size = 0
     chksum = None
     checksum = ''
-    counter = 0
     node = None
     start_time = time.time()
 
@@ -45,7 +44,6 @@ class g:
             offset=g.offset,
             size_prev=g.size_prev,
             size=g.size,
-            counter=g.counter,
             pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
                 minfile=v['minfile'],
@@ -144,61 +142,47 @@ def replication_request(src, buf):
 
     g.followers[src] = req
 
-    if not g.state and len(g.followers) == g.quorum:
+    if not g.state and len(g.followers) >= g.quorum:
         g.state = 'old-sync'
-        log('assuming LEADERSHIP as quorum reached({0})'.format(g.quorum))
+        log('state(OLD-SYNC) followers(%d)', len(g.followers))
 
-    if 'new-sync' == g.state:
-        in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
-                         filter(lambda k: g.offset == g.peers[k]['offset'],
-                                g.peers))
+    in_sync = filter(lambda k: g.maxfile == g.followers[k]['maxfile'],
+                     filter(lambda k: g.offset == g.followers[k]['offset'],
+                            filter(lambda k: g.followers[k], g.followers)))
 
-        if len(in_sync) >= g.quorum:
-            g.state = 'leader'
-            log('WRITE enabled in msec(%03f) quorum(%d >= %d)',
-                (time.time()-g.start_time)*1000, len(in_sync), g.quorum)
+    if 'new-sync' == g.state and len(in_sync) >= g.quorum:
+        g.state = 'leader'
+        log('state(LEADER) enabled in msec(%03f) in_sync(%d)',
+            (time.time()-g.start_time)*1000, len(in_sync))
 
-            msgs = list()
-            for f in set(g.peers) - set(g.followers):
-                log('sent leader-conflict to non-follower(%s)', f)
-                msgs.append(dict(dst=f, msg='leader_conflict'))
-            return msgs + get_replication_responses()
+        msgs = list()
+        for f in set(g.peers) - set(g.followers):
+            log('sent leader-conflict to non-follower(%s)', f)
+            msgs.append(dict(dst=f, msg='leader_conflict'))
+        return msgs + get_replication_responses()
 
-    if 'old-sync' == g.state:
-        count = 0
-        for src in filter(lambda k: g.followers[k], g.followers.keys()):
-            if g.maxfile != g.followers[src]['maxfile']:
-                continue
+    if 'old-sync' == g.state and len(in_sync) >= g.quorum:
+        g.size_prev = g.offset
+        g.maxfile += 1
+        g.offset = 0
 
-            if g.offset != g.followers[src]['offset']:
-                continue
+        k = g.db.execute('''select key from data
+                            where file < ? and length > 0
+                            order by file, offset limit 1
+                         ''', (g.maxfile,)).fetchone()
+        k, v = (bytes(k[0]), db_get(bytes(k[0]))) if k else ('', 'init')
 
-            count += 1
+        append(''.join([struct.pack('!Q', len(k)), k,
+                        struct.pack('!Q', len(v)), v]))
+        scan(g.maxfile, g.offset, g.checksum)
+        commit()
+        g.state = 'new-sync'
+        log('state(NEW-SYNC) file(%d) in_sync(%d)', g.maxfile-1, len(in_sync))
+        if 0 == int(time.time()) % 5:
+            log('exiting to force test')
+            os._exit(0)
 
-        if count >= g.quorum:
-            log('quorum({0} >= {1}) in sync with old session'.format(
-                count, g.quorum))
-
-            g.size_prev = g.offset
-            g.maxfile += 1
-            g.offset = 0
-
-            k = g.db.execute('''select key from data
-                                where file < ? and length > 0
-                                order by file, offset limit 1
-                             ''', (g.maxfile,)).fetchone()
-            k, v = (bytes(k[0]), db_get(bytes(k[0]))) if k else ('', 'init')
-
-            append(''.join([struct.pack('!Q', len(k)), k,
-                            struct.pack('!Q', len(v)), v]))
-            commit()
-            g.state = 'new-sync'
-            log('new TERM({0}) initiated'.format(g.maxfile))
-            if 0 == int(time.time()) % 5:
-                log('exiting to force test')
-                os._exit(0)
-
-            return get_replication_responses()
+        return get_replication_responses()
 
     acks = list()
     committed_offset = 0
@@ -354,8 +338,6 @@ def replication_response(src, buf):
 
 
 def on_message(src, msg, buf):
-    g.counter += 1
-
     if type(src) is tuple:
         try:
             assert(msg in ('get', 'put', 'watch', 'state')), 'invalid command'

@@ -24,7 +24,7 @@ if __name__ == '__main__':
     parser.add_option('--replsize', dest='repl_size', type='int',
                       help='replication chunk size', default=10*2**20)
     parser.add_option('--timeout', dest='timeout', type='int',
-                      help='timeout in seconds', default='20')
+                      help='timeout in seconds', default='2400')
     parser.add_option('--logfile', dest='logfile', type='str',
                       help='logfile name')
 
