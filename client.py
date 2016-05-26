@@ -28,22 +28,22 @@ class Lockr(object):
                             s = msgio.Client(srv)
                             s.send('state')
                             stats = json.loads(s.recv())
-                            logger.debug('connection to %s succeeded in %.03f '
-                                         'msec', srv, (time.time()-t)*1000)
+                            logger.debug('connected to(%s) msec(%d)',
+                                         srv, (time.time()-t)*1000)
                             if 'leader' == stats['state']:
                                 self.server = s
-                                logger.debug('connected to leader %s',
+                                logger.debug('connected to leader(%s)',
                                              str(srv))
                                 break
 
                             s.close()
                         except:
-                            logger.debug('connection to %s failed in %.03f '
-                                         'msec', srv, (time.time()-t)*1000)
+                            logger.debug('connection to(%s) failed msec(%d)',
+                                         srv, (time.time()-t)*1000)
 
                 self.server.send(req, buf)
                 result = self.server.recv()
-                logger.critical('received response(%s) from %s in %0.3f msec',
+                logger.critical('received response(%s) from%s msec(%d)',
                                 req, self.server.server,
                                 (time.time() - req_begin)*1000)
                 return result
@@ -89,13 +89,13 @@ class Lockr(object):
 
     def get(self, begin, end, flags=False, offset=(0, 0)):
         buf = self.request('get', ''.join([
-                struct.pack('!Q', offset[0]),
-                struct.pack('!Q', offset[1]),
-                struct.pack('!I', flags),
-                struct.pack('!Q', len(begin)),
-                begin,
-                struct.pack('!Q', len(end)),
-                end]))
+            struct.pack('!Q', offset[0]),
+            struct.pack('!Q', offset[1]),
+            struct.pack('!I', flags),
+            struct.pack('!Q', len(begin)),
+            begin,
+            struct.pack('!Q', len(end)),
+            end]))
 
         if 0 != struct.unpack('!B', buf[0])[0]:
             raise Exception(buf[1:])

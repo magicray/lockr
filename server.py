@@ -13,7 +13,6 @@ from logging import critical as log
 
 class g:
     opt = None
-    dfd = None
     fd = None
     db = None
     kv = set()
@@ -31,6 +30,7 @@ class g:
     chksum = None
     checksum = ''
     node = None
+    last_db_commit = 0
     start_time = time.time()
 
     @classmethod
@@ -144,7 +144,8 @@ def replication_request(src, buf):
 
     if not g.state and len(g.followers) >= g.quorum:
         g.state = 'old-sync'
-        log('state(OLD-SYNC) followers(%d)', len(g.followers))
+        log('state(OLD-SYNC) file(%d) offset(%d) followers(%d)',
+            g.maxfile, g.offset, len(g.followers))
 
     in_sync = filter(lambda k: g.maxfile == g.followers[k]['maxfile'],
                      filter(lambda k: g.offset == g.followers[k]['offset'],
@@ -152,8 +153,8 @@ def replication_request(src, buf):
 
     if 'new-sync' == g.state and len(in_sync) >= g.quorum:
         g.state = 'leader'
-        log('state(LEADER) enabled in msec(%03f) in_sync(%d)',
-            (time.time()-g.start_time)*1000, len(in_sync))
+        log('state(LEADER) msec(%d) file(%d) offset(%d) in_sync(%d)',
+            (time.time()-g.start_time)*1000, g.maxfile, g.offset, len(in_sync))
 
         msgs = list()
         for f in set(g.peers) - set(g.followers):
@@ -175,9 +176,9 @@ def replication_request(src, buf):
         append(''.join([struct.pack('!Q', len(k)), k,
                         struct.pack('!Q', len(v)), v]))
         scan(g.maxfile, g.offset, g.checksum)
-        commit()
         g.state = 'new-sync'
-        log('state(NEW-SYNC) file(%d) in_sync(%d)', g.maxfile-1, len(in_sync))
+        log('state(NEW-SYNC) file(%d) offset(%d) in_sync(%d)',
+            g.maxfile-1, g.size_prev, len(in_sync))
         if 0 == int(time.time()) % 5:
             log('exiting to force test')
             os._exit(0)
@@ -210,7 +211,6 @@ def replication_request(src, buf):
 
     if acks:
         scan(g.maxfile, g.offset, g.checksum, g.maxfile, committed_offset)
-        commit()
         for k in g.watch.keys():
             f, o = g.watch[k]
             if g.maxfile > f or (g.maxfile == f and g.offset > o):
@@ -300,7 +300,7 @@ def replication_nextfile(src, buf):
     g.size = 0
 
     if g.fd:
-        commit()
+        os.close(g.fd)
         g.fd = None
 
     log('sent replication-request to(%s) file(%d) offset(%d)',
@@ -320,6 +320,9 @@ def replication_response(src, buf):
             g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
                            os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                            0644)
+            fd = os.open(g.opt.data, os.O_RDONLY)
+            os.fsync(fd)
+            os.close(fd)
 
         assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
@@ -327,7 +330,6 @@ def replication_response(src, buf):
         g.size = os.fstat(g.fd).st_size
 
         scan(g.maxfile, g.offset, g.checksum)
-        commit()
 
         log('sent replication-request to(%s) file(%d) offset(%d)',
             src, g.maxfile, g.size)
@@ -430,8 +432,8 @@ def get(src, buf):
 
     for begin_key, end_key in keys:
         full = g.db.execute('''select key, length from data
-                               where key between ? and ?''',
-            (begin_key, end_key)).fetchall()
+                               where key between ? and ?
+                            ''', (begin_key, end_key)).fetchall()
 
         if 0 == filenum and 0 == offset:
             new = full
@@ -440,8 +442,9 @@ def get(src, buf):
                                   where key between ? and ?
                                   and ((file = ? and offset > ?) or
                                        (file > ?))
-                                  and gc = 0''',
-                (begin_key, end_key, filenum, offset, filenum)).fetchall()
+                                  and gc = 0
+                               ''', (begin_key, end_key, filenum, offset,
+                                     filenum)).fetchall()
 
         new = dict([(bytes(r[0]), r[1]) for r in new if '' != r[0]])
 
@@ -585,14 +588,25 @@ def db_put(txn, filenum, offset, checksum, flags):
             g.db.execute('insert into data values(?, ?, ?, ?, ?)',
                          (sqlite3.Binary(k), filenum, v[0], len(v[1]), flags))
 
+    if time.time() > g.last_db_commit + 1:
+        t = time.time()
+        g.db.commit()
+        log('db commit in msec(%d)', (time.time()-t)*1000)
+        g.last_db_commit = time.time()
 
-def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64, cb=db_put):
+
+def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64,
+         cb=db_put):
     checksum = checksum.decode('hex')
     while True:
         try:
             assert(filenum <= e_filenum)
 
             with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+                t = time.time()
+                os.fsync(fd.fileno())
+                log('fsync(%d) in msec(%d)', filenum, (time.time()-t)*1000)
+
                 fd.seek(0, 2)
                 total_size = fd.tell()
                 fd.seek(offset)
@@ -629,21 +643,12 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64, cb=db_put):
 
                     cb(txn, filenum, offset, checksum, flags)
 
-                    log('scanned file(%d) offset(%d)', filenum, offset)
+                    # log('scanned file(%d) offset(%d)', filenum, offset)
 
             filenum += 1
             offset = 0
         except:
             return
-
-
-def commit():
-    t = time.time()
-    if g.fd:
-        os.fsync(g.fd)
-    g.db.commit()
-    os.fsync(g.dfd)
-    log('committed in msec(%03f)', (time.time() - t)*1000)
 
 
 def init(peers, opt):
@@ -659,13 +664,13 @@ def init(peers, opt):
     if not os.path.isdir(g.opt.data):
         os.mkdir(g.opt.data)
 
-    g.dfd = os.open(g.opt.data, os.O_RDONLY)
-    fcntl.flock(g.dfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    dfd = os.open(g.opt.data, os.O_RDONLY)
+    fcntl.flock(dfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     files = map(int, os.listdir(g.opt.data))
     if not files:
         g.db.execute('delete from data')
-        commit()
+        g.db.commit()
         return
 
     try:
@@ -688,7 +693,7 @@ def init(peers, opt):
 
             with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
                 hdrlen = struct.unpack('!Q', fd.read(8))[0]
-                hdr = fd.read(hdrlen)
+                fd.read(hdrlen)
                 g.checksum = fd.read(20).encode('hex')
                 g.offset = fd.tell()
                 assert(g.offset == hdrlen + 28)
@@ -700,7 +705,7 @@ def init(peers, opt):
         row = g.db.execute('select min(file) from data').fetchone()
         g.minfile = row[0] if row[0] is not None else g.maxfile
 
-        for n in range(min(files),g.minfile) + range(g.maxfile+1,max(files)+1):
+        for n in range(min(files), g.minfile)+range(g.maxfile+1, max(files)+1):
             os.remove(os.path.join(g.opt.data, str(n)))
             log('removed file({0})'.format(n))
 
@@ -712,12 +717,14 @@ def init(peers, opt):
             log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, n)
         os.close(f)
 
-        commit()
+        os.fsync(dfd)
+        g.db.commit()
 
         if g.minfile < g.maxfile:
             g.size_prev = os.path.getsize(
                 os.path.join(g.opt.data, str(g.maxfile-1)))
     except:
         g.db.execute('delete from data where file >= ?', (g.maxfile,))
-        commit()
+        os.fsync(dfd)
+        g.db.commit()
         os._exit(0)

@@ -79,4 +79,4 @@ class Client(cmd.Cmd):
                 offset, result = self.cli.get(key, key, True)
                 prev = result.get(key, '')
                 new = str(int(prev) + 1) if prev else '1'
-                self.cli.put({key : (prev, new)})
+                self.cli.put({key: (prev, new)})
