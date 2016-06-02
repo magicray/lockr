@@ -60,8 +60,7 @@ class Lockr(object):
         for k, v in docs.iteritems():
             items.append(struct.pack('!Q', len(k)))
             items.append(k)
-            items.append(struct.pack('!Q', len(v[0])))
-            items.append(v[0])
+            items.append(struct.pack('!Q', v[0]))
             items.append(struct.pack('!Q', len(v[1])))
             items.append(v[1])
 
@@ -69,7 +68,6 @@ class Lockr(object):
         if 0 == struct.unpack('!B', buf[0])[0]:
             filenum = struct.unpack('!Q', buf[1:9])[0]
             offset = struct.unpack('!Q', buf[9:17])[0]
-
             return 0, (filenum, offset)
         elif 1 == struct.unpack('!B', buf[0])[0]:
             kv = dict()
@@ -77,11 +75,9 @@ class Lockr(object):
             while i < len(buf):
                 key_len = struct.unpack('!Q', buf[i:i+8])[0]
                 key = buf[i+8:i+8+key_len]
-                value_len = struct.unpack('!Q',
-                                          buf[i+8+key_len:i+16+key_len])[0]
-                kv[key] = buf[i+16+key_len:i+16+key_len+value_len]
+                kv[key] = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
 
-                i += 16 + key_len + value_len
+                i += 16 + key_len
 
             return 1, kv
 
@@ -108,14 +104,16 @@ class Lockr(object):
         while i < len(buf):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
-            value_len = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
+            ver = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
+            val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
 
             if flags:
-                result[key] = buf[i+16+key_len:i+16+key_len+value_len]
-                i += 16 + key_len + value_len
+                val = buf[i+24+key_len:i+24+key_len+val_len]
+                result[key] = dict(version=ver, value=val, length=val_len)
+                i += 24 + key_len + val_len
             else:
-                result[key] = value_len
-                i += 16 + key_len
+                result[key] = dict(version=ver, length=val_len)
+                i += 24 + key_len
 
         assert(i == len(buf))
 
@@ -126,11 +124,11 @@ class Lockr(object):
             self.offset, ret = self.get(begin, end, True, self.offset)
             result = dict(added=dict(), updated=dict())
             for key, value in ret.iteritems():
-                if value:
+                if value['value']:
                     if key in self.keys:
-                        result['updated'][key] = value
+                        result['updated'][key] = value['value']
                     else:
-                        result['added'][key] = value
+                        result['added'][key] = value['value']
 
             result['deleted'] = self.keys - set(ret)
             self.keys = set(ret)

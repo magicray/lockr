@@ -36,7 +36,10 @@ class Client(cmd.Cmd):
         begin, end = self.parse_line(line)
         offset, result = self.cli.get(begin, end, with_values)
         for k in sorted(result.keys()):
-            print('{0} - {1}'.format(k, result[k]))
+            print('{0} <{1}-{2}> {3}'.format(k,
+                result[k]['version'],
+                result[k]['length'],
+                result[k].get('value', '')))
 
     def do_keys(self, line):
         self.get(line, False)
@@ -47,14 +50,14 @@ class Client(cmd.Cmd):
     def do_put(self, line):
         cmd = shlex.split(line)
         tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-        docs = dict([(t[0], (t[1], t[2])) for t in tup])
+        docs = dict([(t[0], (int(t[1]), t[2])) for t in tup])
         code, value = self.cli.put(docs)
         if 0 == code:
             print('committed : {0}'.format(value))
         elif 1 == code:
-            print('compare failed for following keys:-')
+            print('version mismatch for the following keys:-')
             for k, v in value.iteritems():
-                print('{0} - {1}'.format(k, v))
+                print('{0} <{1}>'.format(k, v))
         else:
             print(value)
 
@@ -77,6 +80,6 @@ class Client(cmd.Cmd):
             for i in range(10000):
                 key = '%05d' % (i)
                 offset, result = self.cli.get(key, key, True)
-                prev = result.get(key, '')
-                new = str(int(prev) + 1) if prev else '1'
-                self.cli.put({key: (prev, new)})
+                prev = result.get(key, dict(value='0', version=0))
+                new = str(int(prev['value']) + 1)
+                self.cli.put({key: (prev['version'], new)})

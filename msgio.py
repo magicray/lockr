@@ -250,7 +250,7 @@ def loop(module, port, peers, key, cert):
                     else:
                         epoll.modify(fileno, select.EPOLLIN)
 
-        if time.time() > last_stats_time + 10:
+        if time.time() > last_stats_time + 900:
             duration = int(time.time() - last_stats_time)
             last_stats_time = time.time()
 
