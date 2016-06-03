@@ -32,7 +32,7 @@ def loop(module, port, peers, key, cert):
     listener_sock.setblocking(0)
     listener_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener_sock.bind(port)
-    listener_sock.listen(5)
+    listener_sock.listen(1024)
     logger.critical('listening on %s', port)
     module.on_listen(node)
 

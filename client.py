@@ -21,33 +21,36 @@ class Lockr(object):
         req_begin = time.time()
         while time.time() < (req_begin + self.timeout):
             try:
-                if not self.server:
-                    for srv in self.servers:
-                        try:
-                            t = time.time()
-                            s = msgio.Client(srv)
-                            s.send('state')
-                            stats = json.loads(s.recv())
-                            logger.debug('connected to(%s) msec(%d)',
-                                         srv, (time.time()-t)*1000)
-                            if 'leader' == stats['state']:
-                                self.server = s
-                                logger.debug('connected to leader(%s)',
-                                             str(srv))
-                                break
+                if self.server:
+                    self.server.send(req, buf)
+                    result = self.server.recv()
+                    logger.critical('received response(%s) from%s msec(%d)',
+                                    req, self.server.server,
+                                    (time.time() - req_begin)*1000)
+                    return result
 
-                            s.close()
-                        except:
-                            logger.debug('connection to(%s) failed msec(%d)',
-                                         srv, (time.time()-t)*1000)
+                for srv in self.servers:
+                    try:
+                        t = time.time()
+                        s = msgio.Client(srv)
+                        s.send('state')
+                        stats = json.loads(s.recv())
+                        logger.debug('connected to(%s) msec(%d)',
+                                     srv, (time.time()-t)*1000)
+                        if 'leader' == stats['state']:
+                            self.server = s
+                            logger.debug('connected to leader(%s)',
+                                         str(srv))
+                            break
 
-                self.server.send(req, buf)
-                result = self.server.recv()
-                logger.critical('received response(%s) from%s msec(%d)',
-                                req, self.server.server,
-                                (time.time() - req_begin)*1000)
-                return result
+                        s.close()
+                    except:
+                        logger.debug('connection to(%s) failed msec(%d)',
+                                     srv, (time.time()-t)*1000)
             except:
+                if self.server:
+                    self.server.close()
+
                 self.server = None
 
         raise Exception('timed out {0}'.format(time.time()-req_begin))
