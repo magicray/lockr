@@ -9,7 +9,7 @@ logger.setLevel(logging.CRITICAL)
 
 
 class Lockr(object):
-    def __init__(self, servers, timeout=10):
+    def __init__(self, servers, timeout=15):
         self.servers = servers
         self.server = None
         self.timeout = timeout

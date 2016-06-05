@@ -556,37 +556,32 @@ def append(buf):
 
 def db_put(filenum, offset, checksum, buf):
     i = 0
-    txn = dict()
     while i < len(buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
-        key = buf[i+8:i+8+key_len]
+        key = sqlite3.Binary(buf[i+8:i+8+key_len])
 
         ver = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
-
         val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
-        val = buf[i+24+key_len:i+24+key_len+val_len]
 
-        txn[key] = (offset+8+i+24+key_len, ver, val)
+        g.db.execute('delete from data where key=?', (key,))
+        if val_len:
+            g.db.execute('insert into data values(?, ?, ?, ?, ?)',
+                         (key, filenum, offset+8+i+24+key_len, ver, val_len))
 
         i += 24 + key_len + val_len
 
-    assert(i == len(buf))
-
-    g.maxfile = filenum
-    g.offset = offset + len(buf) + 28
-    g.checksum = checksum.encode('hex')
-
-    for k, v in txn.iteritems():
-        g.db.execute('delete from data where key=?', (sqlite3.Binary(k),))
-        if v[1]:
-            g.db.execute('insert into data values(?, ?, ?, ?, ?)',
-                         (sqlite3.Binary(k), filenum, v[0], v[1], len(v[2])))
+    if i != len(buf):
+        os._exit(0)
 
     if time.time() > g.last_db_commit + 1:
         t = time.time()
         g.db.commit()
         log('db commit in msec(%d)', (time.time()-t)*1000)
         g.last_db_commit = time.time()
+
+    g.maxfile = filenum
+    g.offset = offset + len(buf) + 28
+    g.checksum = checksum.encode('hex')
 
 
 def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
