@@ -9,7 +9,7 @@ logger.setLevel(logging.CRITICAL)
 
 
 class Lockr(object):
-    def __init__(self, servers, timeout=5):
+    def __init__(self, servers, timeout=10):
         self.servers = servers
         self.server = None
         self.timeout = timeout
@@ -86,11 +86,10 @@ class Lockr(object):
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
-    def get(self, begin, end, flags=False, offset=(0, 0)):
+    def get(self, begin, end, offset=(0, 0)):
         buf = self.request('get', ''.join([
             struct.pack('!Q', offset[0]),
             struct.pack('!Q', offset[1]),
-            struct.pack('!I', flags),
             struct.pack('!Q', len(begin)),
             begin,
             struct.pack('!Q', len(end)),
@@ -110,12 +109,11 @@ class Lockr(object):
             ver = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
             val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
 
-            if flags:
-                val = buf[i+24+key_len:i+24+key_len+val_len]
-                result[key] = dict(version=ver, value=val, length=val_len)
+            if val_len:
+                result[key] = (ver, buf[i+24+key_len:i+24+key_len+val_len])
                 i += 24 + key_len + val_len
             else:
-                result[key] = dict(version=ver, length=val_len)
+                result[key] = (ver, None)
                 i += 24 + key_len
 
         assert(i == len(buf))
@@ -124,14 +122,14 @@ class Lockr(object):
 
     def watch(self, begin, end):
         while True:
-            self.offset, ret = self.get(begin, end, True, self.offset)
+            self.offset, ret = self.get(begin, end, self.offset)
             result = dict(added=dict(), updated=dict())
-            for key, value in ret.iteritems():
-                if value['value']:
+            for key, (version, value) in ret.iteritems():
+                if value:
                     if key in self.keys:
-                        result['updated'][key] = value['value']
+                        result['updated'][key] = value
                     else:
-                        result['added'][key] = value['value']
+                        result['added'][key] = value
 
             result['deleted'] = self.keys - set(ret)
             self.keys = set(ret)

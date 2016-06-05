@@ -32,20 +32,19 @@ class Client(cmd.Cmd):
                 begin, end = l[0], l[1]
         return begin, end
 
-    def get(self, line, with_values):
+    def get(self, line, values_from):
         begin, end = self.parse_line(line)
-        offset, result = self.cli.get(begin, end, with_values)
+        offset, result = self.cli.get(begin, end, values_from)
         for k in sorted(result.keys()):
-            print('{0} <{1}-{2}> {3}'.format(k,
-                result[k]['version'],
-                result[k]['length'],
-                result[k].get('value', '')))
+            print('{0} <{1}> {2}'.format(k,
+                result[k][0],
+                result[k][1]))
 
     def do_keys(self, line):
-        self.get(line, False)
+        self.get(line, (2**63, 2**63))
 
     def do_get(self, line):
-        self.get(line, True)
+        self.get(line, (0, 0))
 
     def do_put(self, line):
         cmd = shlex.split(line)
@@ -79,7 +78,7 @@ class Client(cmd.Cmd):
         while True:
             for i in range(10000):
                 key = '%05d' % (i)
-                offset, result = self.cli.get(key, key, True)
-                prev = result.get(key, dict(value='0', version=0))
-                new = str(int(prev['value']) + 1)
-                self.cli.put({key: (prev['version'], new)})
+                offset, result = self.cli.get(key, key, (0, 0))
+                prev = result.get(key, (0, '0'))
+                new = str(int(prev[1]) + 1)
+                self.cli.put({key: (prev[0], new)})

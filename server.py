@@ -397,10 +397,9 @@ def watch(src, buf):
 def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
-    flags = struct.unpack('!I', buf[16:20])[0]
 
     keys = list()
-    i = 20
+    i = 16
     while i < len(buf):
         begin_len = struct.unpack('!Q', buf[i:i+8])[0]
         begin = buf[i+8:i+8+begin_len]
@@ -427,46 +426,37 @@ def get(src, buf):
               struct.pack('!Q', g.maxfile),
               struct.pack('!Q', g.offset)]
 
+    k_list = dict()
+    v_list = dict()
     for begin_key, end_key in keys:
-        full = g.db.execute('''select key, file, offset, version, length
+        rows = g.db.execute('''select key, file, offset, version, length
                                from data where key between ? and ?
                             ''', (begin_key, end_key)).fetchall()
 
-        if 0 == filenum and 0 == offset:
-            new = full
-        else:
-            new = g.db.execute('''select key, file, offset, version, length
-                                  from data where key between ? and ?
-                                  and ((file = ? and offset > ?) or
-                                       (file > ?))
-                               ''', (begin_key, end_key, filenum, offset,
-                                     filenum)).fetchall()
+        for r in rows:
+            k, f, o, v, l = r
+            if (f == filenum and o > offset) or (f > filenum):
+                v_list[bytes(k)] = (f, o, v, l)
+            else:
+                k_list[bytes(k)] = (f, o, v, l)
 
-        new = dict([(bytes(r[0]), r) for r in new if '' != r[0]])
+    for key, (filenum, offset, version, length) in v_list.iteritems():
+        result.append(struct.pack('!Q', len(key)))
+        result.append(key)
+        result.append(struct.pack('!Q', version))
+        result.append(struct.pack('!Q', length))
 
-        for key, value in new.iteritems():
-            _, filenum, offset, version, length = value
-            result.append(struct.pack('!Q', len(key)))
-            result.append(key)
-            result.append(struct.pack('!Q', version))
-            result.append(struct.pack('!Q', length))
+        with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+            fd.seek(offset, 0)
+            buf = fd.read(length)
+            assert(len(buf) == length)
+            result.append(buf)
 
-            if flags:
-                with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
-                    fd.seek(offset, 0)
-                    buf = fd.read(length)
-                    assert(len(buf) == length)
-                    result.append(buf)
-
-        for k, filenum, offset, version, length in full:
-            key = bytes(k)
-            if key in new or '' == key:
-                continue
-
-            result.append(struct.pack('!Q', len(key)))
-            result.append(key)
-            result.append(struct.pack('!Q', version))
-            result.append(struct.pack('!Q', 0))
+    for key, (filenum, offset, version, length) in k_list.iteritems():
+        result.append(struct.pack('!Q', len(key)))
+        result.append(key)
+        result.append(struct.pack('!Q', version))
+        result.append(struct.pack('!Q', 0))
 
     return dict(buf=''.join(result))
 

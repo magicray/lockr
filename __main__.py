@@ -20,7 +20,7 @@ if __name__ == '__main__':
     parser.add_option('--index', dest='index', type='string',
                       help='index file path', default='index.db')
     parser.add_option('--maxsize', dest='max_size', type='int',
-                      help='max file size', default=2**18)
+                      help='max file size', default=2**16)
     parser.add_option('--replsize', dest='repl_size', type='int',
                       help='replication chunk size', default=2**24)
     parser.add_option('--timeout', dest='timeout', type='int',
