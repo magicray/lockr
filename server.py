@@ -209,10 +209,10 @@ def replication_request(src, buf):
     if acks:
         scan(g.maxfile, g.offset, g.checksum, g.maxfile, committed_offset)
         for k in g.watch.keys():
-            f, o = g.watch[k]
+            f, o, src, buf = g.watch[k]
             if g.maxfile > f or (g.maxfile == f and g.offset > o):
                 g.watch.pop(k)
-                acks.append(dict(dst=k))
+                acks.append(get(src, buf))
 
     return acks + get_replication_responses()
 
@@ -339,7 +339,7 @@ def replication_response(src, buf):
 def on_message(src, msg, buf):
     if type(src) is tuple:
         try:
-            assert(msg in ('get', 'put', 'watch', 'state')), 'invalid command'
+            assert(msg in ('get', 'put', 'state')), 'invalid command'
             return globals()[msg](src, buf)
         except:
             return dict(buf=struct.pack('!B', 255) + traceback.format_exc())
@@ -384,19 +384,20 @@ def state(src, buf):
     return dict(buf=g.json())
 
 
-def watch(src, buf):
-    filenum = struct.unpack('!Q', buf[0:8])[0]
-    offset = struct.unpack('!Q', buf[8:16])[0]
-
-    if (g.maxfile > filenum) or (g.maxfile == filenum and g.offset > offset):
-        return dict()
-
-    g.watch[src] = (filenum, offset)
-
-
 def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
+
+    wait = True
+    if (g.maxfile > filenum) or (g.maxfile == filenum and g.offset > offset):
+        wait = False
+
+    if (filenum == 2**64-1 and offset == 2**64-1):
+        wait = False
+
+    if wait:
+        g.watch[src] = (filenum, offset, src, buf)
+        return
 
     keys = list()
     i = 16
@@ -458,7 +459,7 @@ def get(src, buf):
         result.append(struct.pack('!Q', version))
         result.append(struct.pack('!Q', 0))
 
-    return dict(buf=''.join(result))
+    return dict(dst=src, buf=''.join(result))
 
 
 def put(src, buf):
@@ -508,28 +509,25 @@ def put(src, buf):
         buf_list.append(struct.pack('!Q', len(keys[key][1])))
         buf_list.append(keys[key][1])
 
-    append(''.join(buf_list))
-
     rows = g.db.execute('''select key, file, offset, version, length from data
                            where file < ? and length > 0
                            order by file, offset limit ?
                         ''', (g.maxfile, len(keys)*2)).fetchall()
 
-    buf_list = list()
-    for r in filter(lambda r: bytes(r[0]) not in g.kv, rows)[0:len(keys)]:
-        key, filenum, offset, version, length = r
+    for key, filenum, offset, version, length in rows:
         key = bytes(key)
 
-        with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
-            fd.seek(offset)
-            buf = fd.read(length)
-            assert(len(buf) == length)
+        if key not in g.kv and key not in keys:
+            with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+                fd.seek(offset)
+                buf = fd.read(length)
+                assert(len(buf) == length)
 
-        buf_list.append(struct.pack('!Q', len(key)))
-        buf_list.append(key)
-        buf_list.append(struct.pack('!Q', version))
-        buf_list.append(struct.pack('!Q', length))
-        buf_list.append(buf)
+            buf_list.append(struct.pack('!Q', len(key)))
+            buf_list.append(key)
+            buf_list.append(struct.pack('!Q', version))
+            buf_list.append(struct.pack('!Q', length))
+            buf_list.append(buf)
 
     append(''.join(buf_list))
 
@@ -570,8 +568,7 @@ def db_put(filenum, offset, checksum, buf):
 
         i += 24 + key_len + val_len
 
-    if i != len(buf):
-        os._exit(0)
+    assert(i == len(buf))
 
     if time.time() > g.last_db_commit + 1:
         t = time.time()
@@ -611,7 +608,12 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
                     assert(y == chksum.digest())
                     checksum = y
 
-                    db_put(filenum, offset, checksum, x)
+                    try:
+                        db_put(filenum, offset, checksum, x)
+                    except:
+                        log(traceback.format_exc())
+                        time.sleep(10**6)
+                        os._exit(0)
 
                     offset += len(x) + 28
 

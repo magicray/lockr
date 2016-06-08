@@ -41,7 +41,7 @@ class Client(cmd.Cmd):
                 result[k][1]))
 
     def do_keys(self, line):
-        self.get(line, (2**63, 2**63))
+        self.get(line, (2**64-1, 2**64-1))
 
     def do_get(self, line):
         self.get(line, (0, 0))

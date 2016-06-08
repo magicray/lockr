@@ -9,7 +9,7 @@ logger.setLevel(logging.CRITICAL)
 
 
 class Lockr(object):
-    def __init__(self, servers, timeout=15):
+    def __init__(self, servers, timeout=5):
         self.servers = servers
         self.server = None
         self.timeout = timeout
@@ -136,7 +136,3 @@ class Lockr(object):
 
             if result['added'] or result['updated'] or result['deleted']:
                 yield result
-
-            self.request('watch', ''.join([
-                struct.pack('!Q', self.offset[0]),
-                struct.pack('!Q', self.offset[1])]))
