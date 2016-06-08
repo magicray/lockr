@@ -387,16 +387,11 @@ def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
 
-    wait = True
-    if (g.maxfile > filenum) or (g.maxfile == filenum and g.offset > offset):
-        wait = False
-
-    if (filenum == 2**64-1 and offset == 2**64-1):
-        wait = False
-
-    if wait:
-        g.watch[src] = (filenum, offset, src, buf)
-        return
+    if filenum != 2**64-1 or offset != 2**64-1:
+        if g.maxfile <= filenum:
+            if g.maxfile == filenum and g.offset < offset:
+                g.watch[src] = (filenum, offset, src, buf)
+                return
 
     keys = list()
     i = 16
