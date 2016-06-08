@@ -110,8 +110,8 @@ def vote(src, buf):
     if g.state.startswith('following-'):
         leader = g.state.split('following-')[1]
 
-        log('sent replication-request to(%s) file(%d) offset(%d) as %s',
-            leader, g.maxfile, g.size, reason)
+        log('sent replication-request to(%s) file(%d) offset(%d) size(%d) as '
+            '%s', leader, g.maxfile, g.offset, g.size, reason)
         msgs = [dict(dst=leader, msg='replication_request', buf=g.json())]
 
         for f in g.followers:
@@ -130,8 +130,8 @@ def replication_request(src, buf):
     req = json.loads(buf)
     g.peers[src] = req
 
-    log('received replication-request from(%s) file(%d) offset(%d)',
-        src, req['maxfile'], req['offset'])
+    log('received replication-request from(%s) file(%d) offset(%d) size(%d)',
+        src, req['maxfile'], req['offset'], req['size'])
 
     if g.state.startswith('following-'):
         log('rejecting replication-request from(%s)', src)
@@ -238,7 +238,7 @@ def get_replication_responses():
             fd.seek(0, 2)
 
             if fd.tell() < req['size']:
-                log('sent replication-truncate to(%s) file(%d) offset(%d) '
+                log('sent replication-truncate to(%s) file(%d) size(%d) '
                     'truncate(%d)',
                     src, req['maxfile'], req['size'], fd.tell())
 
@@ -261,8 +261,7 @@ def get_replication_responses():
             buf = fd.read(g.opt.repl_size)
             if buf:
                 log('sent replication-response to(%s) file(%d) offset(%d) '
-                    'size(%d)',
-                    src, req['maxfile'], req['offset'], len(buf))
+                    'size(%d)', src, req['maxfile'], req['offset'], len(buf))
 
                 g.followers[src] = None
                 msgs.append(dict(dst=src, msg='replication_response', buf=buf))
@@ -300,8 +299,8 @@ def replication_nextfile(src, buf):
         os.close(g.fd)
         g.fd = None
 
-    log('sent replication-request to(%s) file(%d) offset(%d)',
-        src, g.maxfile, g.size)
+    log('sent replication-request to(%s) file(%d) offset(%d) size(%d)',
+        src, g.maxfile, g.offset, g.size)
 
     return dict(msg='replication_request', buf=g.json())
 
@@ -328,8 +327,8 @@ def replication_response(src, buf):
 
         scan(g.maxfile, g.offset, g.checksum)
 
-        log('sent replication-request to(%s) file(%d) offset(%d)',
-            src, g.maxfile, g.size)
+        log('sent replication-request to(%s) file(%d) offset(%d) size(%d)',
+            src, g.maxfile, g.offset, g.size)
 
         return dict(msg='replication_request', buf=g.json())
     except:

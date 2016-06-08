@@ -36,9 +36,7 @@ class Client(cmd.Cmd):
         begin, end = self.parse_line(line)
         offset, result = self.cli.get(begin, end, values_from)
         for k in sorted(result.keys()):
-            print('{0} <{1}> {2}'.format(k,
-                result[k][0],
-                result[k][1]))
+            print('{0} <{1}> {2}'.format(k, result[k][0], result[k][1]))
 
     def do_keys(self, line):
         self.get(line, (2**64-1, 2**64-1))
