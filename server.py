@@ -579,7 +579,11 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
     checksum = checksum.decode('hex')
     while True:
         try:
-            assert(filenum <= e_filenum)
+            if filenum > e_filenum:
+                break
+
+            if not os.path.isfile(os.path.join(g.opt.data, str(filenum))):
+                break
 
             with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
                 t = time.time()
@@ -592,7 +596,9 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
 
                 while(offset < total_size):
                     l = struct.unpack('!Q', fd.read(8))[0]
-                    assert(l + 28 <= e_offset)
+
+                    if l + 28 > e_offset:
+                        break
 
                     x = fd.read(l)
                     y = fd.read(20)
@@ -602,19 +608,16 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
                     assert(y == chksum.digest())
                     checksum = y
 
-                    try:
-                        db_put(filenum, offset, checksum, x)
-                    except:
-                        log(traceback.format_exc())
-                        time.sleep(10**6)
-                        os._exit(0)
+                    db_put(filenum, offset, checksum, x)
 
                     offset += len(x) + 28
 
             filenum += 1
             offset = 0
         except:
-            return
+            log(traceback.format_exc())
+            time.sleep(10**6)
+            os._exit(0)
 
 
 def init(peers, opt):
