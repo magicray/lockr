@@ -643,8 +643,18 @@ def init(peers, opt):
         g.db.commit()
         return
 
+    if os.path.getsize(os.path.join(g.opt.data, str(max(files)))) < 104:
+        os.remove(os.path.join(g.opt.data, str(max(files))))
+        log('removed file(%d) as it has no data', max(files))
+        os._exit(0)
+
     try:
         g.db.execute('delete from data where file < ?', (min(files),))
+        g.db.execute('delete from data where file > ?', (max(files),))
+        g.db.execute('delete from data where file = ? and offset > ?',
+                     (max(files), os.path.getsize(os.path.join(
+                         g.opt.data, str(max(files))))))
+
         g.minfile = min(files)
 
         row = g.db.execute('''select file, offset, length from data
