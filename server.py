@@ -61,7 +61,7 @@ def vote(src, buf):
         return
 
     if g.peers[src]['maxfile'] == g.maxfile:
-        if g.peers[src]['size_prev'] > g.size_prev:
+        if g.peers[src]['size_prev'] > g.size_prev > 0:
             os.remove(os.path.join(g.opt.data, str(g.maxfile)))
             log('REMOVED file(%d) as peer(%s) prev size(%d > %d)',
                 g.maxfile, src, g.peers[src]['size_prev'], g.size_prev)
@@ -172,7 +172,7 @@ def replication_request(src, buf):
                         struct.pack('!Q', len(str(g.maxfile))),
                         str(g.maxfile)]))
 
-        scan(g.maxfile, g.offset, g.checksum)
+        scan()
         g.state = 'new-sync'
         log('state(NEW-SYNC) file(%d) offset(%d) in_sync(%d)',
             g.maxfile-1, g.size_prev, len(in_sync))
@@ -207,7 +207,7 @@ def replication_request(src, buf):
                     struct.pack('!Q', offset)])))
 
     if acks:
-        scan(g.maxfile, g.offset, g.checksum, g.maxfile, committed_offset)
+        scan(g.maxfile, committed_offset)
         for k in g.watch.keys():
             f, o, src, buf = g.watch[k]
             if g.maxfile > f or (g.maxfile == f and g.offset > o):
@@ -325,7 +325,7 @@ def replication_response(src, buf):
 
         g.size = os.fstat(g.fd).st_size
 
-        scan(g.maxfile, g.offset, g.checksum)
+        scan()
 
         log('sent replication-request to(%s) file(%d) offset(%d) size(%d)',
             src, g.maxfile, g.offset, g.size)
@@ -504,8 +504,7 @@ def put(src, buf):
         buf_list.append(keys[key][1])
 
     rows = g.db.execute('''select key, file, offset, version, length from data
-                           where file < ? and length > 0
-                           order by file, offset limit ?
+                           where file < ?  order by file, offset limit ?
                         ''', (g.maxfile, len(keys)*2)).fetchall()
 
     for key, filenum, offset, version, length in rows:
@@ -531,7 +530,7 @@ def put(src, buf):
 
 def append(buf):
     if not g.chksum:
-        g.chksum = hashlib.sha1(g.checksum.decode('hex'))
+        g.chksum = hashlib.sha1(g.checksum)
     else:
         g.chksum = hashlib.sha1(g.chksum.digest())
 
@@ -546,8 +545,11 @@ def append(buf):
     g.size = os.fstat(g.fd).st_size
 
 
-def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
-    checksum = checksum.decode('hex')
+def scan(e_filenum=2**64, e_offset=2**64):
+    b_file, b_offset, n_files, n_size, n_keys = g.maxfile, g.offset, 0, 0, 0
+
+    filenum, offset = g.maxfile, g.offset
+
     while True:
         try:
             if filenum > e_filenum:
@@ -565,6 +567,8 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
                 total_size = fd.tell()
                 fd.seek(offset)
 
+                n_files += 1
+
                 while(offset < total_size):
                     l = struct.unpack('!Q', fd.read(8))[0]
 
@@ -574,10 +578,9 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
                     buf = fd.read(l)
                     y = fd.read(20)
 
-                    chksum = hashlib.sha1(checksum)
+                    chksum = hashlib.sha1(g.checksum)
                     chksum.update(buf)
                     assert(y == chksum.digest())
-                    checksum = y
 
                     i = 0
                     while i < len(buf):
@@ -592,11 +595,12 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
                             buf[i+16+key_len:i+24+key_len])[0]
 
                         g.db.execute('delete from data where key=?', (key,))
-                        if val_len:
+                        if val_len > 0:
                             g.db.execute('insert into data values(?,?,?,?,?)',
-                                         (key, filenum, offset+8+i+24+key_len,
-                                          ver, val_len))
+                                (key, filenum, offset+8+i+24+key_len, ver,
+                                 val_len))
 
+                        n_keys += 1
                         i += 24 + key_len + val_len
 
                     assert(i == len(buf))
@@ -609,16 +613,22 @@ def scan(filenum, offset, checksum, e_filenum=2**64, e_offset=2**64):
 
                     g.maxfile = filenum
                     g.offset = offset + len(buf) + 28
-                    g.checksum = checksum.encode('hex')
+                    g.checksum = chksum.digest()
+                    n_size += len(buf) + 28
 
                     offset += len(buf) + 28
 
             filenum += 1
             offset = 0
         except:
+            log('scan begin(%d, %d) end(%d, %d) file(%d) size(%d) keys(%d)',
+                b_file, b_offset, g.maxfile, g.offset, n_files, n_size, n_keys)
             log(traceback.format_exc())
             time.sleep(10**6)
             os._exit(0)
+
+    log('scan begin(%d, %d) end(%d, %d) file(%d) size(%d) keys(%d)',
+        b_file, b_offset, g.maxfile, g.offset, n_files, n_size, n_keys)
 
 
 def init(peers, opt):
@@ -627,7 +637,6 @@ def init(peers, opt):
     g.db.execute('''create table if not exists data(key blob primary key,
         file unsigned, offset unsigned, version unsigned, length unsigned)''')
     g.db.execute('create index if not exists data_1 on data(file, offset)')
-    g.db.execute('create index if not exists data_2 on data(length)')
 
     g.quorum = int(len(peers)/2.0 + 0.6)
 
@@ -643,19 +652,22 @@ def init(peers, opt):
         g.db.commit()
         return
 
-    if os.path.getsize(os.path.join(g.opt.data, str(max(files)))) < 104:
-        os.remove(os.path.join(g.opt.data, str(max(files))))
-        log('removed file(%d) as it has no data', max(files))
+    min_f, max_f = min(files), max(files)
+    max_f_len = os.path.getsize(os.path.join(g.opt.data, str(max_f)))
+    log('minfile(%d) maxfile(%d) maxfilelen(%d)', min_f, max_f, max_f_len)
+
+    if max_f_len < 104:
+        os.remove(os.path.join(g.opt.data, str(max_f)))
+        log('removed file(%d) as it has no data', max_f)
         os._exit(0)
 
     try:
-        g.db.execute('delete from data where file < ?', (min(files),))
-        g.db.execute('delete from data where file > ?', (max(files),))
+        g.db.execute('delete from data where file < ?', (min_f,))
+        g.db.execute('delete from data where file > ?', (max_f,))
         g.db.execute('delete from data where file = ? and offset > ?',
-                     (max(files), os.path.getsize(os.path.join(
-                         g.opt.data, str(max(files))))))
+                     (max_f, max_f_len))
 
-        g.minfile = min(files)
+        g.minfile = min_f
 
         row = g.db.execute('''select file, offset, length from data
                               order by file desc, offset desc limit 1
@@ -665,27 +677,25 @@ def init(peers, opt):
             g.offset = row[1] + row[2] + 20
             with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
                 fd.seek(row[1] + row[2])
-                g.checksum = fd.read(20).encode('hex')
-                assert(40 == len(g.checksum))
+                g.checksum = fd.read(20)
+                assert(20 == len(g.checksum))
         else:
-            g.maxfile = min(files)
-            g.db.execute('delete from data')
+            g.maxfile = min_f
 
             with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
                 hdrlen = struct.unpack('!Q', fd.read(8))[0]
                 fd.read(hdrlen)
-                g.checksum = fd.read(20).encode('hex')
+                g.checksum = fd.read(20)
                 g.offset = fd.tell()
                 assert(g.offset == hdrlen + 28)
 
-        scan(g.maxfile, g.offset, g.checksum)
-
+        scan()
         g.size = g.offset
 
         row = g.db.execute('select min(file) from data').fetchone()
         g.minfile = row[0] if row[0] is not None else g.maxfile
 
-        for n in range(min(files), g.minfile)+range(g.maxfile+1, max(files)+1):
+        for n in range(min_f, g.minfile) + range(g.maxfile+1, max_f+1):
             os.remove(os.path.join(g.opt.data, str(n)))
             log('removed file({0})'.format(n))
 
@@ -703,8 +713,9 @@ def init(peers, opt):
         if g.minfile < g.maxfile:
             g.size_prev = os.path.getsize(
                 os.path.join(g.opt.data, str(g.maxfile-1)))
+        log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d)',
+            g.minfile, g.maxfile, g.offset, g.size, g.size_prev)
     except:
-        g.db.execute('delete from data where file >= ?', (g.maxfile,))
-        os.fsync(dfd)
-        g.db.commit()
+        log(traceback.format_exc())
+        time.sleep(10**6)
         os._exit(0)
