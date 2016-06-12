@@ -79,4 +79,5 @@ class Client(cmd.Cmd):
                 offset, result = self.cli.get(key, key, (0, 0))
                 prev = result.get(key, (0, '0'))
                 new = str(int(prev[1]) + 1)
-                self.cli.put({key: (prev[0], new)})
+                obj  = {key: (prev[0], new)}
+                print((obj, self.cli.put(obj)))

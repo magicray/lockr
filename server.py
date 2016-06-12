@@ -169,8 +169,8 @@ def replication_request(src, buf):
 
         append(''.join([struct.pack('!Q', 0),
                         struct.pack('!Q', g.maxfile),
-                        struct.pack('!Q', len(str(g.maxfile))),
-                        str(g.maxfile)]))
+                        struct.pack('!Q', 20),
+                        '%20d' % g.size_prev]))
 
         scan()
         g.state = 'new-sync'
