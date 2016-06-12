@@ -270,17 +270,20 @@ def get_replication_responses():
 
 
 def replication_truncate(src, buf):
-    req = json.loads(buf)
+    trunc = json.loads(buf)['truncate']
 
-    log('received replication-truncate from(%s) size(%d)',
-        src, req['truncate'])
+    log('received replication-truncate from(%s) size(%d)', src, trunc)
+
+    g.db.execute('delete from data where file >= ?', (g.maxfile,))
+    g.db.commit()
 
     f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
-    assert(req['truncate'] < n)
-    os.ftruncate(f, req['truncate'])
+    assert(trunc < n)
+    os.ftruncate(f, trunc)
+    os.close(f)
 
-    log('file(%d) truncated(%d) original(%d)', g.maxfile, req['truncate'], n)
+    log('file(%d) truncated(%d) original(%d)', g.maxfile, trunc, n)
     os._exit(0)
 
 
@@ -365,6 +368,7 @@ def on_disconnect(src, exc, tb):
     g.peers.pop(src)
 
     if 'following-' + src == g.state:
+        g.db.commit()
         log('exiting as LEADER({0}) disconnected'.format(src))
         os._exit(0)
 
@@ -657,7 +661,9 @@ def init(peers, opt):
 
     try:
         g.db.execute('delete from data where file < ?', (min_f,))
-        g.db.execute('delete from data where file >= ?', (max_f,))
+        g.db.execute('delete from data where file > ?', (max_f,))
+        g.db.execute('delete from data where file = ? and offset > ?',
+            (max_f, max_f_len))
 
         g.minfile = min_f
 
