@@ -27,8 +27,8 @@ class g:
     offset = 0
     size_prev = 0
     size = 0
-    chksum = None
-    checksum = ''
+    scan_checksum = ''
+    append_checksum = ''
     node = None
     last_db_commit = 0
     start_time = time.time()
@@ -529,19 +529,16 @@ def put(src, buf):
 
 
 def append(buf):
-    if not g.chksum:
-        g.chksum = hashlib.sha1(g.checksum)
-    else:
-        g.chksum = hashlib.sha1(g.chksum.digest())
-
-    g.chksum.update(buf)
+    g.append_checksum = hashlib.sha1(g.append_checksum)
+    g.append_checksum.update(buf)
+    g.append_checksum = g.append_checksum.digest()
 
     if not g.fd:
         g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
                        os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                        0644)
 
-    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + g.chksum.digest())
+    os.write(g.fd, struct.pack('!Q', len(buf)) + buf + g.append_checksum)
     g.size = os.fstat(g.fd).st_size
 
 
@@ -578,7 +575,7 @@ def scan(e_filenum=2**64, e_offset=2**64):
                     buf = fd.read(l)
                     y = fd.read(20)
 
-                    chksum = hashlib.sha1(g.checksum)
+                    chksum = hashlib.sha1(g.scan_checksum)
                     chksum.update(buf)
                     assert(y == chksum.digest())
 
@@ -588,11 +585,9 @@ def scan(e_filenum=2**64, e_offset=2**64):
                         key = sqlite3.Binary(buf[i+8:i+8+key_len])
 
                         ver = struct.unpack(
-                            '!Q',
-                            buf[i+8+key_len:i+16+key_len])[0]
+                            '!Q', buf[i+8+key_len:i+16+key_len])[0]
                         val_len = struct.unpack(
-                            '!Q',
-                            buf[i+16+key_len:i+24+key_len])[0]
+                            '!Q', buf[i+16+key_len:i+24+key_len])[0]
 
                         g.db.execute('delete from data where key=?', (key,))
                         if val_len > 0:
@@ -613,9 +608,8 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                     g.maxfile = filenum
                     g.offset = offset + len(buf) + 28
-                    g.checksum = chksum.digest()
+                    g.scan_checksum = chksum.digest()
                     n_size += len(buf) + 28
-
                     offset += len(buf) + 28
 
             filenum += 1
@@ -663,9 +657,7 @@ def init(peers, opt):
 
     try:
         g.db.execute('delete from data where file < ?', (min_f,))
-        g.db.execute('delete from data where file > ?', (max_f,))
-        g.db.execute('delete from data where file = ? and offset > ?',
-                     (max_f, max_f_len))
+        g.db.execute('delete from data where file >= ?', (max_f,))
 
         g.minfile = min_f
 
@@ -677,20 +669,21 @@ def init(peers, opt):
             g.offset = row[1] + row[2] + 20
             with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
                 fd.seek(row[1] + row[2])
-                g.checksum = fd.read(20)
-                assert(20 == len(g.checksum))
+                g.scan_checksum = fd.read(20)
+                assert(20 == len(g.scan_checksum))
         else:
             g.maxfile = min_f
 
             with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
                 hdrlen = struct.unpack('!Q', fd.read(8))[0]
                 fd.read(hdrlen)
-                g.checksum = fd.read(20)
+                g.scan_checksum = fd.read(20)
                 g.offset = fd.tell()
                 assert(g.offset == hdrlen + 28)
 
         scan()
         g.size = g.offset
+        g.append_checksum = g.scan_checksum
 
         row = g.db.execute('select min(file) from data').fetchone()
         g.minfile = row[0] if row[0] is not None else g.maxfile
