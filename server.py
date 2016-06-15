@@ -30,7 +30,6 @@ class g:
     scan_checksum = ''
     append_checksum = ''
     node = None
-    last_db_commit = 0
     start_time = time.time()
 
     @classmethod
@@ -273,9 +272,6 @@ def replication_truncate(src, buf):
     trunc = json.loads(buf)['truncate']
 
     log('received replication-truncate from(%s) size(%d)', src, trunc)
-
-    g.db.execute('delete from data where file >= ?', (g.maxfile,))
-    g.db.commit()
 
     f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
@@ -583,6 +579,10 @@ def scan(e_filenum=2**64, e_offset=2**64):
                     chksum.update(buf)
                     assert(y == chksum.digest())
 
+                    g.maxfile = filenum
+                    g.offset = offset + len(buf) + 28
+                    g.scan_checksum = chksum.digest()
+
                     i = 0
                     while i < len(buf):
                         key_len = struct.unpack('!Q', buf[i:i+8])[0]
@@ -604,17 +604,17 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                     assert(i == len(buf))
 
-                    if time.time() > g.last_db_commit + 1:
-                        t = time.time()
-                        g.db.commit()
-                        log('db commit in msec(%d)', (time.time()-t)*1000)
-                        g.last_db_commit = time.time()
+                    g.db.execute('insert or replace into data values'
+                        '(?,?,?,?,?)', ('txn', g.maxfile, g.offset, 0, 0))
 
-                    g.maxfile = filenum
-                    g.offset = offset + len(buf) + 28
-                    g.scan_checksum = chksum.digest()
                     n_size += len(buf) + 28
                     offset += len(buf) + 28
+
+                assert(offset == total_size)
+
+            t = time.time()
+            g.db.commit()
+            log('db commit in msec(%d)', (time.time()-t)*1000)
 
             filenum += 1
             offset = 0
@@ -623,7 +623,6 @@ def scan(e_filenum=2**64, e_offset=2**64):
                 b_file, b_offset, g.maxfile, g.offset, n_files, n_size, n_keys)
             log(traceback.format_exc())
             time.sleep(10**6)
-            os._exit(0)
 
     log('scan begin(%d, %d) end(%d, %d) file(%d) size(%d) keys(%d)',
         b_file, b_offset, g.maxfile, g.offset, n_files, n_size, n_keys)
@@ -667,14 +666,12 @@ def init(peers, opt):
 
         g.minfile = min_f
 
-        row = g.db.execute('''select file, offset, length from data
-                              order by file desc, offset desc limit 1
-                           ''').fetchone()
+        row = g.db.execute("select file, offset from data where "
+                           "key='txn'").fetchone()
         if row:
-            g.maxfile = row[0]
-            g.offset = row[1] + row[2] + 20
+            g.maxfile, g.offset = row
             with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
-                fd.seek(row[1] + row[2])
+                fd.seek(g.offset - 20)
                 g.scan_checksum = fd.read(20)
                 assert(20 == len(g.scan_checksum))
         else:
@@ -717,4 +714,3 @@ def init(peers, opt):
     except:
         log(traceback.format_exc())
         time.sleep(10**6)
-        os._exit(0)

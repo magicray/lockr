@@ -75,9 +75,13 @@ class Client(cmd.Cmd):
     def do_test(self, line):
         while True:
             for i in range(10000):
-                key = '%05d' % (i)
-                offset, result = self.cli.get(key, key, (0, 0))
-                prev = result.get(key, (0, '0'))
-                new = str(int(prev[1]) + 1)
-                obj  = {key: (prev[0], new)}
-                print((obj, self.cli.put(obj)))
+                while True:
+                    key = '%05d' % (i)
+                    offset, result = self.cli.get(key, key, (0, 0))
+                    prev = result.get(key, (0, '0'))
+                    new = str(int(prev[1]) + 1)
+                    req  = {key: (prev[0], new)}
+                    res = self.cli.put(req)
+                    print((req, res))
+                    if 0 == res[0]:
+                        break
