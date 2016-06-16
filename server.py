@@ -30,6 +30,7 @@ class g:
     scan_checksum = ''
     append_checksum = ''
     node = None
+    commit_time = 0
     start_time = time.time()
 
     @classmethod
@@ -175,7 +176,7 @@ def replication_request(src, buf):
         g.state = 'new-sync'
         log('state(NEW-SYNC) file(%d) offset(%d) in_sync(%d)',
             g.maxfile-1, g.size_prev, len(in_sync))
-        if 0 == int(time.time()) % 5:
+        if 0 == int(time.time()) % 3:
             log('exiting to force test')
             os._exit(0)
 
@@ -593,28 +594,32 @@ def scan(e_filenum=2**64, e_offset=2**64):
                         val_len = struct.unpack(
                             '!Q', buf[i+16+key_len:i+24+key_len])[0]
 
-                        g.db.execute('delete from data where key=?', (key,))
-                        if val_len > 0:
-                            g.db.execute('insert into data values(?,?,?,?,?)',
-                                (key, filenum, offset+8+i+24+key_len, ver,
-                                 val_len))
+                        if key_len > 0 and val_len > 0:
+                           g.db.execute('insert or replace into data '
+                                'values(?,?,?,?,?)', (key, filenum,
+                                offset+8+i+24+key_len, ver, val_len))
+                        else:
+                            g.db.execute('delete from data where key=?',(key,))
+
 
                         n_keys += 1
                         i += 24 + key_len + val_len
 
                     assert(i == len(buf))
 
-                    g.db.execute('insert or replace into data values'
-                        '(?,?,?,?,?)', ('txn', g.maxfile, g.offset, 0, 0))
+                    g.db.execute('insert into txn values(?, ?)',
+                                 (g.maxfile, g.offset))
+
+                    if time.time() > g.commit_time + 1:
+                        t = time.time()
+                        g.db.commit()
+                        log('db commit in msec(%d)', (time.time()-t)*1000)
+                        g.commit_time = time.time()
 
                     n_size += len(buf) + 28
                     offset += len(buf) + 28
 
                 assert(offset == total_size)
-
-            t = time.time()
-            g.db.commit()
-            log('db commit in msec(%d)', (time.time()-t)*1000)
 
             filenum += 1
             offset = 0
@@ -634,6 +639,8 @@ def init(peers, opt):
     g.db.execute('''create table if not exists data(key blob primary key,
         file unsigned, offset unsigned, version unsigned, length unsigned)''')
     g.db.execute('create index if not exists data_1 on data(file, offset)')
+    g.db.execute('''create table if not exists txn(file unsigned,
+        offset unsigned, primary key(file, offset))''')
 
     g.quorum = int(len(peers)/2.0 + 0.6)
 
@@ -659,15 +666,21 @@ def init(peers, opt):
         os._exit(0)
 
     try:
-        g.db.execute('delete from data where file < ?', (min_f,))
-        g.db.execute('delete from data where file > ?', (max_f,))
-        g.db.execute('delete from data where file = ? and offset > ?',
-            (max_f, max_f_len))
-
         g.minfile = min_f
 
-        row = g.db.execute("select file, offset from data where "
-                           "key='txn'").fetchone()
+        g.db.execute('delete from data where file < ?', (min_f,))
+        g.db.execute('delete from txn where file < ?', (min_f,))
+        g.db.execute('delete from txn where file > ?', (max_f,))
+        g.db.execute('delete from txn where file = ? and offset > ?',
+                     (max_f, max_f_len))
+
+        row = g.db.execute('select file, offset from txn order by file desc, '
+                           'offset desc limit 1').fetchone()
+        if row:
+            g.db.execute('delete from data where file > ?', (row[0],))
+            g.db.execute('delete from data where file = ? and offset > ?',
+                         (row[0], row[1]))
+
         if row:
             g.maxfile, g.offset = row
             with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
