@@ -15,13 +15,6 @@ logger.setLevel(logging.CRITICAL)
 
 
 def loop(module, port, peers, key, cert):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setblocking(0)
-        s.connect(('0.0.0.0', port))
-    except:
-        port = (s.getsockname()[0], port)
-
     node = '{0}:{1}'.format(*port)
 
     clients = set(filter(lambda x: x > port,
@@ -34,7 +27,6 @@ def loop(module, port, peers, key, cert):
     listener_sock.bind(port)
     listener_sock.listen(1024)
     logger.critical('listening on %s', port)
-    module.on_listen(node)
 
     epoll = select.epoll()
     epoll.register(listener_sock.fileno(), select.EPOLLIN)

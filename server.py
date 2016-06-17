@@ -3,6 +3,7 @@ import json
 import time
 import fcntl
 import struct
+import signal
 import sqlite3
 import hashlib
 import traceback
@@ -12,14 +13,14 @@ from logging import critical as log
 
 
 class g:
-    opt = None
+    conf = None
     fd = None
     db = None
     kv = set()
     watch = dict()
     acks = collections.deque()
     peers = dict()
-    followers = dict()
+    followers = set()
     quorum = 0
     state = ''
     minfile = 0
@@ -62,7 +63,7 @@ def vote(src, buf):
 
     if g.peers[src]['maxfile'] == g.maxfile:
         if g.peers[src]['size_prev'] > g.size_prev > 0:
-            os.remove(os.path.join(g.opt.data, str(g.maxfile)))
+            os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
             log('REMOVED file(%d) as peer(%s) prev size(%d > %d)',
                 g.maxfile, src, g.peers[src]['size_prev'], g.size_prev)
             os._exit(0)
@@ -72,7 +73,7 @@ def vote(src, buf):
             src, g.peers[src]['minfile'], g.maxfile)
         while True:
             try:
-                os.remove(os.path.join(g.opt.data, str(g.maxfile)))
+                os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
                 log('removed file(%d)', g.maxfile)
                 g.maxfile -= 1
             except:
@@ -127,11 +128,11 @@ def leader_conflict(src, buf):
 
 
 def replication_request(src, buf):
-    req = json.loads(buf)
-    g.peers[src] = req
+    g.peers[src] = json.loads(buf)
 
     log('received replication-request from(%s) file(%d) offset(%d) size(%d)',
-        src, req['maxfile'], req['offset'], req['size'])
+        src, g.peers[src]['maxfile'], g.peers[src]['offset'],
+        g.peers[src]['size'])
 
     if g.state.startswith('following-'):
         log('rejecting replication-request from(%s)', src)
@@ -140,21 +141,21 @@ def replication_request(src, buf):
     if src not in g.followers:
         log('accepted (%s) as follower(%d)', src, len(g.followers)+1)
 
-    g.followers[src] = req
+    g.followers.add(src)
 
     if not g.state and len(g.followers) >= g.quorum:
         g.state = 'old-sync'
         log('state(OLD-SYNC) file(%d) offset(%d) followers(%d)',
             g.maxfile, g.offset, len(g.followers))
 
-    in_sync = filter(lambda k: g.maxfile == g.followers[k]['maxfile'],
-                     filter(lambda k: g.offset == g.followers[k]['offset'],
-                            filter(lambda k: g.followers[k], g.followers)))
+    in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
+                     filter(lambda k: g.offset == g.peers[k]['offset'],
+                            g.followers))
 
     if 'new-sync' == g.state and len(in_sync) >= g.quorum:
         g.state = 'leader'
-        log('state(LEADER) msec(%d) file(%d) offset(%d) in_sync(%d)',
-            (time.time()-g.start_time)*1000, g.maxfile, g.offset, len(in_sync))
+        log('state(LEADER) file(%d) offset(%d) in_sync(%d)',
+            g.maxfile, g.offset, len(in_sync))
 
         msgs = list()
         for f in set(g.peers) - set(g.followers):
@@ -218,23 +219,25 @@ def replication_request(src, buf):
 
 
 def get_replication_responses():
+    data_dir = g.conf['data']
+
     msgs = list()
-    for src in filter(lambda k: g.followers[k], g.followers.keys()):
-        req = g.followers[src]
+    for src in g.followers.copy():
+        req = g.peers[src]
 
         if 0 == req['maxfile']:
-            f = map(int, os.listdir(g.opt.data))
+            f = map(int, os.listdir(data_dir))
             if f:
                 log('sent replication-nextfile to(%s) file(%d)', src, min(f))
 
-                g.followers[src] = None
+                g.followers.remove(src)
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                                  buf=json.dumps(dict(filenum=min(f)))))
 
-        if not os.path.isfile(os.path.join(g.opt.data, str(req['maxfile']))):
+        if not os.path.isfile(os.path.join(data_dir, str(req['maxfile']))):
             continue
 
-        with open(os.path.join(g.opt.data, str(req['maxfile']))) as fd:
+        with open(os.path.join(data_dir, str(req['maxfile']))) as fd:
             fd.seek(0, 2)
 
             if fd.tell() < req['size']:
@@ -242,7 +245,7 @@ def get_replication_responses():
                     'truncate(%d)',
                     src, req['maxfile'], req['size'], fd.tell())
 
-                g.followers[src] = None
+                g.followers.remove(src)
                 msgs.append(dict(dst=src, msg='replication_truncate',
                                  buf=json.dumps(dict(truncate=fd.tell()))))
 
@@ -253,17 +256,17 @@ def get_replication_responses():
                 log('sent replication-nextfile to(%s) file(%d)',
                     src, req['maxfile']+1)
 
-                g.followers[src] = None
+                g.followers.remove(src)
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                             buf=json.dumps(dict(filenum=req['maxfile']+1))))
 
             fd.seek(req['size'])
-            buf = fd.read(g.opt.repl_size)
+            buf = fd.read(g.conf['repl_size'])
             if buf:
                 log('sent replication-response to(%s) file(%d) offset(%d) '
                     'size(%d)', src, req['maxfile'], req['offset'], len(buf))
 
-                g.followers[src] = None
+                g.followers.remove(src)
                 msgs.append(dict(dst=src, msg='replication_response', buf=buf))
 
     return msgs
@@ -274,7 +277,7 @@ def replication_truncate(src, buf):
 
     log('received replication-truncate from(%s) size(%d)', src, trunc)
 
-    f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
+    f = os.open(os.path.join(g.conf['data'], str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
     assert(trunc < n)
     os.ftruncate(f, trunc)
@@ -313,10 +316,10 @@ def replication_response(src, buf):
         assert(len(buf) > 0)
 
         if not g.fd:
-            g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
+            g.fd = os.open(os.path.join(g.conf['data'], str(g.maxfile)),
                            os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                            0644)
-            fd = os.open(g.opt.data, os.O_RDONLY)
+            fd = os.open(g.conf['data'], os.O_RDONLY)
             os.fsync(fd)
             os.close(fd)
 
@@ -346,10 +349,6 @@ def on_message(src, msg, buf):
     return globals()[msg](src, buf)
 
 
-def on_listen(node):
-    g.node = node
-
-
 def on_connect(src):
     return dict(msg='vote', buf=g.json())
 
@@ -370,11 +369,12 @@ def on_disconnect(src, exc, tb):
         os._exit(0)
 
     if src in g.followers:
-        g.followers.pop(src)
+        g.followers.remove(src)
         log('removed follower(%s) remaining(%d)', src, len(g.followers))
 
     if g.state in ('old-sync', 'new-sync', 'leader'):
         if len(g.followers) < g.quorum:
+            g.db.commit()
             log('exiting as followers(%d) < quorum(%d)',
                 len(g.followers), g.quorum)
             os._exit(0)
@@ -442,7 +442,7 @@ def get(src, buf):
         result.append(struct.pack('!Q', version))
         result.append(struct.pack('!Q', length))
 
-        with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+        with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
             fd.seek(offset, 0)
             buf = fd.read(length)
             assert(len(buf) == length)
@@ -458,8 +458,8 @@ def get(src, buf):
 
 
 def put(src, buf):
-    if g.offset > g.opt.max_size:
-        log('max file size reached(%d > %d)', g.offset, g.opt.max_size)
+    if g.offset > g.conf['max_size']:
+        log('max file size reached(%d > %d)', g.offset, g.conf['max_size'])
         os._exit(0)
 
     i = 0
@@ -512,7 +512,7 @@ def put(src, buf):
         key = bytes(key)
 
         if key not in g.kv and key not in keys:
-            with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+            with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
                 fd.seek(offset)
                 buf = fd.read(length)
                 assert(len(buf) == length)
@@ -535,7 +535,7 @@ def append(buf):
     g.append_checksum = g.append_checksum.digest()
 
     if not g.fd:
-        g.fd = os.open(os.path.join(g.opt.data, str(g.maxfile)),
+        g.fd = os.open(os.path.join(g.conf['data'], str(g.maxfile)),
                        os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                        0644)
 
@@ -553,10 +553,10 @@ def scan(e_filenum=2**64, e_offset=2**64):
             if filenum > e_filenum:
                 break
 
-            if not os.path.isfile(os.path.join(g.opt.data, str(filenum))):
+            if not os.path.isfile(os.path.join(g.conf['data'], str(filenum))):
                 break
 
-            with open(os.path.join(g.opt.data, str(filenum)), 'rb') as fd:
+            with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
                 t = time.time()
                 os.fsync(fd.fileno())
                 log('fsync(%d) in msec(%d)', filenum, (time.time()-t)*1000)
@@ -624,106 +624,105 @@ def scan(e_filenum=2**64, e_offset=2**64):
             filenum += 1
             offset = 0
         except:
+            signal.alarm(0)
             log('scan begin(%d, %d) end(%d, %d) file(%d) size(%d) keys(%d)',
                 b_file, b_offset, g.maxfile, g.offset, n_files, n_size, n_keys)
             log(traceback.format_exc())
-            time.sleep(10**6)
+            time.sleep(10**8)
 
     log('scan begin(%d, %d) end(%d, %d) file(%d) size(%d) keys(%d)',
         b_file, b_offset, g.maxfile, g.offset, n_files, n_size, n_keys)
 
 
-def init(peers, opt):
-    g.opt = opt
-    g.db = sqlite3.connect(g.opt.index)
+def init(conf):
+    g.conf = conf
+    g.db = sqlite3.connect(g.conf['index'])
     g.db.execute('''create table if not exists data(key blob primary key,
         file unsigned, offset unsigned, version unsigned, length unsigned)''')
     g.db.execute('create index if not exists data_1 on data(file, offset)')
     g.db.execute('''create table if not exists txn(file unsigned,
         offset unsigned, primary key(file, offset))''')
 
-    g.quorum = int(len(peers)/2.0 + 0.6)
+    g.quorum = int(len(conf['nodes'])/2.0 + 0.6)
+    g.node = '{0}:{1}'.format(*conf['port'])
 
-    if not os.path.isdir(g.opt.data):
-        os.mkdir(g.opt.data)
+    data_dir = g.conf['data']
+    if not os.path.isdir(data_dir):
+        os.mkdir(data_dir)
 
-    dfd = os.open(g.opt.data, os.O_RDONLY)
+    dfd = os.open(data_dir, os.O_RDONLY)
     fcntl.flock(dfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    files = map(int, os.listdir(g.opt.data))
+    files = map(int, os.listdir(data_dir))
     if not files:
         g.db.execute('delete from data')
         g.db.commit()
         return
 
     min_f, max_f = min(files), max(files)
-    max_f_len = os.path.getsize(os.path.join(g.opt.data, str(max_f)))
+    max_f_len = os.path.getsize(os.path.join(data_dir, str(max_f)))
     log('minfile(%d) maxfile(%d) maxfilelen(%d)', min_f, max_f, max_f_len)
 
     if max_f_len < 72:
-        os.remove(os.path.join(g.opt.data, str(max_f)))
+        os.remove(os.path.join(data_dir, str(max_f)))
         log('removed file(%d) as it has no data', max_f)
         os._exit(0)
 
-    try:
-        g.minfile = min_f
+    g.minfile = min_f
 
-        g.db.execute('delete from data where file < ?', (min_f,))
-        g.db.execute('delete from txn where file < ?', (min_f,))
-        g.db.execute('delete from txn where file > ?', (max_f,))
-        g.db.execute('delete from txn where file = ? and offset > ?',
-                     (max_f, max_f_len))
+    g.db.execute('delete from data where file < ?', (min_f,))
+    g.db.execute('delete from txn where file < ?', (min_f,))
+    g.db.execute('delete from txn where file > ?', (max_f,))
+    g.db.execute('delete from txn where file = ? and offset > ?',
+                 (max_f, max_f_len))
 
-        row = g.db.execute('select file, offset from txn order by file desc, '
-                           'offset desc limit 1').fetchone()
-        if row:
-            g.db.execute('delete from data where file > ?', (row[0],))
-            g.db.execute('delete from data where file = ? and offset > ?',
-                         (row[0], row[1]))
+    row = g.db.execute('select file, offset from txn order by file desc, '
+                       'offset desc limit 1').fetchone()
+    if row:
+        g.db.execute('delete from data where file > ?', (row[0],))
+        g.db.execute('delete from data where file = ? and offset > ?',
+                     (row[0], row[1]))
 
-        if row:
-            g.maxfile, g.offset = row
-            with open(os.path.join(g.opt.data, str(g.maxfile)), 'rb') as fd:
-                fd.seek(g.offset - 20)
-                g.scan_checksum = fd.read(20)
-                assert(20 == len(g.scan_checksum))
-        else:
-            g.maxfile = min_f
+    if row:
+        g.maxfile, g.offset = row
+        with open(os.path.join(data_dir, str(g.maxfile)), 'rb') as fd:
+            fd.seek(g.offset - 20)
+            g.scan_checksum = fd.read(20)
+            assert(20 == len(g.scan_checksum))
+    else:
+        g.maxfile = min_f
 
-            with open(os.path.join(g.opt.data, str(g.minfile)), 'rb') as fd:
-                hdrlen = struct.unpack('!Q', fd.read(8))[0]
-                fd.read(hdrlen)
-                g.scan_checksum = fd.read(20)
-                g.offset = fd.tell()
-                assert(g.offset == hdrlen + 28)
+        with open(os.path.join(data_dir, str(g.minfile)), 'rb') as fd:
+            hdrlen = struct.unpack('!Q', fd.read(8))[0]
+            fd.read(hdrlen)
+            g.scan_checksum = fd.read(20)
+            g.offset = fd.tell()
+            assert(g.offset == hdrlen + 28)
 
-        scan()
-        g.size = g.offset
-        g.append_checksum = g.scan_checksum
+    scan()
+    g.size = g.offset
+    g.append_checksum = g.scan_checksum
 
-        row = g.db.execute('select min(file) from data').fetchone()
-        g.minfile = row[0] if row[0] is not None else g.maxfile
+    row = g.db.execute('select min(file) from data').fetchone()
+    g.minfile = row[0] if row[0] is not None else g.maxfile
 
-        for n in range(min_f, g.minfile) + range(g.maxfile+1, max_f+1):
-            os.remove(os.path.join(g.opt.data, str(n)))
-            log('removed file({0})'.format(n))
+    for n in range(min_f, g.minfile) + range(g.maxfile+1, max_f+1):
+        os.remove(os.path.join(data_dir, str(n)))
+        log('removed file({0})'.format(n))
 
-        f = os.open(os.path.join(g.opt.data, str(g.maxfile)), os.O_RDWR)
-        n = os.fstat(f).st_size
-        if n > g.offset:
-            os.ftruncate(f, g.offset)
-            os.fsync(f)
-            log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, n)
-        os.close(f)
+    f = os.open(os.path.join(data_dir, str(g.maxfile)), os.O_RDWR)
+    n = os.fstat(f).st_size
+    if n > g.offset:
+        os.ftruncate(f, g.offset)
+        os.fsync(f)
+        log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, n)
+    os.close(f)
 
-        os.fsync(dfd)
-        g.db.commit()
+    os.fsync(dfd)
+    g.db.commit()
 
-        if g.minfile < g.maxfile:
-            g.size_prev = os.path.getsize(
-                os.path.join(g.opt.data, str(g.maxfile-1)))
-        log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d)',
-            g.minfile, g.maxfile, g.offset, g.size, g.size_prev)
-    except:
-        log(traceback.format_exc())
-        time.sleep(10**6)
+    if g.minfile < g.maxfile:
+        g.size_prev = os.path.getsize(
+            os.path.join(data_dir, str(g.maxfile-1)))
+    log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d)',
+        g.minfile, g.maxfile, g.offset, g.size, g.size_prev)

@@ -9,14 +9,15 @@ logger.setLevel(logging.CRITICAL)
 
 
 class Lockr(object):
-    def __init__(self, servers):
+    def __init__(self, servers, timeout=10**8):
         self.servers = servers
         self.server = None
+        self.timeout = timeout
 
     def request(self, req, buf=''):
         req_begin = time.time()
         backoff = 1
-        while True:
+        while time.time() < req_begin + self.timeout:
             try:
                 if not self.server:
                     for srv in self.servers:
