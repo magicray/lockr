@@ -9,18 +9,32 @@ logger.setLevel(logging.CRITICAL)
 
 
 class Lockr(object):
-    def __init__(self, servers, timeout=15):
+    def __init__(self, servers):
         self.servers = servers
         self.server = None
-        self.timeout = timeout
-
-        self.offset = (0, 0)
-        self.keys = set()
 
     def request(self, req, buf=''):
         req_begin = time.time()
-        while time.time() < (req_begin + self.timeout):
+        backoff = 1
+        while True:
             try:
+                if not self.server:
+                    for srv in self.servers:
+                        try:
+                            t = time.time()
+                            s = msgio.Client(srv)
+                            s.send('state')
+                            stats = json.loads(s.recv())
+                            logger.debug('connected to(%s) msec(%d)',
+                                         srv, (time.time()-t)*1000)
+                            if 'leader' == stats['state']:
+                                self.server = s
+                                break
+
+                            s.close()
+                        except:
+                            logger.debug('connection to(%s) failed msec(%d)',
+                                         srv, (time.time()-t)*1000)
                 if self.server:
                     self.server.send(req, buf)
                     result = self.server.recv()
@@ -29,31 +43,13 @@ class Lockr(object):
                                     (time.time() - req_begin)*1000)
                     return result
 
-                for srv in self.servers:
-                    try:
-                        t = time.time()
-                        s = msgio.Client(srv)
-                        s.send('state')
-                        stats = json.loads(s.recv())
-                        logger.debug('connected to(%s) msec(%d)',
-                                     srv, (time.time()-t)*1000)
-                        if 'leader' == stats['state']:
-                            self.server = s
-                            logger.debug('connected to leader(%s)',
-                                         str(srv))
-                            break
-
-                        s.close()
-                    except:
-                        logger.debug('connection to(%s) failed msec(%d)',
-                                     srv, (time.time()-t)*1000)
+                time.sleep(backoff)
+                backoff = min(60, backoff*2)
             except:
                 if self.server:
                     self.server.close()
 
                 self.server = None
-
-        raise Exception('timed out {0}'.format(time.time()-req_begin))
 
     def state(self):
         return json.loads(self.request('state'))
@@ -121,18 +117,23 @@ class Lockr(object):
         return offset, result
 
     def watch(self, begin, end):
+        offset = (0, 0)
+        keys = dict()
+
         while True:
-            self.offset, ret = self.get(begin, end, self.offset)
-            result = dict(added=dict(), updated=dict())
+            offset, ret = self.get(begin, end, (offset[0], offset[1]+1))
+            result = dict(added=dict(),
+                          updated=dict(),
+                          deleted=set(keys)-set(ret))
+
             for key, (version, value) in ret.iteritems():
                 if value:
-                    if key in self.keys:
-                        result['updated'][key] = value
-                    else:
+                    if key not in keys:
                         result['added'][key] = value
+                    elif version > keys[key]:
+                        result['updated'][key] = value
 
-            result['deleted'] = self.keys - set(ret)
-            self.keys = set(ret)
+            keys = dict([(k, ret[k][0]) for k in ret])
 
             if result['added'] or result['updated'] or result['deleted']:
                 yield result

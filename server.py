@@ -660,7 +660,7 @@ def init(peers, opt):
     max_f_len = os.path.getsize(os.path.join(g.opt.data, str(max_f)))
     log('minfile(%d) maxfile(%d) maxfilelen(%d)', min_f, max_f, max_f_len)
 
-    if max_f_len < 104:
+    if max_f_len < 72:
         os.remove(os.path.join(g.opt.data, str(max_f)))
         log('removed file(%d) as it has no data', max_f)
         os._exit(0)

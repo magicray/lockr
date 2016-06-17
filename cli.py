@@ -74,7 +74,7 @@ class Client(cmd.Cmd):
 
     def do_test(self, line):
         while True:
-            for i in range(10000):
+            for i in range(100000):
                 while True:
                     key = '%05d' % (i)
                     offset, result = self.cli.get(key, key, (0, 0))
