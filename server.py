@@ -20,7 +20,7 @@ class g:
     watch = dict()
     acks = collections.deque()
     peers = dict()
-    followers = set()
+    followers = dict()
     quorum = 0
     state = ''
     minfile = 0
@@ -28,6 +28,8 @@ class g:
     offset = 0
     size_prev = 0
     size = 0
+    clock = 0
+    hdr = None
     scan_checksum = ''
     append_checksum = ''
     node = None
@@ -36,10 +38,16 @@ class g:
 
     @classmethod
     def json(cls):
+        rows = g.db.execute('select hdr from hdr where file = ?',
+                            (g.maxfile,)).fetchone()
+        g.hdr = json.loads(rows[0]) if rows else dict(vclock=dict())
+
         return json.dumps(dict(
             uptime=int(time.time()-g.start_time),
             state=g.state,
             node=g.node,
+            clock=g.clock,
+            hdr=g.hdr,
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
@@ -47,6 +55,8 @@ class g:
             size=g.size,
             pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
+                clock=v['clock'],
+                hdr=v['hdr'],
                 minfile=v['minfile'],
                 maxfile=v['maxfile'],
                 offset=v['offset'],
@@ -141,7 +151,7 @@ def replication_request(src, buf):
     if src not in g.followers:
         log('accepted (%s) as follower(%d)', src, len(g.followers)+1)
 
-    g.followers.add(src)
+    g.followers[src] = True
 
     if not g.state and len(g.followers) >= g.quorum:
         g.state = 'old-sync'
@@ -150,7 +160,7 @@ def replication_request(src, buf):
 
     in_sync = filter(lambda k: g.maxfile == g.peers[k]['maxfile'],
                      filter(lambda k: g.offset == g.peers[k]['offset'],
-                            g.followers))
+                            filter(lambda k: g.followers[k], g.followers)))
 
     if 'new-sync' == g.state and len(in_sync) >= g.quorum:
         g.state = 'leader'
@@ -168,10 +178,13 @@ def replication_request(src, buf):
         g.maxfile += 1
         g.offset = 0
 
+        vclk = dict([(f, g.peers[f]['clock']) for f in g.followers])
+        vclk[g.node] = g.clock
+        hdr = json.dumps(dict(vclock=vclk), sort_keys=True, indent=4)
         append(''.join([struct.pack('!Q', 0),
                         struct.pack('!Q', g.maxfile),
-                        struct.pack('!Q', 20),
-                        '%20d' % g.size_prev]))
+                        struct.pack('!Q', len(hdr)),
+                        hdr]))
 
         scan()
         g.state = 'new-sync'
@@ -222,15 +235,37 @@ def get_replication_responses():
     data_dir = g.conf['data']
 
     msgs = list()
-    for src in g.followers.copy():
+    for src in filter(lambda k: g.followers[k], g.followers):
         req = g.peers[src]
+
+        rows = g.db.execute('select hdr from hdr where file = ?',
+                        (req['maxfile'],)).fetchone()
+        m_vclock = json.loads(rows[0])['vclock'] if rows else dict()
+        p_vclock = req['hdr']['vclock']
+        if m_vclock and p_vclock:
+            assert(set(p_vclock).intersection(m_vclock))
+            for s in set(p_vclock).intersection(m_vclock):
+                if m_vclock[s] == p_vclock[s]:
+                    continue
+
+                log('vclock mismatch {0}'.format(json.dumps(m_vclock)))
+                log('peer({0} {1}'.format(src, json.dumps(p_vclock)))
+
+                if req['maxfile'] == g.maxfile and m_vclock[s] < p_vclock[s]:
+                    os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
+                    log('REMOVED file(%d) due to vclock conflict', g.maxfile)
+                    os._exit(0)
+
+                g.followers[src] = False
+                msgs.append(dict(dst=src, msg='replication_conflict'))
+                break
 
         if 0 == req['maxfile']:
             f = map(int, os.listdir(data_dir))
             if f:
                 log('sent replication-nextfile to(%s) file(%d)', src, min(f))
 
-                g.followers.remove(src)
+                g.followers[src] = False
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                                  buf=json.dumps(dict(filenum=min(f)))))
 
@@ -245,7 +280,7 @@ def get_replication_responses():
                     'truncate(%d)',
                     src, req['maxfile'], req['size'], fd.tell())
 
-                g.followers.remove(src)
+                g.followers[src] = False
                 msgs.append(dict(dst=src, msg='replication_truncate',
                                  buf=json.dumps(dict(truncate=fd.tell()))))
 
@@ -256,7 +291,7 @@ def get_replication_responses():
                 log('sent replication-nextfile to(%s) file(%d)',
                     src, req['maxfile']+1)
 
-                g.followers.remove(src)
+                g.followers[src] = False
                 msgs.append(dict(dst=src, msg='replication_nextfile',
                             buf=json.dumps(dict(filenum=req['maxfile']+1))))
 
@@ -266,7 +301,7 @@ def get_replication_responses():
                 log('sent replication-response to(%s) file(%d) offset(%d) '
                     'size(%d)', src, req['maxfile'], req['offset'], len(buf))
 
-                g.followers.remove(src)
+                g.followers[src] = False
                 msgs.append(dict(dst=src, msg='replication_response', buf=buf))
 
     return msgs
@@ -286,6 +321,11 @@ def replication_truncate(src, buf):
     log('file(%d) truncated(%d) original(%d)', g.maxfile, trunc, n)
     os._exit(0)
 
+
+def replication_conflict(src, buf):
+    os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
+    log('REMOVED file(%d) due to replication_conflict', g.maxfile)
+    os._exit(0)
 
 def replication_nextfile(src, buf):
     req = json.loads(buf)
@@ -328,6 +368,10 @@ def replication_response(src, buf):
 
         g.size = os.fstat(g.fd).st_size
 
+        if g.maxfile > 1 and not g.scan_checksum:
+            log('exiting to reinitialize checksum')
+            os._exit(0)
+
         scan()
 
         log('sent replication-request to(%s) file(%d) offset(%d) size(%d)',
@@ -369,7 +413,7 @@ def on_disconnect(src, exc, tb):
         os._exit(0)
 
     if src in g.followers:
-        g.followers.remove(src)
+        del(g.followers[src])
         log('removed follower(%s) remaining(%d)', src, len(g.followers))
 
     if g.state in ('old-sync', 'new-sync', 'leader'):
@@ -598,11 +642,13 @@ def scan(e_filenum=2**64, e_offset=2**64):
                            g.db.execute('insert or replace into data '
                                 'values(?,?,?,?,?)', (key, filenum,
                                 offset+8+i+24+key_len, ver, val_len))
+                           n_keys += 1
+                        elif 0 == key_len:
+                            g.db.execute('insert into hdr values(?, ?)',
+                                         (ver, buf[i+24+key_len:]))
                         else:
                             g.db.execute('delete from data where key=?',(key,))
 
-
-                        n_keys += 1
                         i += 24 + key_len + val_len
 
                     assert(i == len(buf))
@@ -642,6 +688,10 @@ def init(conf):
     g.db.execute('create index if not exists data_1 on data(file, offset)')
     g.db.execute('''create table if not exists txn(file unsigned,
         offset unsigned, primary key(file, offset))''')
+    g.db.execute('''create table if not exists hdr(file unsigned primary key,
+        hdr text)''')
+    g.db.execute('''create table if not exists kv(key text primary key,
+        value int)''')
 
     g.quorum = int(len(conf['nodes'])/2.0 + 0.6)
     g.node = '{0}:{1}'.format(*conf['port'])
@@ -653,9 +703,15 @@ def init(conf):
     dfd = os.open(data_dir, os.O_RDONLY)
     fcntl.flock(dfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
+    row = g.db.execute("select value from kv where key='clock'").fetchone()
+    g.clock = row[0] + 1 if(row) else 1
+    g.db.execute("insert or replace into kv values('clock', ?)", (g.clock,))
+
     files = map(int, os.listdir(data_dir))
     if not files:
         g.db.execute('delete from data')
+        g.db.execute('delete from txn')
+        g.db.execute('delete from hdr')
         g.db.commit()
         return
 
@@ -671,8 +727,8 @@ def init(conf):
     g.minfile = min_f
 
     g.db.execute('delete from data where file < ?', (min_f,))
-    g.db.execute('delete from txn where file < ?', (min_f,))
-    g.db.execute('delete from txn where file > ?', (max_f,))
+    g.db.execute('delete from txn where file < ? or file > ?', (min_f, max_f))
+    g.db.execute('delete from hdr where file < ? or file > ?', (min_f, max_f))
     g.db.execute('delete from txn where file = ? and offset > ?',
                  (max_f, max_f_len))
 
