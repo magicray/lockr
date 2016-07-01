@@ -15,7 +15,7 @@ def get_conf():
         cert='ssl.cert',
         data='data',
         index='index.db',
-        max_size=2**17,
+        max_size=2**16,
         repl_size=2**20,
         timeout=600)
         

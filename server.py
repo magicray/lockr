@@ -17,6 +17,7 @@ class g:
     fd = None
     db = None
     kv = set()
+    oldest = dict()
     watch = dict()
     acks = collections.deque()
     peers = dict()
@@ -34,13 +35,12 @@ class g:
     append_checksum = ''
     node = None
     commit_time = 0
+    committed = 0
     start_time = time.time()
 
     @classmethod
     def json(cls):
-        rows = g.db.execute('select hdr from hdr where file = ?',
-                            (g.maxfile,)).fetchone()
-        g.hdr = json.loads(rows[0]) if rows else dict(vclock=dict())
+        g.hdr = read_hdr(g.maxfile)
 
         return json.dumps(dict(
             uptime=int(time.time()-g.start_time),
@@ -53,6 +53,7 @@ class g:
             offset=g.offset,
             size_prev=g.size_prev,
             size=g.size,
+            committed=g.committed,
             pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
                 clock=v['clock'],
@@ -62,8 +63,17 @@ class g:
                 offset=v['offset'],
                 size=v['size'],
                 size_prev=v['size_prev'],
+                committed=v['committed'],
                 state=v['state'])) for k, v in g.peers.iteritems() if v])))
 
+
+def read_hdr(filenum):
+    row = g.db.execute('select value from data where key = ? and file = ?',
+                       (sqlite3.Binary(''), filenum)).fetchone()
+    if row:
+        return json.loads(row[0])
+
+    return dict(vclock=dict())
 
 def vote(src, buf):
     g.peers[src] = json.loads(buf)
@@ -88,6 +98,24 @@ def vote(src, buf):
                 g.maxfile -= 1
             except:
                 os._exit(0)
+
+    m_vclock = read_hdr(g.maxfile)['vclock']
+    p_vclock = g.peers[src]['hdr']['vclock']
+    if g.peers[src]['maxfile'] == g.maxfile:
+        for s in set(p_vclock).intersection(m_vclock):
+            if m_vclock[s] == p_vclock[s]:
+                continue
+
+            log('mismatch vclock{0}'.format(json.dumps(m_vclock)))
+            log('peer({0}) vclock{1}'.format(src, json.dumps(p_vclock)))
+
+            if m_vclock[s] < p_vclock[s]:
+                os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
+                log('REMOVED file(%d) due to vclock conflict', g.maxfile)
+                os._exit(0)
+
+            log('sent vclock-conflict to(%s)', src)
+            return dict(dst=src, msg='vclock_conflict')
 
     if g.peers[src]['state'] in ('old-sync', 'new-sync', 'leader'):
         g.state = 'following-' + src
@@ -137,6 +165,11 @@ def leader_conflict(src, buf):
     os._exit(0)
 
 
+def vclock_conflict(src, buf):
+    os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
+    log('REMOVED file(%d) due to replication_conflict', g.maxfile)
+    os._exit(0)
+
 def replication_request(src, buf):
     g.peers[src] = json.loads(buf)
 
@@ -147,6 +180,14 @@ def replication_request(src, buf):
     if g.state.startswith('following-'):
         log('rejecting replication-request from(%s)', src)
         raise Exception('reject-replication-request')
+
+    m_vclock = read_hdr(g.peers[src]['maxfile'])['vclock']
+    p_vclock = g.peers[src]['hdr']['vclock']
+    if p_vclock and m_vclock != p_vclock:
+        log('this : %s', m_vclock)
+        log('peer : %s', p_vclock)
+        log('sent vclock-conflict to(%s)', src)
+        return dict(msg='vclock_conflict')
 
     if src not in g.followers:
         log('accepted (%s) as follower(%d)', src, len(g.followers)+1)
@@ -185,7 +226,6 @@ def replication_request(src, buf):
                         struct.pack('!Q', g.maxfile),
                         struct.pack('!Q', len(hdr)),
                         hdr]))
-
         scan()
         g.state = 'new-sync'
         log('state(NEW-SYNC) file(%d) offset(%d) in_sync(%d)',
@@ -197,7 +237,6 @@ def replication_request(src, buf):
         return get_replication_responses()
 
     acks = list()
-    committed_offset = 0
     if 'leader' == g.state:
         offsets = list()
         for k, v in g.peers.iteritems():
@@ -205,10 +244,10 @@ def replication_request(src, buf):
                 offsets.append(v['offset'])
 
         if len(offsets) >= g.quorum:
-            committed_offset = sorted(offsets, reverse=True)[g.quorum-1]
+            g.committed = sorted(offsets, reverse=True)[g.quorum-1]
 
             while g.acks:
-                if g.acks[0][0] > committed_offset:
+                if g.acks[0][0] > g.committed:
                     break
 
                 offset, dst, keys = g.acks.popleft()
@@ -221,7 +260,7 @@ def replication_request(src, buf):
                     struct.pack('!Q', offset)])))
 
     if acks:
-        scan(g.maxfile, committed_offset)
+        scan(g.maxfile, g.committed)
         for k in g.watch.keys():
             f, o, src, buf = g.watch[k]
             if g.maxfile > f or (g.maxfile == f and g.offset > o):
@@ -237,28 +276,6 @@ def get_replication_responses():
     msgs = list()
     for src in filter(lambda k: g.followers[k], g.followers):
         req = g.peers[src]
-
-        rows = g.db.execute('select hdr from hdr where file = ?',
-                        (req['maxfile'],)).fetchone()
-        m_vclock = json.loads(rows[0])['vclock'] if rows else dict()
-        p_vclock = req['hdr']['vclock']
-        if m_vclock and p_vclock:
-            assert(set(p_vclock).intersection(m_vclock))
-            for s in set(p_vclock).intersection(m_vclock):
-                if m_vclock[s] == p_vclock[s]:
-                    continue
-
-                log('vclock mismatch {0}'.format(json.dumps(m_vclock)))
-                log('peer({0} {1}'.format(src, json.dumps(p_vclock)))
-
-                if req['maxfile'] == g.maxfile and m_vclock[s] < p_vclock[s]:
-                    os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
-                    log('REMOVED file(%d) due to vclock conflict', g.maxfile)
-                    os._exit(0)
-
-                g.followers[src] = False
-                msgs.append(dict(dst=src, msg='replication_conflict'))
-                break
 
         if 0 == req['maxfile']:
             f = map(int, os.listdir(data_dir))
@@ -302,6 +319,8 @@ def get_replication_responses():
                     'size(%d)', src, req['maxfile'], req['offset'], len(buf))
 
                 g.followers[src] = False
+                msgs.append(dict(dst=src, msg='replication_committed',
+                                 buf=g.json()))
                 msgs.append(dict(dst=src, msg='replication_response', buf=buf))
 
     return msgs
@@ -322,10 +341,10 @@ def replication_truncate(src, buf):
     os._exit(0)
 
 
-def replication_conflict(src, buf):
-    os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
-    log('REMOVED file(%d) due to replication_conflict', g.maxfile)
-    os._exit(0)
+def replication_committed(src, buf):
+    g.peers[src] = json.loads(buf)
+    g.committed = g.peers[src]['committed']
+
 
 def replication_nextfile(src, buf):
     req = json.loads(buf)
@@ -471,10 +490,14 @@ def get(src, buf):
     for begin_key, end_key in keys:
         rows = g.db.execute('''select key, file, offset, version, length
                                from data where key between ? and ?
+                               order by file, offset
                             ''', (begin_key, end_key)).fetchall()
 
-        for r in rows:
-            k, f, o, v, l = r
+        d = dict([(bytes(k), (f, o, v, l)) for k, f, o, v, l in rows])
+        for k, (f, o, v, l) in d.iteritems():
+            if 0 == v:
+                continue
+
             if (f == filenum and o > offset) or (f > filenum):
                 v_list[bytes(k)] = (f, o, v, l)
             else:
@@ -521,8 +544,9 @@ def put(src, buf):
         val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
         val = buf[i+24+key_len:i+24+key_len+val_len]
 
-        row = g.db.execute('select version from data where key=?',
-                           (sqlite3.Binary(key),)).fetchone()
+        row = g.db.execute('''select version from data where key=?
+                              order by file desc, offset desc limit 1
+                           ''', (sqlite3.Binary(key),)).fetchone()
         if (row and row[0] != ver) or (not row and 0 != ver):
             buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
@@ -548,12 +572,14 @@ def put(src, buf):
         buf_list.append(struct.pack('!Q', len(keys[key][1])))
         buf_list.append(keys[key][1])
 
-    rows = g.db.execute('''select key, file, offset, version, length from data
-                           where file < ?  order by file, offset limit ?
-                        ''', (g.maxfile, len(keys)*2)).fetchall()
+    gc = list()
+    for key, (filenum, offset, version, length) in g.oldest.iteritems():
+        if 0 == version:
+            assert(0 == length)
+            continue
 
-    for key, filenum, offset, version, length in rows:
-        key = bytes(key)
+        if filenum == g.maxfile:
+            continue
 
         if key not in g.kv and key not in keys:
             with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
@@ -567,7 +593,11 @@ def put(src, buf):
             buf_list.append(struct.pack('!Q', length))
             buf_list.append(buf)
 
+            gc.append(key)
+
     append(''.join(buf_list))
+    map(lambda k: g.oldest.pop(k, None), keys)
+    map(lambda k: g.oldest.pop(k, None), gc)
 
     g.acks.append((g.size, src, set(keys)))
     return get_replication_responses()
@@ -638,23 +668,16 @@ def scan(e_filenum=2**64, e_offset=2**64):
                         val_len = struct.unpack(
                             '!Q', buf[i+16+key_len:i+24+key_len])[0]
 
-                        if key_len > 0 and val_len > 0:
-                           g.db.execute('insert or replace into data '
-                                'values(?,?,?,?,?)', (key, filenum,
-                                offset+8+i+24+key_len, ver, val_len))
-                           n_keys += 1
-                        elif 0 == key_len:
-                            g.db.execute('insert into hdr values(?, ?)',
-                                         (ver, buf[i+24+key_len:]))
-                        else:
-                            g.db.execute('delete from data where key=?',(key,))
+                        g.db.execute('insert into data values(?,?,?,?,?,?)',
+                            (key, filenum, offset+8+i+24+key_len,
+                             ver if val_len else 0,
+                             val_len,
+                             None if key_len else buf[i+24+key_len:]))
 
+                        n_keys += 1
                         i += 24 + key_len + val_len
 
                     assert(i == len(buf))
-
-                    g.db.execute('insert into txn values(?, ?)',
-                                 (g.maxfile, g.offset))
 
                     if time.time() > g.commit_time + 1:
                         t = time.time()
@@ -664,8 +687,6 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                     n_size += len(buf) + 28
                     offset += len(buf) + 28
-
-                assert(offset == total_size)
 
             filenum += 1
             offset = 0
@@ -683,13 +704,10 @@ def scan(e_filenum=2**64, e_offset=2**64):
 def init(conf):
     g.conf = conf
     g.db = sqlite3.connect(g.conf['index'])
-    g.db.execute('''create table if not exists data(key blob primary key,
-        file unsigned, offset unsigned, version unsigned, length unsigned)''')
-    g.db.execute('create index if not exists data_1 on data(file, offset)')
-    g.db.execute('''create table if not exists txn(file unsigned,
-        offset unsigned, primary key(file, offset))''')
-    g.db.execute('''create table if not exists hdr(file unsigned primary key,
-        hdr text)''')
+    g.db.execute('''create table if not exists data(key blob, file unsigned,
+        offset unsigned, version unsigned, length unsigned, value blob)''')
+    g.db.execute('create index if not exists d1 on data(key)')
+    g.db.execute('create index if not exists d2 on data(file, offset)')
     g.db.execute('''create table if not exists kv(key text primary key,
         value int)''')
 
@@ -710,8 +728,6 @@ def init(conf):
     files = map(int, os.listdir(data_dir))
     if not files:
         g.db.execute('delete from data')
-        g.db.execute('delete from txn')
-        g.db.execute('delete from hdr')
         g.db.commit()
         return
 
@@ -719,28 +735,16 @@ def init(conf):
     max_f_len = os.path.getsize(os.path.join(data_dir, str(max_f)))
     log('minfile(%d) maxfile(%d) maxfilelen(%d)', min_f, max_f, max_f_len)
 
-    if max_f_len < 72:
-        os.remove(os.path.join(data_dir, str(max_f)))
-        log('removed file(%d) as it has no data', max_f)
-        os._exit(0)
-
     g.minfile = min_f
 
-    g.db.execute('delete from data where file < ?', (min_f,))
-    g.db.execute('delete from txn where file < ? or file > ?', (min_f, max_f))
-    g.db.execute('delete from hdr where file < ? or file > ?', (min_f, max_f))
-    g.db.execute('delete from txn where file = ? and offset > ?',
-                 (max_f, max_f_len))
+    g.db.execute('''delete from data where file < ? or file > ?
+        or (file = ? and offset > ?)''', (min_f, max_f, max_f, max_f_len))
 
-    row = g.db.execute('select file, offset from txn order by file desc, '
-                       'offset desc limit 1').fetchone()
+    row = g.db.execute('''select file, offset, length from data
+        order by file desc, offset desc limit 1''').fetchone()
     if row:
-        g.db.execute('delete from data where file > ?', (row[0],))
-        g.db.execute('delete from data where file = ? and offset > ?',
-                     (row[0], row[1]))
+        g.maxfile, g.offset = row[0], row[1] + row[2] + 20
 
-    if row:
-        g.maxfile, g.offset = row
         with open(os.path.join(data_dir, str(g.maxfile)), 'rb') as fd:
             fd.seek(g.offset - 20)
             g.scan_checksum = fd.read(20)
@@ -759,12 +763,15 @@ def init(conf):
     g.size = g.offset
     g.append_checksum = g.scan_checksum
 
-    row = g.db.execute('select min(file) from data').fetchone()
-    g.minfile = row[0] if row[0] is not None else g.maxfile
-
-    for n in range(min_f, g.minfile) + range(g.maxfile+1, max_f+1):
-        os.remove(os.path.join(data_dir, str(n)))
-        log('removed file({0})'.format(n))
+    for filenum in range(min_f, max_f-1):
+        rows = g.db.execute('''select distinct max(file) from data
+                               where key in(select key from data where file=?)
+                               group by key
+                            ''', (filenum,)).fetchall()
+        if all(map(lambda k: k != filenum, rows)):
+            os.remove(os.path.join(data_dir, str(filenum)))
+            log('removed file(%d)', filenum)
+            os._exit(0)
 
     f = os.open(os.path.join(data_dir, str(g.maxfile)), os.O_RDWR)
     n = os.fstat(f).st_size
@@ -776,6 +783,13 @@ def init(conf):
 
     os.fsync(dfd)
     g.db.commit()
+
+    rows = g.db.execute('''select key, max(file), max(offset), version, length
+                           from data group by key order by file, offset limit
+                           1000000
+                        ''').fetchall()
+
+    g.oldest = dict([(bytes(k), (f, o, v, l)) for k, f, o, v, l in rows])
 
     if g.minfile < g.maxfile:
         g.size_prev = os.path.getsize(
