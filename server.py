@@ -17,7 +17,7 @@ class g:
     fd = None
     db = None
     kv = set()
-    oldest = dict()
+    oldest = list()
     watch = dict()
     acks = collections.deque()
     peers = dict()
@@ -70,10 +70,8 @@ class g:
 def read_hdr(filenum):
     row = g.db.execute('select value from data where key = ? and file = ?',
                        (sqlite3.Binary(''), filenum)).fetchone()
-    if row:
-        return json.loads(row[0])
 
-    return dict(vclock=dict())
+    return json.loads(row[0]) if row else dict(vclock=dict())
 
 def vote(src, buf):
     g.peers[src] = json.loads(buf)
@@ -169,6 +167,7 @@ def vclock_conflict(src, buf):
     os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
     log('REMOVED file(%d) due to replication_conflict', g.maxfile)
     os._exit(0)
+
 
 def replication_request(src, buf):
     g.peers[src] = json.loads(buf)
@@ -495,7 +494,11 @@ def get(src, buf):
 
         d = dict([(bytes(k), (f, o, v, l)) for k, f, o, v, l in rows])
         for k, (f, o, v, l) in d.iteritems():
+            if '' == k:
+                continue
+
             if 0 == v:
+                assert(0 == l)
                 continue
 
             if (f == filenum and o > offset) or (f > filenum):
@@ -510,7 +513,7 @@ def get(src, buf):
         result.append(struct.pack('!Q', length))
 
         with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
-            fd.seek(offset, 0)
+            fd.seek(offset)
             buf = fd.read(length)
             assert(len(buf) == length)
             result.append(buf)
@@ -572,16 +575,17 @@ def put(src, buf):
         buf_list.append(struct.pack('!Q', len(keys[key][1])))
         buf_list.append(keys[key][1])
 
-    gc = list()
-    for key, (filenum, offset, version, length) in g.oldest.iteritems():
-        if 0 == version:
-            assert(0 == length)
-            continue
-
-        if filenum == g.maxfile:
-            continue
+    count = 0
+    while g.oldest and count < len(keys):
+        key, filenum, offset, version, length = g.oldest.pop()
 
         if key not in g.kv and key not in keys:
+            row = g.db.execute('''select version from data where key=?
+                                  order by file desc, offset desc limit 1
+                               ''', (sqlite3.Binary(key),)).fetchone()
+            if row[0] != version:
+                continue
+
             with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
                 fd.seek(offset)
                 buf = fd.read(length)
@@ -593,11 +597,9 @@ def put(src, buf):
             buf_list.append(struct.pack('!Q', length))
             buf_list.append(buf)
 
-            gc.append(key)
+            count += 1
 
     append(''.join(buf_list))
-    map(lambda k: g.oldest.pop(k, None), keys)
-    map(lambda k: g.oldest.pop(k, None), gc)
 
     g.acks.append((g.size, src, set(keys)))
     return get_replication_responses()
@@ -731,14 +733,13 @@ def init(conf):
         g.db.commit()
         return
 
-    min_f, max_f = min(files), max(files)
-    max_f_len = os.path.getsize(os.path.join(data_dir, str(max_f)))
-    log('minfile(%d) maxfile(%d) maxfilelen(%d)', min_f, max_f, max_f_len)
+    g.minfile, g.maxfile = min(files), max(files)
+    g.size = os.path.getsize(os.path.join(data_dir, str(g.maxfile)))
+    log('minfile(%d) maxfile(%d) maxfilelen(%d)', g.minfile, g.maxfile, g.size)
 
-    g.minfile = min_f
-
-    g.db.execute('''delete from data where file < ? or file > ?
-        or (file = ? and offset > ?)''', (min_f, max_f, max_f, max_f_len))
+    g.db.execute('''delete from data where
+                    (file < ?) or (file > ?) or (file = ? and offset > ?)
+                 ''', (g.minfile, g.maxfile, g.maxfile, g.size))
 
     row = g.db.execute('''select file, offset, length from data
         order by file desc, offset desc limit 1''').fetchone()
@@ -750,7 +751,7 @@ def init(conf):
             g.scan_checksum = fd.read(20)
             assert(20 == len(g.scan_checksum))
     else:
-        g.maxfile = min_f
+        g.maxfile = g.minfile
 
         with open(os.path.join(data_dir, str(g.minfile)), 'rb') as fd:
             hdrlen = struct.unpack('!Q', fd.read(8))[0]
@@ -760,39 +761,48 @@ def init(conf):
             assert(g.offset == hdrlen + 28)
 
     scan()
-    g.size = g.offset
-    g.append_checksum = g.scan_checksum
 
-    for filenum in range(min_f, max_f-1):
-        rows = g.db.execute('''select distinct max(file) from data
-                               where key in(select key from data where file=?)
-                               group by key
-                            ''', (filenum,)).fetchall()
-        if all(map(lambda k: k != filenum, rows)):
-            os.remove(os.path.join(data_dir, str(filenum)))
-            log('removed file(%d)', filenum)
-            os._exit(0)
-
-    f = os.open(os.path.join(data_dir, str(g.maxfile)), os.O_RDWR)
-    n = os.fstat(f).st_size
-    if n > g.offset:
+    if g.size > g.offset:
+        f = os.open(os.path.join(data_dir, str(g.maxfile)), os.O_RDWR)
         os.ftruncate(f, g.offset)
         os.fsync(f)
-        log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, n)
-    os.close(f)
+        os.close(f)
+        log('file(%d) truncated(%d) original(%d)', g.maxfile, g.offset, g.size)
 
-    os.fsync(dfd)
+    g.size = g.offset
+    g.append_checksum = g.scan_checksum
     g.db.commit()
 
-    rows = g.db.execute('''select key, max(file), max(offset), version, length
-                           from data group by key order by file, offset limit
-                           1000000
-                        ''').fetchall()
+    rows = g.db.execute('''select distinct key, file from data
+                           where key in(select key from data where file = ?)
+                        ''', (g.minfile,)).fetchall()
+    keys = dict([(bytes(r[0]), False) for r in rows])
+    for k, f in rows:
+        if g.minfile < f < g.maxfile-1:
+            keys[bytes(k)] = True
 
-    g.oldest = dict([(bytes(k), (f, o, v, l)) for k, f, o, v, l in rows])
+    if all(map(lambda k: keys[k], keys)):
+        os.remove(os.path.join(data_dir, str(g.minfile)))
+        os.fsync(dfd)
+        log('removed file(%d) as it contains overwritten values', g.minfile)
+        os._exit(0)
+
+    rows = g.db.execute('''select key, file, offset, version, length
+                           from data where file < ? order by file, offset 
+                           limit 1000000''', (g.maxfile,)).fetchall()
+    if rows:
+        keys = set()
+        for i in range(len(rows)-1, -1, -1):
+            k, (f, o, v, l) = bytes(rows[i][0]), rows[i][1:]
+
+            if k not in keys and k != '':
+                assert((v == 0 and l == 0) or (v > 0 and l > 0))
+                keys.add(k)
+                if v > 0:
+                    g.oldest.append((k, f, o, v, l))
 
     if g.minfile < g.maxfile:
-        g.size_prev = os.path.getsize(
-            os.path.join(data_dir, str(g.maxfile-1)))
-    log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d)',
-        g.minfile, g.maxfile, g.offset, g.size, g.size_prev)
+        g.size_prev = os.path.getsize(os.path.join(data_dir, str(g.maxfile-1)))
+
+    log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d) oldest(%d)',
+        g.minfile, g.maxfile, g.offset, g.size, g.size_prev, len(g.oldest))

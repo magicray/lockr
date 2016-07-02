@@ -85,3 +85,7 @@ class Client(cmd.Cmd):
                     print((req, res))
                     if 0 == res[0]:
                         break
+
+                    #if 1 != res[0]:
+                    #    import os
+                    #    os._exit(0)
