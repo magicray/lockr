@@ -73,7 +73,7 @@ def read_hdr(filenum):
 
     return json.loads(row[0]) if row else dict(vclock=dict())
 
-def vote(src, buf):
+def replication_connect(src, buf):
     g.peers[src] = json.loads(buf)
 
     if g.state:
@@ -412,7 +412,7 @@ def on_message(src, msg, buf):
 
 
 def on_connect(src):
-    return dict(msg='vote', buf=g.json())
+    return dict(msg='replication_connect', buf=g.json())
 
 
 def on_disconnect(src, exc, tb):
@@ -456,7 +456,7 @@ def get(src, buf):
                 g.watch[src] = (filenum, offset, src, buf)
                 return
 
-    keys = list()
+    keys = dict()
     i = 16
     while i < len(buf):
         begin_len = struct.unpack('!Q', buf[i:i+8])[0]
@@ -474,7 +474,17 @@ def get(src, buf):
         else:
             end = sqlite3.Binary(end)
 
-        keys.append((begin, end))
+        rows = g.db.execute('''select key, file, offset, version, length
+                               from data indexed by d1
+                               where key between ? and ?
+                            ''', (begin, end)).fetchall()
+        for k, f, o, v, l in rows:
+            k = bytes(k)
+
+            if k not in keys:
+                keys[k] = (f, o, v, l)
+            elif (f > keys[k][0]) or (keys[k][0] == f and o > keys[k][1]):
+                keys[k] = (f, o, v, l)
 
         i += 16 + begin_len + end_len
 
@@ -484,45 +494,28 @@ def get(src, buf):
               struct.pack('!Q', g.maxfile),
               struct.pack('!Q', g.offset)]
 
-    k_list = dict()
-    v_list = dict()
-    for begin_key, end_key in keys:
-        rows = g.db.execute('''select key, file, offset, version, length
-                               from data where key between ? and ?
-                               order by file, offset
-                            ''', (begin_key, end_key)).fetchall()
+    for k, (f, o, v, l) in keys.iteritems():
+        if '' == k:
+            continue
 
-        d = dict([(bytes(k), (f, o, v, l)) for k, f, o, v, l in rows])
-        for k, (f, o, v, l) in d.iteritems():
-            if '' == k:
-                continue
+        if 0 == v:
+            assert(0 == l)
+            continue
 
-            if 0 == v:
-                assert(0 == l)
-                continue
+        result.append(struct.pack('!Q', len(k)))
+        result.append(k)
+        result.append(struct.pack('!Q', v))
 
-            if (f == filenum and o > offset) or (f > filenum):
-                v_list[bytes(k)] = (f, o, v, l)
-            else:
-                k_list[bytes(k)] = (f, o, v, l)
+        if (f == filenum and o > offset) or (f > filenum):
+            result.append(struct.pack('!Q', l))
 
-    for key, (filenum, offset, version, length) in v_list.iteritems():
-        result.append(struct.pack('!Q', len(key)))
-        result.append(key)
-        result.append(struct.pack('!Q', version))
-        result.append(struct.pack('!Q', length))
-
-        with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
-            fd.seek(offset)
-            buf = fd.read(length)
-            assert(len(buf) == length)
-            result.append(buf)
-
-    for key, (filenum, offset, version, length) in k_list.iteritems():
-        result.append(struct.pack('!Q', len(key)))
-        result.append(key)
-        result.append(struct.pack('!Q', version))
-        result.append(struct.pack('!Q', 0))
+            with open(os.path.join(g.conf['data'], str(f)), 'rb') as fd:
+                fd.seek(o)
+                b = fd.read(l)
+                assert(len(b) == l)
+                result.append(b)
+        else:
+            result.append(struct.pack('!Q', 0))
 
     return dict(dst=src, buf=''.join(result))
 
@@ -681,11 +674,12 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                     assert(i == len(buf))
 
-                    if time.time() > g.commit_time + 1:
+                    if time.time() > g.commit_time:
                         t = time.time()
                         g.db.commit()
-                        log('db commit in msec(%d)', (time.time()-t)*1000)
-                        g.commit_time = time.time()
+                        t = time.time()-t
+                        log('db commit in msec(%d)', t*1000)
+                        g.commit_time = time.time() + t*10
 
                     n_size += len(buf) + 28
                     offset += len(buf) + 28
@@ -708,7 +702,8 @@ def init(conf):
     g.db = sqlite3.connect(g.conf['index'])
     g.db.execute('''create table if not exists data(key blob, file unsigned,
         offset unsigned, version unsigned, length unsigned, value blob)''')
-    g.db.execute('create index if not exists d1 on data(key)')
+    g.db.execute('''create index if not exists d1 on data(key, file, offset,
+        version, length)''')
     g.db.execute('create index if not exists d2 on data(file, offset)')
     g.db.execute('''create table if not exists kv(key text primary key,
         value int)''')
