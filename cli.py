@@ -3,6 +3,7 @@ import shlex
 import client
 import pprint
 import struct
+import traceback
 
 
 class Client(cmd.Cmd):
@@ -34,7 +35,8 @@ class Client(cmd.Cmd):
 
     def get(self, line, values_from):
         begin, end = self.parse_line(line)
-        offset, result = self.cli.get(begin, end, values_from)
+        code, offset, result = self.cli.get(begin, end, values_from)
+        assert(0 == code)
         for k in sorted(result.keys()):
             print('{0} <{1}> {2}'.format(k, result[k][0], result[k][1]))
 
@@ -54,7 +56,8 @@ class Client(cmd.Cmd):
         elif 1 == code:
             print('version mismatch for the following keys:-')
             for k, v in value.iteritems():
-                print('{0} <{1}>'.format(k, v))
+                if v:
+                    print('{0} <{1}>'.format(k, v))
         else:
             print(value)
 
@@ -70,14 +73,14 @@ class Client(cmd.Cmd):
                     for k in sorted(result['deleted']):
                         print('DEL {0}'.format(k))
             except:
-                pass
+                traceback.print_exc()
 
     def do_test(self, line):
         while True:
             for i in range(100000):
                 while True:
                     key = '%05d' % (i)
-                    offset, result = self.cli.get(key, key, (0, 0))
+                    code, offset, result = self.cli.get(key, key, (0, 0))
                     prev = result.get(key, (0, '0'))
                     new = str(int(prev[1]) + 1)
                     req  = {key: (prev[0], new)}
@@ -85,7 +88,3 @@ class Client(cmd.Cmd):
                     print((req, res))
                     if 0 == res[0]:
                         break
-
-                    #if 1 != res[0]:
-                    #    import os
-                    #    os._exit(0)

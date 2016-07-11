@@ -92,7 +92,8 @@ class Lockr(object):
             struct.pack('!Q', len(end)),
             end]))
 
-        if 0 != struct.unpack('!B', buf[0])[0]:
+        code = struct.unpack('!B', buf[0])[0]
+        if code > 1:
             raise Exception(buf[1:])
 
         offset = (struct.unpack('!Q', buf[1:9])[0],
@@ -115,26 +116,34 @@ class Lockr(object):
 
         assert(i == len(buf))
 
-        return offset, result
+        return code, offset, result
 
     def watch(self, begin, end):
         offset = (0, 0)
         keys = dict()
 
         while True:
-            offset, ret = self.get(begin, end, (offset[0], offset[1]+1))
-            result = dict(added=dict(),
-                          updated=dict(),
-                          deleted=set(keys)-set(ret))
+            code, offset, ret = self.get(begin, end, (offset[0], offset[1]+1))
+            result = dict(added=dict(), updated=dict(), deleted=set())
 
             for key, (version, value) in ret.iteritems():
                 if value:
                     if key not in keys:
                         result['added'][key] = value
+                        keys[key] = version
                     elif version > keys[key]:
                         result['updated'][key] = value
+                        keys[key] = version
+                else:
+                    if key in keys:
+                        result['deleted'].add(key)
+                    keys.pop(key, None)
 
-            keys = dict([(k, ret[k][0]) for k in ret])
+            if 0 == code:
+                for k in set(keys)-set(result['added'])-set(result['updated']):
+                    if k in keys:
+                        result['deleted'].add(k)
+                    keys.pop(k, None)
 
             if result['added'] or result['updated'] or result['deleted']:
                 yield result

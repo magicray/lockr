@@ -24,7 +24,7 @@ class g:
     followers = dict()
     quorum = 0
     state = ''
-    minfile = 0
+    minfile = 1
     maxfile = 0
     offset = 0
     size_prev = 0
@@ -36,6 +36,7 @@ class g:
     node = None
     commit_time = 0
     committed = 0
+    version=1
     start_time = time.time()
 
     @classmethod
@@ -54,6 +55,7 @@ class g:
             size_prev=g.size_prev,
             size=g.size,
             committed=g.committed,
+            version=g.version,
             pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
                 clock=v['clock'],
@@ -222,10 +224,11 @@ def replication_request(src, buf):
         vclk[g.node] = g.clock
         hdr = json.dumps(dict(vclock=vclk), sort_keys=True, indent=4)
         append(''.join([struct.pack('!Q', 0),
-                        struct.pack('!Q', g.maxfile),
+                        struct.pack('!Q', g.version),
                         struct.pack('!Q', len(hdr)),
                         hdr]))
         scan()
+        g.version += 1
         g.state = 'new-sync'
         log('state(NEW-SYNC) file(%d) offset(%d) in_sync(%d)',
             g.maxfile-1, g.size_prev, len(in_sync))
@@ -450,11 +453,9 @@ def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
 
-    if filenum != 2**64-1 or offset != 2**64-1:
-        if g.maxfile <= filenum:
-            if g.maxfile == filenum and g.offset < offset:
-                g.watch[src] = (filenum, offset, src, buf)
-                return
+    if (filenum > g.maxfile) or (filenum == g.maxfile and offset > g.offset):
+        g.watch[src] = (filenum, offset, src, buf)
+        return
 
     keys = dict()
     i = 16
@@ -476,21 +477,21 @@ def get(src, buf):
 
         rows = g.db.execute('''select key, file, offset, version, length
                                from data indexed by d1
-                               where key between ? and ?
-                            ''', (begin, end)).fetchall()
+                               where file > ? and key between ? and ?
+                            ''', (filenum-1, begin, end)).fetchall()
         for k, f, o, v, l in rows:
-            k = bytes(k)
+            if f == filenum and o < offset:
+                continue
 
-            if k not in keys:
-                keys[k] = (f, o, v, l)
-            elif (f > keys[k][0]) or (keys[k][0] == f and o > keys[k][1]):
+            k = bytes(k)
+            if k not in keys or v > keys[k][2]:
                 keys[k] = (f, o, v, l)
 
         i += 16 + begin_len + end_len
 
     assert(i == len(buf))
 
-    result = [struct.pack('!B', 0),
+    result = [struct.pack('!B', 0 if filenum < g.minfile else 1),
               struct.pack('!Q', g.maxfile),
               struct.pack('!Q', g.offset)]
 
@@ -498,24 +499,17 @@ def get(src, buf):
         if '' == k:
             continue
 
-        if 0 == v:
-            assert(0 == l)
-            continue
-
         result.append(struct.pack('!Q', len(k)))
         result.append(k)
         result.append(struct.pack('!Q', v))
+        result.append(struct.pack('!Q', l))
 
-        if (f == filenum and o > offset) or (f > filenum):
-            result.append(struct.pack('!Q', l))
-
+        if l > 0:
             with open(os.path.join(g.conf['data'], str(f)), 'rb') as fd:
                 fd.seek(o)
                 b = fd.read(l)
                 assert(len(b) == l)
                 result.append(b)
-        else:
-            result.append(struct.pack('!Q', 0))
 
     return dict(dst=src, buf=''.join(result))
 
@@ -540,7 +534,8 @@ def put(src, buf):
         val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
         val = buf[i+24+key_len:i+24+key_len+val_len]
 
-        row = g.db.execute('''select version from data where key=?
+        row = g.db.execute('''select version from data indexed by d2
+                              where key = ?
                               order by file desc, offset desc limit 1
                            ''', (sqlite3.Binary(key),)).fetchone()
         if (row and row[0] != ver) or (not row and 0 != ver):
@@ -548,7 +543,7 @@ def put(src, buf):
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', row[0] if row else 0))
 
-        keys[key] = (ver+1 if val else 0, val)
+        keys[key] = val
 
         i += 24 + key_len + val_len
 
@@ -564,35 +559,42 @@ def put(src, buf):
     for key in keys:
         buf_list.append(struct.pack('!Q', len(key)))
         buf_list.append(key)
-        buf_list.append(struct.pack('!Q', keys[key][0]))
-        buf_list.append(struct.pack('!Q', len(keys[key][1])))
-        buf_list.append(keys[key][1])
+        buf_list.append(struct.pack('!Q', g.version))
+        buf_list.append(struct.pack('!Q', len(keys[key])))
+        buf_list.append(keys[key])
 
     count = 0
     while g.oldest and count < len(keys):
         key, filenum, offset, version, length = g.oldest.pop()
 
+        if 0 == length:
+            continue
+
         if key not in g.kv and key not in keys:
-            row = g.db.execute('''select version from data where key=?
+            row = g.db.execute('''select version, length
+                                  from data indexed by d2
+                                  where key = ?
                                   order by file desc, offset desc limit 1
                                ''', (sqlite3.Binary(key),)).fetchone()
             if row[0] != version:
+                assert(row[0] > version)
                 continue
-
-            with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
-                fd.seek(offset)
-                buf = fd.read(length)
-                assert(len(buf) == length)
 
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', version))
             buf_list.append(struct.pack('!Q', length))
-            buf_list.append(buf)
+
+            with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
+                fd.seek(offset)
+                buf = fd.read(length)
+                assert(len(buf) == length)
+                buf_list.append(buf)
 
             count += 1
 
     append(''.join(buf_list))
+    g.version += 1
 
     g.acks.append((g.size, src, set(keys)))
     return get_replication_responses()
@@ -664,9 +666,7 @@ def scan(e_filenum=2**64, e_offset=2**64):
                             '!Q', buf[i+16+key_len:i+24+key_len])[0]
 
                         g.db.execute('insert into data values(?,?,?,?,?,?)',
-                            (key, filenum, offset+8+i+24+key_len,
-                             ver if val_len else 0,
-                             val_len,
+                            (key, filenum, offset+8+i+24+key_len, ver, val_len,
                              None if key_len else buf[i+24+key_len:]))
 
                         n_keys += 1
@@ -702,9 +702,10 @@ def init(conf):
     g.db = sqlite3.connect(g.conf['index'])
     g.db.execute('''create table if not exists data(key blob, file unsigned,
         offset unsigned, version unsigned, length unsigned, value blob)''')
-    g.db.execute('''create index if not exists d1 on data(key, file, offset,
+    g.db.execute('''create index if not exists d1 on data(file, offset, key,
         version, length)''')
-    g.db.execute('create index if not exists d2 on data(file, offset)')
+    g.db.execute('''create index if not exists d2 on data(key, file, offset,
+        version, length)''')
     g.db.execute('''create table if not exists kv(key text primary key,
         value int)''')
 
@@ -790,14 +791,15 @@ def init(conf):
         for i in range(len(rows)-1, -1, -1):
             k, (f, o, v, l) = bytes(rows[i][0]), rows[i][1:]
 
-            if k not in keys and k != '':
-                assert((v == 0 and l == 0) or (v > 0 and l > 0))
-                keys.add(k)
-                if v > 0:
-                    g.oldest.append((k, f, o, v, l))
+            if k != '' and (k not in g.oldest or v > g.oldest[k][2]):
+                g.oldest.append((k, f, o, v, l))
 
     if g.minfile < g.maxfile:
         g.size_prev = os.path.getsize(os.path.join(data_dir, str(g.maxfile-1)))
+
+    row = g.db.execute('select max(version) from data').fetchone()
+    if row:
+        g.version = row[0] + 1
 
     log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d) oldest(%d)',
         g.minfile, g.maxfile, g.offset, g.size, g.size_prev, len(g.oldest))
