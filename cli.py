@@ -2,9 +2,11 @@ import cmd
 import shlex
 import client
 import pprint
-import struct
+import logging
 import traceback
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.CRITICAL)
 
 class Client(cmd.Cmd):
     prompt = '>'
@@ -22,29 +24,11 @@ class Client(cmd.Cmd):
     def do_state(self, line):
         print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
-    def parse_line(self, line):
-        begin, end = '', ''
-        if line:
-            l = shlex.split(line)
-            if 1 == len(l):
-                begin = l[0]
-                end = begin + struct.pack('!B', 255)
-            else:
-                begin, end = l[0], l[1]
-        return begin, end
-
-    def get(self, line, values_from):
-        begin, end = self.parse_line(line)
-        code, offset, result = self.cli.get(begin, end, values_from)
+    def do_get(self, line):
+        code, offset, result = self.cli.get(shlex.split(line))
         assert(0 == code)
         for k in sorted(result.keys()):
             print('{0} <{1}> {2}'.format(k, result[k][0], result[k][1]))
-
-    def do_keys(self, line):
-        self.get(line, (2**64-1, 2**64-1))
-
-    def do_get(self, line):
-        self.get(line, (0, 0))
 
     def do_put(self, line):
         cmd = shlex.split(line)
@@ -62,10 +46,9 @@ class Client(cmd.Cmd):
             print(value)
 
     def do_watch(self, line):
-        begin, end = self.parse_line(line)
         while True:
             try:
-                for result in self.cli.watch(begin, end):
+                for result in self.cli.watch(shlex.split(line)):
                     for k in sorted(result['added'].keys()):
                         print('ADD {0} - {1}'.format(k, result['added'][k]))
                     for k in sorted(result['updated'].keys()):
@@ -80,11 +63,11 @@ class Client(cmd.Cmd):
             for i in range(100000):
                 while True:
                     key = '%05d' % (i)
-                    code, offset, result = self.cli.get(key, key, (0, 0))
-                    prev = result.get(key, (0, '0'))
-                    new = str(int(prev[1]) + 1)
+                    code, offset, result = self.cli.get([key])
+                    prev = result[key]
+                    new = str(int(prev[1] if prev[1] else 0) + 1)
                     req  = {key: (prev[0], new)}
                     res = self.cli.put(req)
-                    print((req, res))
+                    logger.critical((req, res))
                     if 0 == res[0]:
                         break

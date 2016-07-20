@@ -83,14 +83,15 @@ class Lockr(object):
 
         return struct.unpack('!B', buf[0])[0], buf[1:]
 
-    def get(self, begin, end, offset=(0, 0)):
-        buf = self.request('get', ''.join([
-            struct.pack('!Q', offset[0]),
-            struct.pack('!Q', offset[1]),
-            struct.pack('!Q', len(begin)),
-            begin,
-            struct.pack('!Q', len(end)),
-            end]))
+    def get(self, keys, offset=(0, 0)):
+        buf_list = [struct.pack('!Q', offset[0]),
+                    struct.pack('!Q', offset[1])]
+
+        for key in keys:
+            buf_list.append(struct.pack('!Q', len(key)))
+            buf_list.append(key)
+
+        buf = self.request('get', ''.join(buf_list))
 
         code = struct.unpack('!B', buf[0])[0]
         if code > 1:
@@ -118,12 +119,12 @@ class Lockr(object):
 
         return code, offset, result
 
-    def watch(self, begin, end):
+    def watch(self, watched):
         offset = (0, 0)
         keys = dict()
 
         while True:
-            code, offset, ret = self.get(begin, end, (offset[0], offset[1]+1))
+            code, offset, ret = self.get(watched, (offset[0], offset[1]+1))
             result = dict(added=dict(), updated=dict(), deleted=set())
 
             for key, (version, value) in ret.iteritems():
