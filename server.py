@@ -20,6 +20,7 @@ class g:
     oldest = collections.deque()
     watch = dict()
     acks = collections.deque()
+    conns = set()
     peers = dict()
     followers = dict()
     quorum = 0
@@ -37,7 +38,7 @@ class g:
     commit_time = 0
     committed = 0
     uncommitted = collections.deque()
-    version=1
+    version = 1
     start_time = time.time()
 
     @classmethod
@@ -56,6 +57,7 @@ class g:
             size_prev=g.size_prev,
             size=g.size,
             committed=g.committed,
+            conns=len(g.conns),
             version=g.version,
             pending=[len(g.kv), len(g.acks), len(g.watch)],
             peers=dict([(k, dict(
@@ -80,6 +82,7 @@ def read_hdr(filenum):
         buf = fd.read(hdrlen)
         assert(len(buf) == hdrlen)
         return json.loads(buf[24:])
+
 
 def replication_connect(src, buf):
     g.peers[src] = json.loads(buf)
@@ -270,6 +273,10 @@ def replication_request(src, buf):
     if acks:
         scan(g.maxfile, g.committed)
         db_sync()
+
+        for p in g.followers:
+            acks.append(dict(dst=p, msg='replication_committed', buf=g.json()))
+
         for k in g.watch.keys():
             f, o, src, buf = g.watch[k]
             if g.maxfile > f or (g.maxfile == f and g.offset > o):
@@ -280,25 +287,6 @@ def replication_request(src, buf):
 
     return acks + get_replication_responses()
 
-
-def db_sync():
-    while g.uncommitted:
-        key, filenum, offset, version, length = g.uncommitted[0]
-
-        if filenum == g.maxfile and offset > g.committed:
-            break
-
-        key, filenum, offset, version, length = g.uncommitted.popleft()
-
-        g.db.execute('insert or replace into data values(?,?,?,?,?)',
-            (key, filenum, offset, version, length))
-
-    if time.time() > g.commit_time:
-        t = time.time()
-        g.db.commit()
-        t = time.time() - t
-        log('db sync in msec(%d)', t*1000)
-        g.commit_time = time.time() + t*10
 
 def get_replication_responses():
     data_dir = g.conf['data']
@@ -346,11 +334,9 @@ def get_replication_responses():
             buf = fd.read(g.conf['repl_size'])
             if buf:
                 log('sent replication-response to(%s) file(%d) offset(%d) '
-                    'size(%d)', src, req['maxfile'], req['offset'], len(buf))
+                    'size(%d)', src, req['maxfile'], req['size'], len(buf))
 
                 g.followers[src] = False
-                msgs.append(dict(dst=src, msg='replication_committed',
-                                 buf=g.json()))
                 msgs.append(dict(dst=src, msg='replication_response', buf=buf))
 
     return msgs
@@ -372,9 +358,17 @@ def replication_truncate(src, buf):
 
 
 def replication_committed(src, buf):
+    assert(not g.state or g.state.endswith('-' + src))
+
+    if not g.state:
+        return
+
     g.peers[src] = json.loads(buf)
-    g.committed = g.peers[src]['committed']
-    db_sync()
+
+    if g.maxfile == g.peers[src]['maxfile']:
+        if g.offset >= g.peers[src]['committed']:
+            g.committed = g.peers[src]['committed']
+            db_sync()
 
 
 def replication_nextfile(src, buf):
@@ -415,6 +409,7 @@ def replication_response(src, buf):
 
         assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
+        assert(g.size + len(buf) == os.fstat(g.fd).st_size)
 
         g.size = os.fstat(g.fd).st_size
 
@@ -423,6 +418,8 @@ def replication_response(src, buf):
             os._exit(0)
 
         scan()
+
+        assert(g.size == os.fstat(g.fd).st_size)
 
         log('sent replication-request to(%s) file(%d) offset(%d) size(%d)',
             src, g.maxfile, g.offset, g.size)
@@ -433,6 +430,8 @@ def replication_response(src, buf):
 
 
 def on_message(src, msg, buf):
+    g.conns.add(src)
+
     if type(src) is tuple:
         try:
             assert(msg in ('get', 'put', 'state')), 'invalid command'
@@ -448,6 +447,9 @@ def on_connect(src):
 
 
 def on_disconnect(src, exc, tb):
+    if src in g.conns:
+        g.conns.remove(src)
+
     if exc and str(exc) != 'reject-replication-request':
         log(tb)
 
@@ -621,6 +623,26 @@ def append(buf):
     g.size = os.fstat(g.fd).st_size
 
 
+def db_sync():
+    while g.uncommitted:
+        key, filenum, offset, version, length = g.uncommitted[0]
+
+        if filenum == g.maxfile and offset > g.committed:
+            break
+
+        key, filenum, offset, version, length = g.uncommitted.popleft()
+
+        g.db.execute('insert or replace into data values(?,?,?,?,?)',
+                     (key, filenum, offset, version, length))
+
+    if time.time() > g.commit_time:
+        t = time.time()
+        g.db.commit()
+        t = time.time() - t
+        log('db sync in msec(%d)', t*1000)
+        g.commit_time = time.time() + t*10
+
+
 def scan(e_filenum=2**64, e_offset=2**64):
     b_file, b_offset, n_files, n_size, n_keys = g.maxfile, g.offset, 0, 0, 0
 
@@ -646,13 +668,22 @@ def scan(e_filenum=2**64, e_offset=2**64):
                 n_files += 1
 
                 while(offset < total_size):
-                    l = struct.unpack('!Q', fd.read(8))[0]
+                    hdr = fd.read(8)
+                    if 8 != len(hdr):
+                        break
+
+                    l = struct.unpack('!Q', hdr)[0]
 
                     if l + 28 > e_offset:
                         break
 
                     buf = fd.read(l)
+                    if l != len(buf):
+                        break
+
                     y = fd.read(20)
+                    if 20 != len(y):
+                        break
 
                     chksum = hashlib.sha1(g.scan_checksum)
                     chksum.update(buf)
@@ -674,7 +705,6 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                         t = (key, filenum, offset+8+i+24+key_len, ver, val_len)
                         g.uncommitted.append(t)
-
 
                         n_keys += 1
                         i += 24 + key_len + val_len
@@ -706,10 +736,7 @@ def init(conf):
     g.db.execute('''create table if not exists data(key blob, file unsigned,
         offset unsigned, version unsigned, length unsigned,
         primary key(key))''')
-    g.db.execute('''create index if not exists k on data(key, file, offset,
-        version, length)''')
-    g.db.execute('''create index if not exists fo on data(file, offset, key,
-        version, length)''')
+    g.db.execute('create unique index if not exists fo on data(file, offset)')
     g.db.execute('create index if not exists v on data(version)')
     g.db.execute('''create table if not exists kv(key text primary key,
         value int)''')
@@ -791,7 +818,6 @@ def init(conf):
     row = g.db.execute('select max(version) from data').fetchone()
     if row[0]:
         g.version = row[0] + 1
-
 
     rows = g.db.execute('''select key, file, offset, version, length
                            from data where file < ?

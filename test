@@ -1,7 +1,5 @@
 #!/bin/bash
 
-c=0
-while [ $c -lt 250 ]; do
+for i in $(seq 1 $1); do
     echo 'test' | python ~/git/lockr >& /dev/null &
-    let c=c+1
 done

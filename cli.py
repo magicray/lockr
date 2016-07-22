@@ -8,6 +8,7 @@ import traceback
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.CRITICAL)
 
+
 class Client(cmd.Cmd):
     prompt = '>'
 
@@ -66,7 +67,7 @@ class Client(cmd.Cmd):
                     code, offset, result = self.cli.get([key])
                     prev = result[key]
                     new = str(int(prev[1] if prev[1] else 0) + 1)
-                    req  = {key: (prev[0], new)}
+                    req = {key: (prev[0], new)}
                     res = self.cli.put(req)
                     logger.critical((req, res))
                     if 0 == res[0]:

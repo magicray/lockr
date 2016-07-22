@@ -18,7 +18,7 @@ def get_conf():
         max_size=2**14,
         repl_size=2**20,
         timeout=600)
-        
+
     with open('conf.yaml') as fd:
         conf.update(yaml.load(fd.read()))
 
@@ -66,7 +66,7 @@ if __name__ == '__main__':
                         conf['timeout'], 2*conf['timeout']))
 
                     msgio.loop(server, conf['port'], conf['nodes'],
-                        conf['key'], conf['cert'])
+                               conf['key'], conf['cert'])
                 except:
                     signal.alarm(0)
                     logging.critical(traceback.format_exc())
