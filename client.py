@@ -87,9 +87,10 @@ class Lockr(object):
         buf_list = [struct.pack('!Q', offset[0]),
                     struct.pack('!Q', offset[1])]
 
-        for key in keys:
+        for key, version in keys.iteritems():
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
+            buf_list.append(struct.pack('!Q', version))
 
         buf = self.request('get', ''.join(buf_list))
 
@@ -124,7 +125,8 @@ class Lockr(object):
         keys = dict()
 
         while True:
-            code, offset, ret = self.get(watched, (offset[0], offset[1]+1))
+            key_ver = dict([(k, keys.get(k, 0)) for k in watched])
+            code, offset, ret = self.get(key_ver, (offset[0], offset[1]+1))
             result = dict(added=dict(), updated=dict(), deleted=set())
 
             for key, (version, value) in ret.iteritems():

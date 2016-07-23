@@ -215,13 +215,21 @@ def replication_request(src, buf):
 
     if 'new-sync' == g.state and len(in_sync) >= g.quorum:
         g.state = 'leader'
+        g.committed = g.offset
+        db_sync()
+
         log('state(LEADER) file(%d) offset(%d) in_sync(%d)',
             g.maxfile, g.offset, len(in_sync))
 
         msgs = list()
+        for f in g.followers:
+            log('sent replication-committed to(%s) commit(%d)', f, g.committed)
+            msgs.append(dict(dst=f, msg='replication_committed', buf=g.json()))
+
         for f in set(g.peers) - set(g.followers):
-            log('sent leader-conflict to non-follower(%s)', f)
+            log('sent leader-conflict to(%s)', f)
             msgs.append(dict(dst=f, msg='leader_conflict'))
+
         return msgs + get_replication_responses()
 
     if 'old-sync' == g.state and len(in_sync) >= g.quorum:
@@ -275,15 +283,14 @@ def replication_request(src, buf):
         db_sync()
 
         for p in g.followers:
+            log('sent replication-committed to(%s) commit(%d)', p, g.committed)
             acks.append(dict(dst=p, msg='replication_committed', buf=g.json()))
 
-        for k in g.watch.keys():
-            f, o, src, buf = g.watch[k]
-            if g.maxfile > f or (g.maxfile == f and g.offset > o):
-                res = get(src, buf)
-                if res:
-                    acks.append(res)
-                    g.watch.pop(k)
+        for src in g.watch.keys():
+            res = get(src, g.watch[src])
+            if res:
+                acks.append(res)
+                g.watch.pop(src)
 
     return acks + get_replication_responses()
 
@@ -358,10 +365,8 @@ def replication_truncate(src, buf):
 
 
 def replication_committed(src, buf):
-    assert(not g.state or g.state.endswith('-' + src))
-
-    if not g.state:
-        return
+    log('received replication-committed from(%s)', src)
+    assert(g.state.endswith('-' + src))
 
     g.peers[src] = json.loads(buf)
 
@@ -484,8 +489,8 @@ def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
 
-    if (filenum > g.maxfile) or (filenum == g.maxfile and offset > g.offset):
-        g.watch[src] = (filenum, offset, src, buf)
+    if (filenum > g.maxfile) or (filenum == g.maxfile and offset > g.committed):
+        g.watch[src] = buf
         return
 
     result = [struct.pack('!B', 0 if filenum < g.minfile else 1),
@@ -497,29 +502,28 @@ def get(src, buf):
     while i < len(buf):
         key_len = struct.unpack('!Q', buf[i:i+8])[0]
         key = buf[i+8:i+8+key_len]
+        version = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
 
         row = g.db.execute('''select file, offset, version, length
                               from data where key = ?
                            ''', (sqlite3.Binary(key),)).fetchone()
 
-        keys[key] = row if row else (0, 0, 0, 0)
+        t = row if row else (0, 0, 0, 0)
+        if version != (t[2] if t[3] > 0 else 0):
+            keys[key] = t
 
-        i += 8 + key_len
+        i += 16 + key_len
 
     assert(i == len(buf))
 
-    if filenum > 0 and offset > 0:
-        flag = False
-        for k, (f, o, v, l) in keys.iteritems():
-            if (f == filenum and o > offset) or (f > filenum):
-                flag = True
-        if False == flag:
-            return
+    if (filenum > 0 or offset > 0) and not keys:
+        g.watch[src] = buf
+        return
 
     for k, (f, o, v, l) in keys.iteritems():
         result.append(struct.pack('!Q', len(k)))
         result.append(k)
-        result.append(struct.pack('!Q', v))
+        result.append(struct.pack('!Q', v if l > 0 else 0))
         result.append(struct.pack('!Q', l))
 
         if l > 0:
@@ -552,8 +556,9 @@ def put(src, buf):
         val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
         val = buf[i+24+key_len:i+24+key_len+val_len]
 
-        row = g.db.execute('select version from data where key = ?',
-                           (sqlite3.Binary(key),)).fetchone()
+        row = g.db.execute('''select version from data
+                              where key = ? and length > 0
+                           ''', (sqlite3.Binary(key),)).fetchone()
         if (row and row[0] != ver) or (not row and 0 != ver):
             buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
@@ -588,7 +593,7 @@ def put(src, buf):
         if row[0] != filenum or row[1] != offset:
             continue
 
-        if key not in g.kv and key not in keys and length > 0:
+        if key not in g.kv and length > 0:
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', version))
@@ -624,6 +629,7 @@ def append(buf):
 
 
 def db_sync():
+    count = 0
     while g.uncommitted:
         key, filenum, offset, version, length = g.uncommitted[0]
 
@@ -634,6 +640,9 @@ def db_sync():
 
         g.db.execute('insert or replace into data values(?,?,?,?,?)',
                      (key, filenum, offset, version, length))
+        count += 1
+
+    log('db_sync count(%d)', count)
 
     if time.time() > g.commit_time:
         t = time.time()
@@ -643,14 +652,14 @@ def db_sync():
         g.commit_time = time.time() + t*10
 
 
-def scan(e_filenum=2**64, e_offset=2**64):
+def scan(e_filenum=None, e_offset=None):
     b_file, b_offset, n_files, n_size, n_keys = g.maxfile, g.offset, 0, 0, 0
 
     filenum, offset = g.maxfile, g.offset
 
     while True:
         try:
-            if filenum > e_filenum:
+            if e_filenum and filenum > e_filenum:
                 break
 
             if not os.path.isfile(os.path.join(g.conf['data'], str(filenum))):
@@ -674,7 +683,7 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                     l = struct.unpack('!Q', hdr)[0]
 
-                    if l + 28 > e_offset:
+                    if e_offset and l + 28 > e_offset:
                         break
 
                     buf = fd.read(l)
@@ -713,9 +722,6 @@ def scan(e_filenum=2**64, e_offset=2**64):
 
                     n_size += len(buf) + 28
                     offset += len(buf) + 28
-
-            if filenum < g.maxfile - 1:
-                db_sync()
 
             filenum += 1
             offset = 0
@@ -801,23 +807,24 @@ def init(conf):
     g.append_checksum = g.scan_checksum
     g.db.commit()
 
-    for n in range(g.minfile, g.maxfile-1):
-        rows = g.db.execute('''select key from data
-                               where file = ? and length > 0''', (n,))
-
-        if rows.fetchall():
-            break
-
-        os.remove(os.path.join(data_dir, str(n)))
-        log('removed file(%d) containing overwritten data', n)
-        os.fsync(dfd)
-
-    if g.minfile < g.maxfile:
-        g.size_prev = os.path.getsize(os.path.join(data_dir, str(g.maxfile-1)))
-
     row = g.db.execute('select max(version) from data').fetchone()
     if row[0]:
         g.version = row[0] + 1
+
+        for n in range(g.minfile, g.maxfile-1):
+            rows = g.db.execute('''select count(*) from data
+                                   where file = ? and length > 0''', (n,))
+
+            if rows.fetchone()[0] > 0:
+                break
+
+            os.remove(os.path.join(data_dir, str(n)))
+            log('removed file(%d) containing overwritten data', n)
+            os.fsync(dfd)
+            g.minfile = n + 1
+
+    if g.minfile < g.maxfile:
+        g.size_prev = os.path.getsize(os.path.join(data_dir, str(g.maxfile-1)))
 
     rows = g.db.execute('''select key, file, offset, version, length
                            from data where file < ?

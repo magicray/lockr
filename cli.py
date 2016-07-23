@@ -26,7 +26,8 @@ class Client(cmd.Cmd):
         print(pprint.pformat(self.cli.state()).replace("u'", " '"))
 
     def do_get(self, line):
-        code, offset, result = self.cli.get(shlex.split(line))
+        key_ver = dict([(k, 0) for k in shlex.split(line)])
+        code, offset, result = self.cli.get(key_ver)
         assert(0 == code)
         for k in sorted(result.keys()):
             print('{0} <{1}> {2}'.format(k, result[k][0], result[k][1]))
@@ -64,10 +65,10 @@ class Client(cmd.Cmd):
             for i in range(100000):
                 while True:
                     key = '%05d' % (i)
-                    code, offset, result = self.cli.get([key])
-                    prev = result[key]
-                    new = str(int(prev[1] if prev[1] else 0) + 1)
-                    req = {key: (prev[0], new)}
+                    code, offset, result = self.cli.get({key: 0})
+                    ver, val = result.get(key, (0, None))
+                    new = str((int(val) if val else 0) + 1)
+                    req = {key: (ver, new)}
                     res = self.cli.put(req)
                     logger.critical((req, res))
                     if 0 == res[0]:
