@@ -1,4 +1,5 @@
 import cmd
+import json
 import shlex
 import client
 import pprint
@@ -61,15 +62,19 @@ class Client(cmd.Cmd):
                 traceback.print_exc()
 
     def do_test(self, line):
+        test_id = '%06d' % (int(line))
         while True:
             for i in range(100000):
                 while True:
                     key = '%05d' % (i)
                     code, offset, result = self.cli.get({key: 0})
-                    ver, val = result.get(key, (0, None))
-                    new = str((int(val) if val else 0) + 1)
-                    req = {key: (ver, new)}
-                    res = self.cli.put(req)
-                    logger.critical((req, res))
+                    ver, res = result.get(key, (0, '{}'))
+
+                    doc = json.loads(res)
+                    doc[test_id] = doc.get(test_id, 0) + 1
+                    doc = json.dumps(doc, indent=4, sort_keys=True)
+
+                    res = self.cli.put({key: (ver, doc)})
+                    logger.critical((key, ver, res))
                     if 0 == res[0]:
                         break

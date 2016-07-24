@@ -256,6 +256,7 @@ def replication_request(src, buf):
         return get_replication_responses()
 
     acks = list()
+    updated_keys = set()
     if 'leader' == g.state:
         offsets = list()
         for k, v in g.peers.iteritems():
@@ -271,7 +272,7 @@ def replication_request(src, buf):
 
                 offset, dst, keys = g.acks.popleft()
                 for k in keys:
-                    g.kv.remove(k)
+                    updated_keys.add(k)
 
                 acks.append(dict(dst=dst, buf=''.join([
                     struct.pack('!B', 0),
@@ -287,11 +288,12 @@ def replication_request(src, buf):
             acks.append(dict(dst=p, msg='replication_committed', buf=g.json()))
 
         for src in g.watch.keys():
-            res = get(src, g.watch[src])
-            if res:
-                acks.append(res)
+            filenum, keys = g.watch[src]
+            if set(keys).intersection(updated_keys):
+                acks.append(get_response(filenum, src, keys))
                 g.watch.pop(src)
 
+    g.kv = g.kv - updated_keys
     return acks + get_replication_responses()
 
 
@@ -489,14 +491,6 @@ def get(src, buf):
     filenum = struct.unpack('!Q', buf[0:8])[0]
     offset = struct.unpack('!Q', buf[8:16])[0]
 
-    if (filenum > g.maxfile) or (filenum == g.maxfile and offset > g.committed):
-        g.watch[src] = buf
-        return
-
-    result = [struct.pack('!B', 0 if filenum < g.minfile else 1),
-              struct.pack('!Q', g.maxfile),
-              struct.pack('!Q', g.offset)]
-
     i = 16
     keys = dict()
     while i < len(buf):
@@ -504,34 +498,42 @@ def get(src, buf):
         key = buf[i+8:i+8+key_len]
         version = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
 
-        row = g.db.execute('''select file, offset, version, length
-                              from data where key = ?
-                           ''', (sqlite3.Binary(key),)).fetchone()
-
-        t = row if row else (0, 0, 0, 0)
-        if version != (t[2] if t[3] > 0 else 0):
-            keys[key] = t
+        keys[key] = version
 
         i += 16 + key_len
 
     assert(i == len(buf))
 
-    if (filenum > 0 or offset > 0) and not keys:
-        g.watch[src] = buf
+    if (filenum > g.maxfile) or (filenum == g.maxfile and offset > g.committed):
+        g.watch[src] = (filenum, keys)
         return
 
-    for k, (f, o, v, l) in keys.iteritems():
-        result.append(struct.pack('!Q', len(k)))
-        result.append(k)
-        result.append(struct.pack('!Q', v if l > 0 else 0))
-        result.append(struct.pack('!Q', l))
+    return get_response(filenum, src, keys)
 
-        if l > 0:
-            with open(os.path.join(g.conf['data'], str(f)), 'rb') as fd:
-                fd.seek(o)
-                b = fd.read(l)
-                assert(len(b) == l)
-                result.append(b)
+
+def get_response(filenum, src, keys):
+    result = [struct.pack('!B', 0 if filenum < g.minfile else 1),
+              struct.pack('!Q', g.maxfile),
+              struct.pack('!Q', g.offset)]
+
+    for key, version in keys.iteritems():
+        row = g.db.execute('''select file, offset, version, length
+                              from data where key = ?
+                           ''', (sqlite3.Binary(key),)).fetchone()
+
+        f, o, v, l = row if row else (0, 0, 0, 0)
+        if version != (v if l > 0 else 0):
+            result.append(struct.pack('!Q', len(key)))
+            result.append(key)
+            result.append(struct.pack('!Q', v if l > 0 else 0))
+            result.append(struct.pack('!Q', l))
+
+            if l > 0:
+                with open(os.path.join(g.conf['data'], str(f)), 'rb') as fd:
+                    fd.seek(o)
+                    b = fd.read(l)
+                    assert(len(b) == l)
+                    result.append(b)
 
     return dict(dst=src, buf=''.join(result))
 

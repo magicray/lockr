@@ -1,5 +1,5 @@
 #!/bin/bash
 
 for i in $(seq 1 $1); do
-    echo 'test' | python ~/git/lockr >& /dev/null &
+    echo "test $i" | python ~/git/lockr >& /dev/null &
 done
