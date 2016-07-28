@@ -61,8 +61,9 @@ class Lockr(object):
             items.append(struct.pack('!Q', len(k)))
             items.append(k)
             items.append(struct.pack('!Q', v[0]))
-            items.append(struct.pack('!Q', len(v[1])))
-            items.append(v[1])
+            items.append(struct.pack('!Q', v[1]))
+            items.append(struct.pack('!Q', len(v[2])))
+            items.append(v[2])
 
         buf = self.request('put', ''.join(items))
         if 0 == struct.unpack('!B', buf[0])[0]:
@@ -107,14 +108,13 @@ class Lockr(object):
             key_len = struct.unpack('!Q', buf[i:i+8])[0]
             key = buf[i+8:i+8+key_len]
             ver = struct.unpack('!Q', buf[i+8+key_len:i+16+key_len])[0]
-            val_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
-
-            if val_len:
-                result[key] = (ver, buf[i+24+key_len:i+24+key_len+val_len])
-                i += 24 + key_len + val_len
+            if ver > 0:
+                v_len = struct.unpack('!Q', buf[i+16+key_len:i+24+key_len])[0]
+                result[key] = (ver, buf[i+24+key_len:i+24+key_len+v_len])
+                i += 24 + key_len + v_len
             else:
                 result[key] = (ver, None)
-                i += 24 + key_len
+                i += 16 + key_len
 
         assert(i == len(buf))
 

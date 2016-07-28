@@ -35,8 +35,8 @@ class Client(cmd.Cmd):
 
     def do_put(self, line):
         cmd = shlex.split(line)
-        tup = zip(cmd[0::3], cmd[1::3], cmd[2::3])
-        docs = dict([(t[0], (int(t[1]), t[2])) for t in tup])
+        tup = zip(cmd[0::4], cmd[1::4], cmd[2::4], cmd[3::4])
+        docs = dict([(t[0], (int(t[1]), int(t[2]), t[3])) for t in tup])
         code, value = self.cli.put(docs)
         if 0 == code:
             print('committed : {0}'.format(value))
@@ -63,18 +63,17 @@ class Client(cmd.Cmd):
 
     def do_test(self, line):
         test_id = '%06d' % (int(line))
-        while True:
-            for i in range(100000):
-                while True:
-                    key = '%05d' % (i)
-                    code, offset, result = self.cli.get({key: 0})
-                    ver, res = result.get(key, (0, '{}'))
+        for i in range(100000):
+            while True:
+                key = '%05d' % (i)
+                code, offset, result = self.cli.get({key: 0})
+                ver, res = result.get(key, (0, '{}'))
 
-                    doc = json.loads(res)
-                    doc[test_id] = doc.get(test_id, 0) + 1
-                    doc = json.dumps(doc, indent=4, sort_keys=True)
+                doc = json.loads(res)
+                doc[test_id] = doc.get(test_id, 0) + 1
+                doc = json.dumps(doc, indent=4, sort_keys=True)
 
-                    res = self.cli.put({key: (ver, doc)})
-                    logger.critical((key, ver, res))
-                    if 0 == res[0]:
-                        break
+                res = self.cli.put({key: (ver, 0, doc)})
+                logger.critical((key, ver, res))
+                if 0 == res[0]:
+                    break
