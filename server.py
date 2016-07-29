@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import copy
 import fcntl
 import struct
 import signal
@@ -32,7 +33,7 @@ class g:
     size_prev = 0
     size = 0
     clock = 0
-    hdr = None
+    vclock = None
     scan_checksum = ''
     append_checksum = ''
     node = None
@@ -44,40 +45,24 @@ class g:
 
     @classmethod
     def json(cls):
-        g.hdr = read_hdr(g.maxfile)
+        g.vclock = read_hdr(g.maxfile)
 
         return json.dumps(dict(
-            uptime=int(time.time()-g.start_time),
             state=g.state,
-            node=g.node,
             clock=g.clock,
-            hdr=g.hdr,
+            vclock=g.vclock,
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
             size_prev=g.size_prev,
             size=g.size,
-            committed=g.committed,
-            conns=len(g.conns),
-            version=g.version,
-            watch=[len(g.watch_key), len(g.watch_src)],
-            pending=[len(g.kv), len(g.acks)],
-            peers=dict([(k, dict(
-                clock=v['clock'],
-                hdr=v['hdr'],
-                minfile=v['minfile'],
-                maxfile=v['maxfile'],
-                offset=v['offset'],
-                size=v['size'],
-                size_prev=v['size_prev'],
-                committed=v['committed'],
-                state=v['state'])) for k, v in g.peers.iteritems() if v])))
+            committed=g.committed))
 
 
 def read_hdr(filenum):
     filename = os.path.join(g.conf['data'], str(filenum))
     if not os.path.isfile(filename):
-        return dict(vclock=dict())
+        return dict()
 
     with open(os.path.join(g.conf['data'], str(filenum))) as fd:
         hdrlen = struct.unpack('!Q', fd.read(8))[0]
@@ -110,8 +95,8 @@ def replication_connect(src, buf):
             except:
                 os._exit(0)
 
-    m_vclock = read_hdr(g.maxfile)['vclock']
-    p_vclock = g.peers[src]['hdr']['vclock']
+    m_vclock = read_hdr(g.maxfile)
+    p_vclock = g.peers[src]['vclock']
     if g.peers[src]['maxfile'] == g.maxfile:
         for s in set(p_vclock).intersection(m_vclock):
             if m_vclock[s] == p_vclock[s]:
@@ -193,8 +178,8 @@ def replication_request(src, buf):
         log('rejecting replication-request from(%s)', src)
         raise Exception('reject-replication-request')
 
-    m_vclock = read_hdr(g.peers[src]['maxfile'])['vclock']
-    p_vclock = g.peers[src]['hdr']['vclock']
+    m_vclock = read_hdr(g.peers[src]['maxfile'])
+    p_vclock = g.peers[src]['vclock']
     if p_vclock and m_vclock != p_vclock:
         log('this : %s', m_vclock)
         log('peer : %s', p_vclock)
@@ -241,12 +226,12 @@ def replication_request(src, buf):
 
         vclk = dict([(f, g.peers[f]['clock']) for f in g.followers])
         vclk[g.node] = g.clock
-        hdr = json.dumps(dict(vclock=vclk), sort_keys=True, indent=4)
+        vclk = json.dumps(vclk, sort_keys=True, indent=4)
         append(''.join([struct.pack('!Q', 0),
                         struct.pack('!Q', g.version),
                         struct.pack('!Q', 0),
-                        struct.pack('!Q', len(hdr)),
-                        hdr]))
+                        struct.pack('!Q', len(vclk)),
+                        vclk]))
         scan()
         g.version += 1
         g.state = 'new-sync'
@@ -491,7 +476,18 @@ def on_disconnect(src, exc, tb):
 
 
 def state(src, buf):
-    return dict(buf=g.json())
+    d = copy.deepcopy(g.peers)
+    d.update(json.loads(g.json()))
+    d.update(dict(uptime=int(time.time()-g.start_time),
+                  node=g.node,
+                  total_clients=len(g.conns),
+                  pending_keys=len(g.kv),
+                  pending_clients=len(g.acks),
+                  watch_keys=len(g.watch_key),
+                  watch_clients=len(g.watch_src),
+                  version=g.version))
+
+    return dict(buf=json.dumps(d))
 
 
 def get(src, buf):

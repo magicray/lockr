@@ -25,10 +25,9 @@ class Lockr(object):
                             t = time.time()
                             s = msgio.Client(srv)
                             s.send('state')
-                            stats = json.loads(s.recv())
                             logger.debug('connected to(%s) msec(%d)',
                                          srv, (time.time()-t)*1000)
-                            if 'leader' == stats['state']:
+                            if 'leader' == json.loads(s.recv())['state']:
                                 self.server = s
                                 break
 

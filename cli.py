@@ -2,7 +2,6 @@ import cmd
 import json
 import shlex
 import client
-import pprint
 import logging
 import traceback
 
@@ -24,7 +23,21 @@ class Client(cmd.Cmd):
         exit(0)
 
     def do_state(self, line):
-        print(pprint.pformat(self.cli.state()).replace("u'", " '"))
+        state = self.cli.state()
+
+        for k in filter(lambda k: type(state[k]) is dict, state):
+            if k == 'vclock':
+                continue
+
+            if state[k]['vclock'] == state['vclock']:
+                state[k].pop('vclock')
+
+            if state[k]['state'] == 'following-{0}'.format(state['node']):
+                state[k].pop('state')
+
+        state.pop('state')
+
+        print(json.dumps(state, indent=4, sort_keys=True))
 
     def do_get(self, line):
         key_ver = dict([(k, 0) for k in shlex.split(line)])
