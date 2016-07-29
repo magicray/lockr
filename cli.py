@@ -1,7 +1,8 @@
 import cmd
 import json
+import yaml
 import shlex
-import client
+import lockr
 import logging
 import traceback
 
@@ -14,7 +15,7 @@ class Client(cmd.Cmd):
 
     def __init__(self, servers):
         cmd.Cmd.__init__(self)
-        self.cli = client.Lockr(servers)
+        self.cli = lockr.Lockr(servers)
 
     def do_EOF(self, line):
         self.do_quit(line)
@@ -90,3 +91,14 @@ class Client(cmd.Cmd):
                 logger.critical((key, ver, res))
                 if 0 == res[0]:
                     break
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
+
+    with open('conf.yaml') as fd:
+        conf = yaml.load(fd.read())
+
+    nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
+                    conf['nodes']))
+    Client(nodes).cmdloop()
