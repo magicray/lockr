@@ -1,7 +1,6 @@
 import os
 import sys
 import json
-import yaml
 import time
 import copy
 import fcntl
@@ -864,6 +863,21 @@ def init(conf):
 if __name__ == '__main__':
     logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
 
+    conf = dict(key='key',
+                cert='ssl.cert',
+                data='data',
+                index='index.db',
+                max_size=2**14,
+                repl_size=2**20,
+                timeout=600000,
+                port='127.0.0.1:2001',
+                nodes=['127.0.0.1:{0}'.format(p) for p in range(2002, 2006)])
+
+    if not os.path.isfile('conf.json'):
+        print('Create conf.json using the following sample:')
+        print(json.dumps(conf, indent=4, sort_keys=4))
+        exit(1)
+
     fcntl.flock(os.open('.', os.O_RDONLY), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     if len(sys.argv) > 1:
@@ -885,16 +899,9 @@ if __name__ == '__main__':
 
             logging.critical('')
             try:
-                conf = dict(key='key',
-                            cert='ssl.cert',
-                            data='data',
-                            index='index.db',
-                            max_size=2**14,
-                            repl_size=2**20,
-                            timeout=600000)
 
-                with open('conf.yaml') as fd:
-                    conf.update(yaml.load(fd.read()))
+                with open('conf.json') as fd:
+                    conf.update(json.loads(fd.read()))
 
                 conf['nodes'] = set(map(lambda x: (x.split(':')[0],
                                                    int(x.split(':')[1])),
@@ -905,8 +912,8 @@ if __name__ == '__main__':
 
                 init(conf)
 
-                signal.alarm(random.randint(
-                    conf['timeout'], 2*conf['timeout']))
+                signal.alarm(random.randint(conf['timeout'],
+                                            2*conf['timeout']))
 
                 msgio.loop(sys.modules[__name__],
                            conf['port'],

@@ -1,6 +1,6 @@
+import os
 import cmd
 import json
-import yaml
 import shlex
 import lockr
 import logging
@@ -76,6 +76,11 @@ class Client(cmd.Cmd):
                 traceback.print_exc()
 
     def do_test(self, line):
+        """
+        for i in $(seq 1 500); do
+            echo "test $i" | python -m lockr.cli >& /dev/null &
+        done
+        """
         test_id = '%06d' % (int(line))
         for i in range(100000):
             while True:
@@ -96,8 +101,15 @@ class Client(cmd.Cmd):
 if __name__ == '__main__':
     logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
 
-    with open('conf.yaml') as fd:
-        conf = yaml.load(fd.read())
+    conf = dict(nodes=['127.0.0.1:{0}'.format(p) for p in range(2001, 2006)])
+
+    if not os.path.isfile('conf.json'):
+        print('Create conf.json using the following sample:')
+        print(json.dumps(conf, indent=4, sort_keys=4))
+        exit(1)
+
+    with open('conf.json') as fd:
+        conf = json.loads(fd.read())
 
     nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
                     conf['nodes']))
