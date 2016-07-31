@@ -1,4 +1,5 @@
 import os
+import sys
 import cmd
 import json
 import shlex
@@ -97,6 +98,26 @@ class Client(cmd.Cmd):
                 if 0 == res[0]:
                     break
 
+    def do_verify(self, line):
+        expected = int(line)
+        failed = list()
+        for i in range(100000):
+            key = '%05d' % (i)
+            code, offset, result = self.cli.get({key: 0})
+            ver, res = result[key]
+
+            count = len(json.loads(res))
+            if count != expected:
+                failed.append(i)
+
+            if len(failed):
+                print(failed) 
+
+        if len(failed):
+            print('FAILED : {0} count({1})'.format(i, count))
+        else:
+            print('PASSED')
+
 
 if __name__ == '__main__':
     logging.basicConfig(level=0, format='%(asctime)s: %(message)s')
@@ -113,4 +134,8 @@ if __name__ == '__main__':
 
     nodes = set(map(lambda x: (x.split(':')[0], int(x.split(':')[1])),
                     conf['nodes']))
-    Client(nodes).cmdloop()
+
+    if len(sys.argv) > 1:
+        Client(nodes).onecmd(' '.join(sys.argv[1:]))
+    else:
+        Client(nodes).cmdloop()
