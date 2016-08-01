@@ -414,9 +414,8 @@ def replication_response(src, buf):
 
         assert(g.size == os.fstat(g.fd).st_size)
         assert(len(buf) == os.write(g.fd, buf))
-        assert(g.size + len(buf) == os.fstat(g.fd).st_size)
-
-        g.size = os.fstat(g.fd).st_size
+        g.size += len(buf)
+        assert(g.size == os.fstat(g.fd).st_size)
 
         if g.maxfile > 1 and not g.scan_checksum:
             log('exiting to reinitialize checksum')
@@ -527,7 +526,7 @@ def get(src, buf):
 def get_process(filenum, src, keys):
     result = [struct.pack('!B', 0 if filenum < g.minfile else 1),
               struct.pack('!Q', g.maxfile),
-              struct.pack('!Q', g.offset)]
+              struct.pack('!Q', g.committed)]
 
     for key, version in keys.iteritems():
         row = g.db.execute('''select file, offset, version, length
@@ -832,7 +831,12 @@ def init(conf):
 
     row = g.db.execute('select max(version) from data').fetchone()
     if row[0]:
-        g.version = row[0] + 1
+        g.version = row[0]
+        for txn in g.uncommitted:
+            for r in txn:
+                if r[3] > g.version:
+                    g.version = r[3]
+        g.version += 1
 
         for n in range(g.minfile, g.maxfile-1):
             rows = g.db.execute('''select count(*) from data

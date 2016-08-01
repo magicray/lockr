@@ -91,6 +91,7 @@ class Client(cmd.Cmd):
 
                 doc = json.loads(res)
                 doc[test_id] = doc.get(test_id, 0) + 1
+                doc['count'] = doc.get('count', 0) + 1
                 doc = json.dumps(doc, indent=4, sort_keys=True)
 
                 res = self.cli.put({key: (ver, 0, doc)})
