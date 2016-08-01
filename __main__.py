@@ -22,7 +22,7 @@ class g:
     fd = None
     db = None
     kv = set()
-    oldest = collections.deque()
+    oldest = dict()
     watch_key = dict()
     watch_src = dict()
     acks = collections.deque()
@@ -582,7 +582,7 @@ def put(src, buf):
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', row[0] if row else 0))
 
-        keys[key] = (ttl, val)
+        keys[key] = (ttl if 0 == ttl else int(time.time() + ttl), val)
 
         i += 32 + key_len + val_len
 
@@ -596,24 +596,19 @@ def put(src, buf):
 
     buf_list = list()
     for key, (ttl, val) in keys.iteritems():
-        ttl = ttl if 0 == ttl else int(time.time() + ttl)
         buf_list.append(struct.pack('!Q', len(key)))
         buf_list.append(key)
         buf_list.append(struct.pack('!Q', g.version))
         buf_list.append(struct.pack('!Q', ttl))
         buf_list.append(struct.pack('!Q', len(val)))
         buf_list.append(val)
+        g.oldest.pop(key, None)
 
     count = 0
     while g.oldest and count < len(keys):
-        key, filenum, offset, version, length = g.oldest.popleft()
+        key, (filenum, offset, version, ttl, length) = g.oldest.popitem()
 
-        row = g.db.execute('select file, offset from data where key = ?',
-                           (sqlite3.Binary(key),)).fetchone()
-        if row[0] != filenum or row[1] != offset:
-            continue
-
-        if key not in g.kv and key not in keys and length > 0:
+        if length > 0:
             buf_list.append(struct.pack('!Q', len(key)))
             buf_list.append(key)
             buf_list.append(struct.pack('!Q', version))
@@ -663,8 +658,9 @@ def db_sync():
 
         txn = g.uncommitted.popleft()
         for key, filenum, offset, version, ttl, length in txn:
+            g.oldest.pop(key, None)
             g.db.execute('insert or replace into data values(?,?,?,?,?,?)',
-                         (key, filenum, offset, version, ttl, length))
+                (sqlite3.Binary(key), filenum, offset, version, ttl, length))
             count += 1
 
     if time.time() > g.commit_time:
@@ -725,7 +721,7 @@ def scan():
                     txn = list() 
                     while i < len(buf):
                         key_len = struct.unpack('!Q', buf[i:i+8])[0]
-                        key = sqlite3.Binary(buf[i+8:i+8+key_len])
+                        key = buf[i+8:i+8+key_len]
 
                         ver = struct.unpack(
                             '!Q', buf[i+8+key_len:i+16+key_len])[0]
@@ -853,14 +849,13 @@ def init(conf):
     if g.minfile < g.maxfile:
         g.size_prev = os.path.getsize(os.path.join(data_dir, str(g.maxfile-1)))
 
-    rows = g.db.execute('''select key, file, offset, version, length
-                           from data where file < ?  order by file, offset
-                        ''', (min(g.minfile+2, g.maxfile-2),))
-    for r in rows:
-        g.oldest.append((bytes(r[0]), r[1], r[2], r[3], r[4]))
+    g.oldest = dict([(bytes(r[0]), (r[1], r[2], r[3], r[4], r[5]))
+        for r in g.db.execute('''select key, file, offset, version, ttl, length
+                                 from data where file < ?  order by file, offset
+                              ''', (min(g.minfile+2, g.maxfile-2),))])
 
-    log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d)',
-        g.minfile, g.maxfile, g.offset, g.size, g.size_prev)
+    log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d) oldest(%d)',
+        g.minfile, g.maxfile, g.offset, g.size, g.size_prev, len(g.oldest))
 
 
 if __name__ == '__main__':
