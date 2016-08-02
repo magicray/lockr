@@ -652,8 +652,13 @@ def db_sync():
 
         key, filenum, offset, version, ttl, length = g.uncommitted.popleft()
 
-        g.db.execute('insert or replace into data values(?,?,?,?,?,?)',
-            (sqlite3.Binary(key), filenum, offset, version, ttl, length))
+        if length > 0:
+            g.db.execute('insert or replace into data values(?,?,?,?,?,?)',
+                (sqlite3.Binary(key), filenum, offset, version, ttl, length))
+        else:
+            g.db.execute('delete from data where key = ?',
+                         (sqlite3.Binary(key),))
+
 
         g.oldest.pop(key, None)
         count += 1
@@ -724,10 +729,9 @@ def scan():
                         val_len = struct.unpack(
                             '!Q', buf[i+24+key_len:i+32+key_len])[0]
 
-                        if val_len > 0:
-                            g.uncommitted.append((key, filenum,
-                                                  offset+8+i+32+key_len,
-                                                  ver, ttl, val_len))
+                        g.uncommitted.append((key, filenum,
+                                              offset+8+i+32+key_len,
+                                              ver, ttl, val_len))
 
                         n_keys += 1
                         i += 32 + key_len + val_len
