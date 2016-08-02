@@ -573,9 +573,9 @@ def put(src, buf):
         val_len = struct.unpack('!Q', buf[i+24+key_len:i+32+key_len])[0]
         val = buf[i+32+key_len:i+32+key_len+val_len]
 
-        row = g.db.execute('''select version from data
-                              where key = ? and length > 0
-                           ''', (sqlite3.Binary(key),)).fetchone()
+        row = g.db.execute('select version from data where key = ?',
+                           (sqlite3.Binary(key),)).fetchone()
+
         if (row and row[0] != ver) or (not row and 0 != ver):
             buf_list.append(struct.pack('!Q', key_len))
             buf_list.append(key)
@@ -607,20 +607,19 @@ def put(src, buf):
     while g.oldest and count < len(keys):
         key, (filenum, offset, version, ttl, length) = g.oldest.popitem()
 
-        if length > 0:
-            buf_list.append(struct.pack('!Q', len(key)))
-            buf_list.append(key)
-            buf_list.append(struct.pack('!Q', version))
-            buf_list.append(struct.pack('!Q', ttl))
-            buf_list.append(struct.pack('!Q', length))
+        buf_list.append(struct.pack('!Q', len(key)))
+        buf_list.append(key)
+        buf_list.append(struct.pack('!Q', version))
+        buf_list.append(struct.pack('!Q', ttl))
+        buf_list.append(struct.pack('!Q', length))
 
-            with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
-                fd.seek(offset)
-                buf = fd.read(length)
-                assert(len(buf) == length)
-                buf_list.append(buf)
+        with open(os.path.join(g.conf['data'], str(filenum)), 'rb') as fd:
+            fd.seek(offset)
+            buf = fd.read(length)
+            assert(len(buf) == length)
+            buf_list.append(buf)
 
-            count += 1
+        count += 1
 
     append(''.join(buf_list))
     g.version += 1
@@ -646,21 +645,18 @@ def append(buf):
 def db_sync():
     count = 0
     while g.uncommitted:
-        commit = True
-        for key, filenum, offset, version, ttl, length in g.uncommitted[0]:
-            if filenum == g.maxfile and offset > g.committed:
-                commit = False
-                break
+        key, filenum, offset, version, ttl, length = g.uncommitted[0]
 
-        if commit is not True:
+        if filenum == g.maxfile and offset > g.committed:
             break
 
-        txn = g.uncommitted.popleft()
-        for key, filenum, offset, version, ttl, length in txn:
-            g.oldest.pop(key, None)
-            g.db.execute('insert or replace into data values(?,?,?,?,?,?)',
-                (sqlite3.Binary(key), filenum, offset, version, ttl, length))
-            count += 1
+        key, filenum, offset, version, ttl, length = g.uncommitted.popleft()
+
+        g.db.execute('insert or replace into data values(?,?,?,?,?,?)',
+            (sqlite3.Binary(key), filenum, offset, version, ttl, length))
+
+        g.oldest.pop(key, None)
+        count += 1
 
     if time.time() > g.commit_time:
         t = time.time()
@@ -717,7 +713,6 @@ def scan():
                     g.scan_checksum = chksum.digest()
 
                     i = 0
-                    txn = list() 
                     while i < len(buf):
                         key_len = struct.unpack('!Q', buf[i:i+8])[0]
                         key = buf[i+8:i+8+key_len]
@@ -729,15 +724,15 @@ def scan():
                         val_len = struct.unpack(
                             '!Q', buf[i+24+key_len:i+32+key_len])[0]
 
-                        txn.append((key, filenum, offset+8+i+32+key_len,
-                                    ver, ttl, val_len))
+                        if val_len > 0:
+                            g.uncommitted.append((key, filenum,
+                                                  offset+8+i+32+key_len,
+                                                  ver, ttl, val_len))
 
                         n_keys += 1
                         i += 32 + key_len + val_len
 
                     assert(i == len(buf))
-
-                    g.uncommitted.append(txn)
 
                     n_size += len(buf) + 28
                     offset += len(buf) + 28
@@ -832,15 +827,14 @@ def init(conf):
     row = g.db.execute('select max(version) from data').fetchone()
     if row[0]:
         g.version = row[0]
-        for txn in g.uncommitted:
-            for r in txn:
-                if r[3] > g.version:
-                    g.version = r[3]
+        for r in g.uncommitted:
+            if r[3] > g.version:
+                g.version = r[3]
         g.version += 1
 
         for n in range(g.minfile, g.maxfile-1):
             rows = g.db.execute('''select count(*) from data
-                                   where file = ? and length > 0''', (n,))
+                                   where file = ?''', (n,))
 
             if rows.fetchone()[0] > 0:
                 break
@@ -855,7 +849,8 @@ def init(conf):
 
     g.oldest = dict([(bytes(r[0]), (r[1], r[2], r[3], r[4], r[5]))
         for r in g.db.execute('''select key, file, offset, version, ttl, length
-                                 from data where file < ?  order by file, offset
+                                 from data where file < ?
+                                 order by file, offset
                               ''', (min(g.minfile+2, g.maxfile-2),))])
 
     log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d) oldest(%d)',
