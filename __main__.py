@@ -34,7 +34,6 @@ class g:
     minfile = 1
     maxfile = 0
     offset = 0
-    size_prev = 0
     size = 0
     clock = 0
     vclock = None
@@ -58,7 +57,6 @@ class g:
             minfile=g.minfile,
             maxfile=g.maxfile,
             offset=g.offset,
-            size_prev=g.size_prev,
             size=g.size,
             committed=g.committed))
 
@@ -80,13 +78,6 @@ def replication_connect(src, buf):
 
     if g.state:
         return
-
-    if g.peers[src]['maxfile'] == g.maxfile:
-        if g.peers[src]['size_prev'] > g.size_prev > 0:
-            os.remove(os.path.join(g.conf['data'], str(g.maxfile)))
-            log('REMOVED file(%d) as peer(%s) prev size(%d > %d)',
-                g.maxfile, src, g.peers[src]['size_prev'], g.size_prev)
-            os._exit(0)
 
     if g.maxfile > 0 and g.peers[src]['minfile'] > g.maxfile:
         log('src(%s) minfile(%d) > maxfile(%d)',
@@ -227,7 +218,6 @@ def replication_request(src, buf):
         return msgs + get_replication_responses()
 
     if 'old-sync' == g.state and len(in_sync) >= g.quorum:
-        g.size_prev = g.offset
         g.maxfile += 1
         g.offset = 0
 
@@ -242,8 +232,7 @@ def replication_request(src, buf):
         scan()
         g.version += 1
         g.state = 'new-sync'
-        log('state(NEW-SYNC) file(%d) offset(%d) in_sync(%d)',
-            g.maxfile-1, g.size_prev, len(in_sync))
+        log('state(NEW-SYNC) file(%d) in_sync(%d)', g.maxfile-1, len(in_sync))
         if 0 == int(time.time()) % 3:
             log('exiting to force test')
             os._exit(0)
@@ -382,7 +371,6 @@ def replication_nextfile(src, buf):
     log('received replication-nextfile from(%s) filenum(%d)',
         src, req['filenum'])
 
-    g.size_prev = g.size
     g.maxfile = req['filenum']
     g.offset = 0
     g.size = 0
@@ -848,17 +836,14 @@ def init(conf):
             os.fsync(dfd)
             g.minfile = n + 1
 
-    if g.minfile < g.maxfile:
-        g.size_prev = os.path.getsize(os.path.join(data_dir, str(g.maxfile-1)))
-
     g.oldest = dict([(bytes(r[0]), (r[1], r[2], r[3], r[4], r[5]))
         for r in g.db.execute('''select key, file, offset, version, ttl, length
                                  from data where file < ?
                                  order by file, offset
                               ''', (min(g.minfile+2, g.maxfile-2),))])
 
-    log('initialized min(%d) max(%d) offset(%d) size(%d) prev(%d) oldest(%d)',
-        g.minfile, g.maxfile, g.offset, g.size, g.size_prev, len(g.oldest))
+    log('initialized min(%d) max(%d) offset(%d) size(%d) oldest(%d)',
+        g.minfile, g.maxfile, g.offset, g.size, len(g.oldest))
 
 
 if __name__ == '__main__':
