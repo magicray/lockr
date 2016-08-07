@@ -32,8 +32,9 @@ class Lockr(object):
                     pass
 
             if self.server:
-                logger.critical('received response(%s) from%s msec(%d)',
-                                req, self.server.server,
+                logger.critical('%s(%s:%d) req(%d) res(%d) msec(%d)', req,
+                                self.server.server[0], self.server.server[1], 
+                                len(buf), len(result),
                                 (time.time() - req_begin)*1000)
                 return result
 
