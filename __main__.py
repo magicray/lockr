@@ -58,6 +58,8 @@ class g:
             maxfile=g.maxfile,
             offset=g.offset,
             size=g.size,
+            watch_clients=len(g.watch_src),
+            watch_keys=len(g.watch_key),
             committed=g.committed))
 
 
@@ -240,7 +242,6 @@ def replication_request(src, buf):
         return get_replication_responses()
 
     acks = list()
-    triggered = set()
     if 'leader' == g.state:
         offsets = list()
         for k, v in g.peers.iteritems():
@@ -257,7 +258,6 @@ def replication_request(src, buf):
                 offset, dst, keys = g.acks.popleft()
                 for k in keys:
                     g.kv.remove(k)
-                    triggered.update(g.watch_key.pop(k, set()))
 
                 acks.append(dict(dst=dst, buf=''.join([
                     struct.pack('!B', 0),
@@ -271,14 +271,6 @@ def replication_request(src, buf):
         for p in g.followers:
             log('sent replication-committed to(%s) commit(%d)', p, g.committed)
             acks.append(dict(dst=p, msg='replication_committed', buf=g.json()))
-
-        for src in triggered:
-            filenum, keys = g.watch_src[src]
-            for k in keys:
-                if k in g.watch_key:
-                    g.watch_key[k].remove(src)
-
-            acks.append(get_process(filenum, src, keys))
 
     return acks + get_replication_responses()
 
@@ -359,10 +351,28 @@ def replication_committed(src, buf):
 
     g.peers[src] = json.loads(buf)
 
-    if g.maxfile == g.peers[src]['maxfile']:
-        if g.offset >= g.peers[src]['committed']:
-            g.committed = g.peers[src]['committed']
-            db_sync()
+    if g.maxfile != g.peers[src]['maxfile']:
+        return
+
+    if g.offset < g.peers[src]['committed']:
+        return
+
+    g.committed = g.peers[src]['committed']
+
+    triggered = set()
+    for key in db_sync():
+        triggered.update(g.watch_key.pop(key, set()))
+
+    acks = list()
+    for src in triggered:
+        filenum, keys = g.watch_src.pop(src)
+        for k in keys:
+            if k in g.watch_key:
+                g.watch_key[k].remove(src)
+
+        acks.append(get_process(filenum, src, keys))
+
+    return acks
 
 
 def replication_nextfile(src, buf):
@@ -427,8 +437,13 @@ def on_message(src, msg, buf):
     if type(src) is tuple:
         try:
             assert(msg in ('get', 'put', 'state')), 'invalid command'
-            return globals()[msg](src, buf)
+            result = globals()[msg](src, buf)
+            assert('disconnect' != result)
+            return result
         except:
+            if 'disconnect' == result:
+                raise Exception('disconnect')
+
             return dict(buf=struct.pack('!B', 255) + traceback.format_exc())
 
     return globals()[msg](src, buf)
@@ -442,7 +457,7 @@ def on_disconnect(src, exc, tb):
     if src in g.conns:
         g.conns.remove(src)
 
-    if exc and str(exc) != 'reject-replication-request':
+    if exc and str(exc) not in ('reject-replication-request', 'disconnect'):
         log(tb)
 
     if src not in g.peers:
@@ -471,15 +486,18 @@ def on_disconnect(src, exc, tb):
 
 
 def state(src, buf):
+    if 'leader' != g.state:
+        return 'disconnect'
+
     d = copy.deepcopy(g.peers)
     d.update(json.loads(g.json()))
+    d.pop('watch_keys')
+    d.pop('watch_clients')
     d.update(dict(uptime=int(time.time()-g.start_time),
                   node=g.node,
                   total_clients=len(g.conns),
-                  pending_keys=len(g.kv),
                   pending_clients=len(g.acks),
-                  watch_keys=len(g.watch_key),
-                  watch_clients=len(g.watch_src),
+                  pending_keys=len(g.kv),
                   version=g.version))
 
     return dict(buf=json.dumps(d))
@@ -501,6 +519,12 @@ def get(src, buf):
         i += 16 + key_len
 
     assert(i == len(buf))
+
+    if 'leader' == g.state:
+        if 0 != filenum or 0 != offset:
+            return 'disconnect'
+
+        return get_process(0, src, keys)
 
     if filenum > g.maxfile or (filenum == g.maxfile and offset > g.committed):
         for k in keys:
@@ -541,6 +565,9 @@ def get_process(filenum, src, keys):
 
 
 def put(src, buf):
+    if 'leader' != g.state:
+        return 'disconnect'
+
     if g.offset > g.conf['max_size']:
         log('max file size reached(%d > %d)', g.offset, g.conf['max_size'])
         os._exit(0)
@@ -631,7 +658,7 @@ def append(buf):
 
 
 def db_sync():
-    count = 0
+    updated = set()
     while g.uncommitted:
         key, filenum, offset, version, ttl, length = g.uncommitted[0]
 
@@ -647,18 +674,19 @@ def db_sync():
             g.db.execute('delete from data where key = ?',
                          (sqlite3.Binary(key),))
 
-
+        updated.add(key)
         g.oldest.pop(key, None)
-        count += 1
 
     if time.time() > g.commit_time:
         t = time.time()
         g.db.commit()
         t = time.time() - t
-        log('db sync count(%d) msec(%d)', count, t*1000)
+        log('db sync count(%d) msec(%d)', len(updated), t*1000)
         g.commit_time = time.time() + t*10
     else:
-        log('db_sync count(%d)', count)
+        log('db_sync count(%d)', len(updated))
+
+    return updated
 
 
 def scan():

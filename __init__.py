@@ -10,7 +10,7 @@ logger.setLevel(logging.CRITICAL)
 
 class Lockr(object):
     def __init__(self, servers, timeout=10**8):
-        self.servers = servers
+        self.servers = set(servers)
         self.server = None
         self.timeout = timeout
 
@@ -18,38 +18,27 @@ class Lockr(object):
         req_begin = time.time()
         backoff = 1
         while time.time() < req_begin + self.timeout:
-            try:
-                if not self.server:
-                    for srv in self.servers:
-                        try:
-                            t = time.time()
-                            s = msgio.Client(srv)
-                            s.send('state')
-                            logger.debug('connected to(%s) msec(%d)',
-                                         srv, (time.time()-t)*1000)
-                            if 'leader' == json.loads(s.recv())['state']:
-                                self.server = s
-                                break
+            servers = set([(time.time(), s, time.time()) for s in self.servers])
+            while servers:
+                _, srv, _ = servers.pop()
+                try:
+                    s = self.server if self.server else msgio.Client(srv)
+                    s.send(req, buf)
+                    result = s.recv()
+                    self.server = s
+                    break
+                except:
+                    self.server = None
+                    pass
 
-                            s.close()
-                        except:
-                            logger.debug('connection to(%s) failed msec(%d)',
-                                         srv, (time.time()-t)*1000)
-                if self.server:
-                    self.server.send(req, buf)
-                    result = self.server.recv()
-                    logger.critical('received response(%s) from%s msec(%d)',
-                                    req, self.server.server,
-                                    (time.time() - req_begin)*1000)
-                    return result
+            if self.server:
+                logger.critical('received response(%s) from%s msec(%d)',
+                                req, self.server.server,
+                                (time.time() - req_begin)*1000)
+                return result
 
-                time.sleep(backoff)
-                backoff = min(60, backoff*2)
-            except:
-                if self.server:
-                    self.server.close()
-
-                self.server = None
+            time.sleep(backoff)
+            backoff = min(60, backoff*2)
 
     def state(self):
         return json.loads(self.request('state'))
@@ -120,7 +109,7 @@ class Lockr(object):
         return code, offset, result
 
     def watch(self, watched):
-        offset = (0, 0)
+        offset = (0, 1)
         keys = dict()
 
         while True:
