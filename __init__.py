@@ -10,7 +10,7 @@ logger.setLevel(logging.CRITICAL)
 
 class Lockr(object):
     def __init__(self, servers, timeout=10**8):
-        self.servers = set(servers)
+        self.servers = list(set(servers))
         self.server = None
         self.timeout = timeout
 
@@ -18,9 +18,8 @@ class Lockr(object):
         req_begin = time.time()
         backoff = 1
         while time.time() < req_begin + self.timeout:
-            servers = set([(time.time(), s, time.time()) for s in self.servers])
-            while servers:
-                _, srv, _ = servers.pop()
+            for i in range(2*len(self.servers)):
+                srv = self.servers[int(time.time()*10**6) % len(self.servers)]
                 try:
                     s = self.server if self.server else msgio.Client(srv)
                     s.send(req, buf)
