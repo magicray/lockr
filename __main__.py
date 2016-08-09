@@ -435,6 +435,7 @@ def on_message(src, msg, buf):
     g.conns.add(src)
 
     if type(src) is tuple:
+        result = None
         try:
             assert(msg in ('get', 'put', 'state')), 'invalid command'
             result = globals()[msg](src, buf)
